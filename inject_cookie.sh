@@ -2,7 +2,8 @@
 
 # ============================================================
 # Roblox Cookie Injector for Termux (Android)
-# Injects .ROBLOSECURITY cookie into com.robloxclient app
+# Injects .ROBLOSECURITY cookie into com.roblox.client
+# Automatically launches Roblox after injection
 # ============================================================
 
 # Colors for output
@@ -16,16 +17,22 @@ NC='\033[0m' # No Color
 echo -e "${CYAN}"
 echo "╔══════════════════════════════════════════════╗"
 echo "║       Roblox Cookie Injector for Termux      ║"
-echo "║         Target: com.robloxclient             ║"
+echo "║         Target: com.roblox.client            ║"
 echo "╚══════════════════════════════════════════════╝"
 echo -e "${NC}"
 
 # --- Configuration ---
-ROBLOX_PACKAGE="com.roblox.client"
-ROBLOX_DATA_DIR="/data/data/${ROBLOX_PACKAGE}"
-COOKIE_FILE="${ROBLOX_DATA_DIR}/files/RobloxCookies.dat"
-SHARED_PREFS_DIR="${ROBLOX_DATA_DIR}/shared_prefs"
-COOKIE_PREFS_FILE="${SHARED_PREFS_DIR}/RobloxPreferences.xml"
+# Try common Roblox package names
+PACKAGE_CANDIDATES=(
+    "com.roblox.client"
+    "com.roblox"
+)
+
+ROBLOX_PACKAGE=""
+ROBLOX_DATA_DIR=""
+COOKIE_FILE=""
+SHARED_PREFS_DIR=""
+COOKIE_PREFS_FILE=""
 
 # --- Helper Functions ---
 
@@ -59,28 +66,33 @@ check_root() {
     print_info "Root access confirmed."
 }
 
-# --- Check if Roblox is installed ---
-check_roblox_installed() {
-    print_step "Checking if Roblox is installed..."
-    if [ -d "$ROBLOX_DATA_DIR" ]; then
-        print_info "Roblox data directory found at ${ROBLOX_DATA_DIR}"
-    else
-        print_error "Roblox data directory not found!"
-        print_error "Make sure ${ROBLOX_PACKAGE} is installed on your device."
-        exit 1
-    fi
+# --- Detect Roblox package ---
+detect_package() {
+    print_step "Detecting Roblox package name..."
+    for pkg in "${PACKAGE_CANDIDATES[@]}"; do
+        if [ -d "/data/data/${pkg}" ]; then
+            ROBLOX_PACKAGE="$pkg"
+            ROBLOX_DATA_DIR="/data/data/${pkg}"
+            COOKIE_FILE="${ROBLOX_DATA_DIR}/files/RobloxCookies.dat"
+            SHARED_PREFS_DIR="${ROBLOX_DATA_DIR}/shared_prefs"
+            COOKIE_PREFS_FILE="${SHARED_PREFS_DIR}/RobloxPreferences.xml"
+            print_info "Found Roblox package: ${ROBLOX_PACKAGE}"
+            return 0
+        fi
+    done
+
+    print_error "Roblox data directory not found!"
+    print_error "Checked: ${PACKAGE_CANDIDATES[*]}"
+    print_error "Make sure Roblox is installed on your device."
+    exit 1
 }
 
 # --- Stop Roblox if running ---
 stop_roblox() {
     print_step "Stopping Roblox process (if running)..."
     am force-stop "$ROBLOX_PACKAGE" 2>/dev/null
-    if [ $? -eq 0 ]; then
-        print_info "Roblox process stopped."
-    else
-        print_warn "Could not stop Roblox (may not be running)."
-    fi
-    sleep 1
+    sleep 2
+    print_info "Roblox process stopped."
 }
 
 # --- Backup existing cookie ---
@@ -132,7 +144,6 @@ inject_cookie_xml() {
     # Create or update the XML preferences file
     if [ -f "$COOKIE_PREFS_FILE" ]; then
         # File exists — try to update the cookie entry
-        # Use sed to replace or add the .ROBLOSECURITY entry
         if grep -q '"ROBLOSECURITY"' "$COOKIE_PREFS_FILE" 2>/dev/null; then
             sed -i "s|<string name=\"ROBLOSECURITY\">.*</string>|<string name=\"ROBLOSECURITY\">$cookie</string>|" "$COOKIE_PREFS_FILE" 2>/dev/null
             print_info "Updated existing ROBLOSECURITY entry in SharedPreferences."
@@ -157,6 +168,30 @@ EOF
     chown "$ROBLOX_PACKAGE:$ROBLOX_PACKAGE" "$COOKIE_PREFS_FILE" 2>/dev/null
     chmod 700 "$SHARED_PREFS_DIR" 2>/dev/null
     chown "$ROBLOX_PACKAGE:$ROBLOX_PACKAGE" "$SHARED_PREFS_DIR" 2>/dev/null
+}
+
+# --- Launch Roblox ---
+launch_roblox() {
+    print_step "Launching Roblox to apply cookie..."
+    
+    # Try to get the main activity
+    MAIN_ACTIVITY=$(cmd package resolve-activity --brief "$ROBLOX_PACKAGE" 2>/dev/null | tail -1)
+    
+    if [ -n "$MAIN_ACTIVITY" ]; then
+        print_info "Starting activity: ${MAIN_ACTIVITY}"
+        am start -n "$MAIN_ACTIVITY" 2>/dev/null
+    else
+        print_info "Starting package directly..."
+        am start -n "${ROBLOX_PACKAGE}/.app.MainActivity" 2>/dev/null || \
+        am start -n "${ROBLOX_PACKAGE}/com.roblox.client.startup.SplashActivity" 2>/dev/null || \
+        monkey -p "$ROBLOX_PACKAGE" -c android.intent.category.LAUNCHER 1 2>/dev/null
+    fi
+    
+    if [ $? -eq 0 ]; then
+        print_info "Roblox launched successfully!"
+    else
+        print_warn "Could not launch Roblox automatically. Please open it manually."
+    fi
 }
 
 # --- Verify injection ---
@@ -195,7 +230,6 @@ verify_injection() {
         echo -e "${GREEN}║       Cookie injection completed!            ║${NC}"
         echo -e "${GREEN}╚══════════════════════════════════════════════╝${NC}"
         echo ""
-        print_info "You can now open Roblox. The cookie should be active."
     else
         print_warn "Some checks failed. Cookie may not be fully injected."
     fi
@@ -241,18 +275,16 @@ main() {
     echo ""
 
     check_root
-    check_roblox_installed
+    detect_package
     stop_roblox
     backup_cookie
     inject_cookie_dat "$cookie"
     inject_cookie_xml "$cookie"
     verify_injection
+    launch_roblox
 
     echo ""
-    print_info "Script finished."
-    echo ""
-    echo -e "${YELLOW}Tip:${NC} If the cookie doesn't work, try clearing Roblox app data"
-    echo "     (Settings > Apps > Roblox > Storage > Clear Data) and re-run this script."
+    print_info "Script finished. Roblox should now be opening with your cookie injected."
     echo ""
 }
 
