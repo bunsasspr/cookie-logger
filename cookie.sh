@@ -89,6 +89,7 @@ row = {
     "is_secure": 1,
     "is_httponly": 1,
     "last_access_utc": int(now_utc),
+    "last_update_utc": int(now_utc),
     "has_expires": 1,
     "is_persistent": 1,
     "priority": 1,
