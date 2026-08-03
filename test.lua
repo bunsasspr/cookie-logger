@@ -164,25 +164,23 @@ end
 -- Live-adjustable draw mode (buttons on the UI can change this mid-run)
 getgenv().PaintBotDrawMode = CONFIG.drawMode
 
-local function shuffle(t)
-    for i = #t, 2, -1 do
-        local j = math.random(i)
-        t[i], t[j] = t[j], t[i]
-    end
-    return t
-end
-
-local function orderNumbers(numbers)
+local function pickNextNumber(numbers)
     local mode = getgenv().PaintBotDrawMode or "ascending"
     if mode == "descending" then
-        table.sort(numbers, function(a, b) return a > b end)
+        local best = numbers[1]
+        for _, n in ipairs(numbers) do
+            if n > best then best = n end
+        end
+        return best
     elseif mode == "random" then
-        table.sort(numbers) -- consistent base order first
-        shuffle(numbers)
+        return numbers[math.random(#numbers)]
     else
-        table.sort(numbers) -- ascending
+        local best = numbers[1]
+        for _, n in ipairs(numbers) do
+            if n < best then best = n end
+        end
+        return best
     end
-    return numbers
 end
 
 local ProgressLabel, ProgressBarFill
@@ -395,48 +393,44 @@ task.spawn(function()
         for n, _ in pairs(groups) do
             table.insert(numbers, n)
         end
-        orderNumbers(numbers)
 
         if #numbers == 0 then
             log("No unpainted pixels found. Picture appears complete!")
             break
         end
 
-        for _, n in ipairs(numbers) do
-            if not getgenv().PaintBotRunning then break end
+        local n = pickNextNumber(numbers)
+        selectNumber(n)
 
-            selectNumber(n)
-
-            -- Keep working this number until no unpainted pixels with it remain
-            while getgenv().PaintBotRunning do
-                -- re-scan live so we pick up pixels painted by chance and skip stale ones
-                local remaining = {}
-                for _, part in ipairs(activePicture:GetChildren()) do
-                    if part:IsA("BasePart") and part:GetAttribute("N") == n and part:GetAttribute("D") == false then
-                        table.insert(remaining, part)
-                    end
+        -- Keep working this number until no unpainted pixels with it remain
+        while getgenv().PaintBotRunning do
+            -- re-scan live so we pick up pixels painted by chance and skip stale ones
+            local remaining = {}
+            for _, part in ipairs(activePicture:GetChildren()) do
+                if part:IsA("BasePart") and part:GetAttribute("N") == n and part:GetAttribute("D") == false then
+                    table.insert(remaining, part)
                 end
+            end
 
-                if #remaining == 0 then
-                    break
+            if #remaining == 0 then
+                break
+            end
+
+            -- pick nearest remaining pixel for this number
+            local nearest, nearestDist = nil, math.huge
+            for _, part in ipairs(remaining) do
+                local d = distanceXZ(hrp.Position, part.Position)
+                if d < nearestDist then
+                    nearestDist = d
+                    nearest = part
                 end
+            end
 
-                -- pick nearest remaining pixel for this number
-                local nearest, nearestDist = nil, math.huge
-                for _, part in ipairs(remaining) do
-                    local d = distanceXZ(hrp.Position, part.Position)
-                    if d < nearestDist then
-                        nearestDist = d
-                        nearest = part
-                    end
-                end
-
-                if nearest then
-                    log("Walking to pixel N=" .. tostring(n) .. " at distance " .. math.floor(nearestDist))
-                    local success = walkToPixel(nearest, humanoid, hrp)
-                    if not success then
-                        log("Timed out / gave up on a pixel, moving on")
-                    end
+            if nearest then
+                log("Walking to pixel N=" .. tostring(n) .. " at distance " .. math.floor(nearestDist))
+                local success = walkToPixel(nearest, humanoid, hrp)
+                if not success then
+                    log("Timed out / gave up on a pixel, moving on")
                 end
             end
         end
