@@ -3,9 +3,14 @@
     -----------------------------
     Finds your own plot's ActivePicture folder, groups unpainted pixels
     (Parts with attribute D == false) by their color number (attribute N),
-    fires the SelectNumber remote to pick that color, then walks to each
-    matching pixel until it's painted (D flips to true), before moving to
-    the next number. Repeats until nothing unpainted is left.
+    fires the SelectNumber remote to pick that color, then walks continuously
+    across matching pixels until they're painted (D flips to true), before
+    moving to the next number. Repeats until nothing unpainted is left.
+
+    CONTINUOUS MODE (default): the character never stops to wait for a single
+    pixel to paint. The nearest still-unpainted pixel of the current number is
+    re-evaluated every retargetInterval seconds, so motion stays smooth and
+    the bot streams through clusters without the old "stop → wait → go" stutter.
 
     CONTROLS (run in console):
         PaintBotStop()    -- stops the bot cleanly (cannot be resumed)
@@ -27,11 +32,25 @@ local CONFIG = {
     -- username here (case-sensitive) and re-run.
     plotOwnerName = nil,
 
-    -- How close (studs, horizontal XZ distance) counts as "arrived" at a pixel
+    -- CONTINUOUS MODE: keep the character in motion and retarget the nearest
+    -- still-unpainted pixel of the current number on a short interval.
+    -- When true, paintWaitTimeout is ignored and there is no intentional
+    -- stop-and-wait on each pixel. Set false to restore the legacy
+    -- "walk → arrive → wait for paint" behaviour.
+    continuousMode = true,
+
+    -- How often (seconds) to re-scan for the nearest unpainted pixel and
+    -- re-issue MoveTo while continuousMode is active. 0.1–0.2 is a good range.
+    retargetInterval = 0.1,
+
+    -- How close (studs, horizontal XZ distance) counts as "arrived" at a pixel.
+    -- Only used in legacy (continuousMode = false) mode for the paint-wait gate.
+    -- In continuous mode the bot never waits on arrival; this is unused there.
     arriveDistance = 3,
 
-    -- After arriving, how long to wait for the game to auto-paint (D flips
-    -- to true) before giving up on this pixel and moving to the next
+    -- LEGACY ONLY (continuousMode = false): after arriving, how long to wait
+    -- for the game to auto-paint (D flips to true) before giving up on this
+    -- pixel and moving to the next. Ignored when continuousMode is true.
     paintWaitTimeout = 2,
 
     -- Delay after firing SelectNumber before starting to walk, to give the
@@ -72,7 +91,8 @@ local CONFIG = {
     -- so the ~20 minute AFK kick doesn't happen during long runs.
     antiAfk = true,
 
-    -- Print progress as it works
+    -- Print progress as it works. In continuous mode, per-pixel walk logs
+    -- are throttled so the console isn't spammed every retarget.
     verbose = true,
 
     -- Default WalkSpeed to apply to the local player once the bot has
@@ -184,6 +204,11 @@ local function findOwnPlot()
     return best
 end
 
+local function distanceXZ(a, b)
+    local dx, dz = a.X - b.X, a.Z - b.Z
+    return math.sqrt(dx * dx + dz * dz)
+end
+
 local function gatherUnpaintedByNumber(activePicture)
     local groups = {}
     for _, part in ipairs(activePicture:GetChildren()) do
@@ -199,6 +224,35 @@ local function gatherUnpaintedByNumber(activePicture)
     return groups
 end
 
+-- Live scan: all still-unpainted parts for a single number N.
+-- skipSet (optional): weak set of parts to ignore this pass (stuck give-ups).
+local function gatherRemainingForNumber(activePicture, n, skipSet)
+    local remaining = {}
+    for _, part in ipairs(activePicture:GetChildren()) do
+        if part:IsA("BasePart")
+            and part:GetAttribute("N") == n
+            and part:GetAttribute("D") == false
+            and not (skipSet and skipSet[part]) then
+            table.insert(remaining, part)
+        end
+    end
+    return remaining
+end
+
+local function findNearestPixel(parts, hrp)
+    local nearest, nearestDist = nil, math.huge
+    for _, part in ipairs(parts) do
+        if part and part.Parent then
+            local d = distanceXZ(hrp.Position, part.Position)
+            if d < nearestDist then
+                nearestDist = d
+                nearest = part
+            end
+        end
+    end
+    return nearest, nearestDist
+end
+
 local function selectNumber(n)
     local okFire, errFire = pcall(function()
         SelectNumberEvent:FireServer(n)
@@ -210,10 +264,6 @@ local function selectNumber(n)
     task.wait(CONFIG.selectNumberSettleTime)
 end
 
-local function distanceXZ(a, b)
-    local dx, dz = a.X - b.X, a.Z - b.Z
-    return math.sqrt(dx * dx + dz * dz)
-end
 
 -- Config save/load (persists drawMode across game rejoins)
 local function loadConfig()
@@ -657,6 +707,16 @@ local function attemptUnstick(humanoid, hrp, targetPos)
     humanoid:MoveTo(targetPos)
 end
 
+-- Returns true if the part is still a valid unpainted target.
+local function isPixelStillOpen(part)
+    return part ~= nil
+        and part.Parent ~= nil
+        and part:GetAttribute("D") ~= true
+end
+
+----------------------------------------------------------------
+-- LEGACY walk-to-one-pixel (used only when continuousMode = false)
+----------------------------------------------------------------
 local function walkToPixel(part, humanoid, hrp, expectedMode)
     humanoid:MoveTo(part.Position)
     local waited = 0
@@ -730,6 +790,155 @@ local function walkToPixel(part, humanoid, hrp, expectedMode)
     return false
 end
 
+----------------------------------------------------------------
+-- CONTINUOUS MODE: keep moving across all pixels of number N.
+-- Never stops to wait for a paint confirmation. Retargets the
+-- nearest still-unpainted pixel every CONFIG.retargetInterval.
+----------------------------------------------------------------
+local function paintNumberContinuous(n, activePicture, humanoid, hrp, expectedMode)
+    local skipSet = {} -- parts we gave up on this pass (stuck); retried next number cycle
+    local currentTarget = nil
+    local stuckRecoveries = 0
+    local lastCheckPos = hrp.Position
+    local lastCheckTime = tick()
+    local lastLogTime = 0
+    local lastRemainingLog = -1
+    local tickInterval = CONFIG.retargetInterval or 0.1
+
+    log("Continuous paint starting for N=" .. tostring(n))
+
+    while getgenv().PaintBotRunning do
+        -- Pause: freeze in place, reset stuck clock on resume
+        if getgenv().PaintBotPaused then
+            waitWhilePaused()
+            if not getgenv().PaintBotRunning then
+                return
+            end
+            lastCheckPos = hrp.Position
+            lastCheckTime = tick()
+            -- Re-issue move toward whatever we were heading to (or retarget below)
+            if currentTarget and isPixelStillOpen(currentTarget) then
+                humanoid:MoveTo(currentTarget.Position)
+            end
+        end
+
+        if not getgenv().PaintBotRunning then
+            return
+        end
+
+        -- Draw mode changed mid-color — abandon immediately so outer loop re-picks
+        if expectedMode and getgenv().PaintBotDrawMode ~= expectedMode then
+            log("Mode changed mid-color -- switching immediately")
+            return
+        end
+
+        -- Live scan of still-unpainted pixels for this number
+        local remaining = gatherRemainingForNumber(activePicture, n, skipSet)
+        if #remaining == 0 then
+            -- If we only emptied the list because of skips, clear skips once
+            -- and retry anything still actually unpainted before giving up.
+            if next(skipSet) ~= nil then
+                local anyLeft = gatherRemainingForNumber(activePicture, n, nil)
+                if #anyLeft > 0 then
+                    skipSet = {}
+                    stuckRecoveries = 0
+                    remaining = anyLeft
+                else
+                    break
+                end
+            else
+                break
+            end
+        end
+
+        local nearest, nearestDist = findNearestPixel(remaining, hrp)
+        if not nearest then
+            break
+        end
+
+        -- Retarget whenever the nearest open pixel changes (painted, destroyed,
+        -- or a closer one appeared). Never wait on the old target.
+        local targetChanged = (nearest ~= currentTarget)
+        if targetChanged then
+            currentTarget = nearest
+            stuckRecoveries = 0
+            lastCheckPos = hrp.Position
+            lastCheckTime = tick()
+            humanoid:MoveTo(currentTarget.Position)
+
+            -- Throttled log: at most once per ~1.5s, or when remaining count drops
+            local now = tick()
+            if now - lastLogTime >= 1.5 or #remaining ~= lastRemainingLog then
+                log(string.format(
+                    "N=%s  target dist=%d  remaining=%d",
+                    tostring(n), math.floor(nearestDist), #remaining))
+                lastLogTime = now
+                lastRemainingLog = #remaining
+            end
+        else
+            -- Same target still open — periodically re-issue MoveTo in case
+            -- pathing stalled without a full stuck event, and keep moving.
+            humanoid:MoveTo(currentTarget.Position)
+        end
+
+        -- Stuck check (same recovery logic as legacy, but on give-up we skip
+        -- this pixel and immediately retarget the next nearest instead of
+        -- blocking in a paint-wait loop).
+        if tick() - lastCheckTime >= CONFIG.stuckCheckInterval then
+            local moved = distanceXZ(hrp.Position, lastCheckPos)
+            if moved < CONFIG.stuckMoveThreshold then
+                stuckRecoveries = stuckRecoveries + 1
+                if stuckRecoveries > CONFIG.maxStuckRecoveries then
+                    log("Skipping stuck pixel N=" .. tostring(n) .. " after", stuckRecoveries, "recoveries")
+                    skipSet[currentTarget] = true
+                    currentTarget = nil
+                    stuckRecoveries = 0
+                else
+                    local targetPos = currentTarget and currentTarget.Position or hrp.Position
+                    attemptUnstick(humanoid, hrp, targetPos)
+                end
+            end
+            lastCheckPos = hrp.Position
+            lastCheckTime = tick()
+        end
+
+        task.wait(tickInterval)
+    end
+
+    log("Finished continuous pass for N=" .. tostring(n))
+end
+
+----------------------------------------------------------------
+-- LEGACY per-pixel loop for one number (continuousMode = false)
+----------------------------------------------------------------
+local function paintNumberLegacy(n, activePicture, humanoid, hrp, expectedMode)
+    while getgenv().PaintBotRunning do
+        waitWhilePaused()
+        if not getgenv().PaintBotRunning then
+            break
+        end
+
+        if getgenv().PaintBotDrawMode ~= expectedMode then
+            log("Mode changed mid-color -- switching immediately")
+            break
+        end
+
+        local remaining = gatherRemainingForNumber(activePicture, n, nil)
+        if #remaining == 0 then
+            break
+        end
+
+        local nearest, nearestDist = findNearestPixel(remaining, hrp)
+        if nearest then
+            log("Walking to pixel N=" .. tostring(n) .. " at distance " .. math.floor(nearestDist))
+            local success = walkToPixel(nearest, humanoid, hrp, expectedMode)
+            if not success then
+                log("Timed out / gave up on a pixel, moving on")
+            end
+        end
+    end
+end
+
 task.spawn(function()
     local plot = findOwnPlot()
     if not plot then
@@ -770,6 +979,11 @@ task.spawn(function()
     armSpeedHook()
 
     log("Starting. Scanning for unpainted pixels...")
+    if CONFIG.continuousMode then
+        log("Continuous mode ON (retarget every", CONFIG.retargetInterval, "s)")
+    else
+        log("Legacy mode ON (arrive + paint-wait)")
+    end
 
     while getgenv().PaintBotRunning do
         waitWhilePaused()
@@ -777,11 +991,18 @@ task.spawn(function()
             break
         end
 
+        -- Refresh character refs in case of respawn mid-run
+        char = LocalPlayer.Character
+        if char then
+            humanoid = char:FindFirstChildOfClass("Humanoid") or humanoid
+            hrp = char:FindFirstChild("HumanoidRootPart") or hrp
+        end
+
         local groups = gatherUnpaintedByNumber(activePicture)
 
         local numbers = {}
-        for n, _ in pairs(groups) do
-            table.insert(numbers, n)
+        for num, _ in pairs(groups) do
+            table.insert(numbers, num)
         end
 
         if #numbers == 0 then
@@ -795,46 +1016,10 @@ task.spawn(function()
 
         -- Keep working this number until no unpainted pixels with it remain,
         -- OR until the draw mode changes (then abandon and re-pick immediately)
-        while getgenv().PaintBotRunning do
-            waitWhilePaused()
-            if not getgenv().PaintBotRunning then
-                break
-            end
-
-            if getgenv().PaintBotDrawMode ~= workingMode then
-                log("Mode changed mid-color -- switching immediately")
-                break
-            end
-
-            -- re-scan live so we pick up pixels painted by chance and skip stale ones
-            local remaining = {}
-            for _, part in ipairs(activePicture:GetChildren()) do
-                if part:IsA("BasePart") and part:GetAttribute("N") == n and part:GetAttribute("D") == false then
-                    table.insert(remaining, part)
-                end
-            end
-
-            if #remaining == 0 then
-                break
-            end
-
-            -- pick nearest remaining pixel for this number
-            local nearest, nearestDist = nil, math.huge
-            for _, part in ipairs(remaining) do
-                local d = distanceXZ(hrp.Position, part.Position)
-                if d < nearestDist then
-                    nearestDist = d
-                    nearest = part
-                end
-            end
-
-            if nearest then
-                log("Walking to pixel N=" .. tostring(n) .. " at distance " .. math.floor(nearestDist))
-                local success = walkToPixel(nearest, humanoid, hrp, workingMode)
-                if not success then
-                    log("Timed out / gave up on a pixel, moving on")
-                end
-            end
+        if CONFIG.continuousMode then
+            paintNumberContinuous(n, activePicture, humanoid, hrp, workingMode)
+        else
+            paintNumberLegacy(n, activePicture, humanoid, hrp, workingMode)
         end
     end
 
