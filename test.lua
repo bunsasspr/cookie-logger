@@ -49,6 +49,11 @@ local CONFIG = {
     showProgressUI = true,
     progressUpdateInterval = 0.5,
 
+    -- Order colors are worked through: "ascending" (1->30), "descending"
+    -- (30->1), or "random" (shuffled each pass). Can also be changed live
+    -- via the buttons on the progress UI.
+    drawMode = "ascending",
+
     -- Print progress as it works
     verbose = true,
 }
@@ -156,6 +161,30 @@ local function distanceXZ(a, b)
     return math.sqrt(dx * dx + dz * dz)
 end
 
+-- Live-adjustable draw mode (buttons on the UI can change this mid-run)
+getgenv().PaintBotDrawMode = CONFIG.drawMode
+
+local function shuffle(t)
+    for i = #t, 2, -1 do
+        local j = math.random(i)
+        t[i], t[j] = t[j], t[i]
+    end
+    return t
+end
+
+local function orderNumbers(numbers)
+    local mode = getgenv().PaintBotDrawMode or "ascending"
+    if mode == "descending" then
+        table.sort(numbers, function(a, b) return a > b end)
+    elseif mode == "random" then
+        table.sort(numbers) -- consistent base order first
+        shuffle(numbers)
+    else
+        table.sort(numbers) -- ascending
+    end
+    return numbers
+end
+
 local ProgressLabel, ProgressBarFill
 
 local function createProgressUI()
@@ -194,6 +223,46 @@ local function createProgressUI()
     ProgressBarFill.BackgroundColor3 = Color3.fromRGB(0, 255, 140)
     ProgressBarFill.Parent = barBG
     Instance.new("UICorner", ProgressBarFill).CornerRadius = UDim.new(0, 6)
+
+    -- Draw mode buttons
+    frame.Size = UDim2.new(0, 220, 0, 76)
+
+    local modeRow = Instance.new("Frame")
+    modeRow.Size = UDim2.new(0.9, 0, 0, 22)
+    modeRow.Position = UDim2.new(0.05, 0, 0, 44)
+    modeRow.BackgroundTransparency = 1
+    modeRow.Parent = frame
+
+    local modeButtons = {}
+    local function setActiveMode(mode)
+        getgenv().PaintBotDrawMode = mode
+        for m, btn in pairs(modeButtons) do
+            btn.BackgroundColor3 = (m == mode) and Color3.fromRGB(0, 255, 140) or Color3.fromRGB(60, 60, 60)
+            btn.BackgroundTransparency = (m == mode) and 0.3 or 0.6
+        end
+    end
+
+    local modes = {"ascending", "descending", "random"}
+    local labels = {ascending = "Asc", descending = "Desc", random = "Random"}
+    for i, mode in ipairs(modes) do
+        local btn = Instance.new("TextButton")
+        btn.Size = UDim2.new(1/3, -4, 1, 0)
+        btn.Position = UDim2.new((i - 1) / 3, 2, 0, 0)
+        btn.Text = labels[mode]
+        btn.Font = Enum.Font.GothamBold
+        btn.TextSize = 11
+        btn.TextColor3 = Color3.new(1, 1, 1)
+        btn.BackgroundColor3 = Color3.fromRGB(60, 60, 60)
+        btn.BackgroundTransparency = 0.6
+        btn.Parent = modeRow
+        Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 4)
+        modeButtons[mode] = btn
+        btn.MouseButton1Click:Connect(function()
+            setActiveMode(mode)
+        end)
+    end
+
+    setActiveMode(getgenv().PaintBotDrawMode or "ascending")
 end
 
 local function updateProgressUI(activePicture)
@@ -326,7 +395,7 @@ task.spawn(function()
         for n, _ in pairs(groups) do
             table.insert(numbers, n)
         end
-        table.sort(numbers)
+        orderNumbers(numbers)
 
         if #numbers == 0 then
             log("No unpainted pixels found. Picture appears complete!")
