@@ -1,0 +1,378 @@
+--[[
+    Paint-by-Number Auto Painter
+    -----------------------------
+    Finds your own plot's ActivePicture folder, groups unpainted pixels
+    (Parts with attribute D == false) by their color number (attribute N),
+    fires the SelectNumber remote to pick that color, then walks to each
+    matching pixel until it's painted (D flips to true), before moving to
+    the next number. Repeats until nothing unpainted is left.
+
+    CONTROLS (run in console):
+        PaintBotStop()   -- stops the bot cleanly
+
+    CONFIG — check these before running
+]]
+
+local CONFIG = {
+    -- If auto-detection of your plot fails, set your exact in-game
+    -- username here (case-sensitive) and re-run.
+    plotOwnerName = nil,
+
+    -- How close (studs, horizontal XZ distance) counts as "arrived" at a pixel
+    arriveDistance = 3,
+
+    -- After arriving, how long to wait for the game to auto-paint (D flips
+    -- to true) before giving up on this pixel and moving to the next
+    paintWaitTimeout = 2,
+
+    -- Delay after firing SelectNumber before starting to walk, to give the
+    -- game time to register the color switch
+    selectNumberSettleTime = 0.25,
+
+    -- Optional walk speed boost. Set to nil to leave WalkSpeed untouched.
+    walkSpeedOverride = nil,
+
+    -- STUCK RECOVERY: how often (seconds) to check whether the character
+    -- has actually moved while walking to a pixel
+    stuckCheckInterval = 1.0,
+
+    -- If the character has moved less than this many studs since the last
+    -- check, it's considered stuck
+    stuckMoveThreshold = 1.5,
+
+    -- How many recovery attempts to make on a single pixel before giving
+    -- up on it entirely and moving to a different one (it'll be picked up
+    -- again on a later pass if still unpainted)
+    maxStuckRecoveries = 3,
+
+    -- On-screen progress bar
+    showProgressUI = true,
+    progressUpdateInterval = 0.5,
+
+    -- Print progress as it works
+    verbose = true,
+}
+
+----------------------------------------------------------------
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local LocalPlayer = Players.LocalPlayer
+
+local SelectNumberEvent = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("SelectNumber")
+
+local function log(...)
+    if CONFIG.verbose then
+        print("[PaintBot]", ...)
+    end
+end
+
+-- Stop switch
+if getgenv().PaintBotRunning then
+    getgenv().PaintBotRunning = false
+    task.wait(0.3)
+end
+getgenv().PaintBotRunning = true
+getgenv().PaintBotStop = function()
+    getgenv().PaintBotRunning = false
+    print("[PaintBot] Stop requested.")
+end
+
+local function findOwnPlot()
+    local plotModels = workspace:FindFirstChild("Map") and workspace.Map:FindFirstChild("PlotModels")
+    if not plotModels then
+        warn("[PaintBot] Could not find Workspace.Map.PlotModels")
+        return nil
+    end
+
+    -- 1) Try exact name match (config override or player's own name)
+    local tryName = CONFIG.plotOwnerName or LocalPlayer.Name
+    local plot = plotModels:FindFirstChild(tryName)
+    if plot and plot:FindFirstChild("ActivePicture") then
+        log("Found plot by name match:", plot.Name)
+        return plot
+    end
+
+    -- 2) Fallback: closest plot to the player's character
+    local char = LocalPlayer.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if not hrp then
+        warn("[PaintBot] No character/HumanoidRootPart to use for fallback plot detection")
+        return nil
+    end
+
+    local best, bestDist = nil, math.huge
+    for _, candidate in ipairs(plotModels:GetChildren()) do
+        local ap = candidate:FindFirstChild("ActivePicture")
+        if ap then
+            local base = candidate:FindFirstChild("PersistentParts")
+            local refPart = (base and base:FindFirstChild("Base")) or ap:FindFirstChildWhichIsA("Part")
+            if refPart then
+                local d = (refPart.Position - hrp.Position).Magnitude
+                if d < bestDist then
+                    bestDist = d
+                    best = candidate
+                end
+            end
+        end
+    end
+
+    if best then
+        log("Found plot by proximity fallback:", best.Name, "(distance:", math.floor(bestDist), "studs)")
+    else
+        warn("[PaintBot] Could not find any plot with an ActivePicture folder")
+    end
+    return best
+end
+
+local function gatherUnpaintedByNumber(activePicture)
+    local groups = {}
+    for _, part in ipairs(activePicture:GetChildren()) do
+        if part:IsA("BasePart") then
+            local done = part:GetAttribute("D")
+            local n = part:GetAttribute("N")
+            if done == false and n ~= nil then
+                groups[n] = groups[n] or {}
+                table.insert(groups[n], part)
+            end
+        end
+    end
+    return groups
+end
+
+local function selectNumber(n)
+    local okFire, errFire = pcall(function()
+        SelectNumberEvent:FireServer(n)
+    end)
+    if not okFire then
+        warn("[PaintBot] Failed to fire SelectNumber:", errFire)
+    end
+    log("Selected number", n)
+    task.wait(CONFIG.selectNumberSettleTime)
+end
+
+local function distanceXZ(a, b)
+    local dx, dz = a.X - b.X, a.Z - b.Z
+    return math.sqrt(dx * dx + dz * dz)
+end
+
+local ProgressLabel, ProgressBarFill
+
+local function createProgressUI()
+    local screenGui = Instance.new("ScreenGui")
+    screenGui.Name = "PaintBotProgressUI"
+    screenGui.ResetOnSpawn = false
+    screenGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+
+    local frame = Instance.new("Frame")
+    frame.Size = UDim2.new(0, 220, 0, 50)
+    frame.Position = UDim2.new(0.5, -110, 0, 20)
+    frame.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+    frame.BackgroundTransparency = 0.25
+    frame.Parent = screenGui
+    Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 8)
+
+    ProgressLabel = Instance.new("TextLabel")
+    ProgressLabel.Size = UDim2.new(1, 0, 0, 18)
+    ProgressLabel.Position = UDim2.new(0, 0, 0, 2)
+    ProgressLabel.BackgroundTransparency = 1
+    ProgressLabel.TextColor3 = Color3.new(1, 1, 1)
+    ProgressLabel.Font = Enum.Font.GothamBold
+    ProgressLabel.TextSize = 13
+    ProgressLabel.Text = "PaintBot: 0% (0/0)"
+    ProgressLabel.Parent = frame
+
+    local barBG = Instance.new("Frame")
+    barBG.Size = UDim2.new(0.9, 0, 0, 12)
+    barBG.Position = UDim2.new(0.05, 0, 0, 26)
+    barBG.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+    barBG.Parent = frame
+    Instance.new("UICorner", barBG).CornerRadius = UDim.new(0, 6)
+
+    ProgressBarFill = Instance.new("Frame")
+    ProgressBarFill.Size = UDim2.new(0, 0, 1, 0)
+    ProgressBarFill.BackgroundColor3 = Color3.fromRGB(0, 255, 140)
+    ProgressBarFill.Parent = barBG
+    Instance.new("UICorner", ProgressBarFill).CornerRadius = UDim.new(0, 6)
+end
+
+local function updateProgressUI(activePicture)
+    if not ProgressLabel or not ProgressBarFill then return end
+
+    local total, done = 0, 0
+    for _, part in ipairs(activePicture:GetChildren()) do
+        if part:IsA("BasePart") and part:GetAttribute("N") ~= nil then
+            total = total + 1
+            if part:GetAttribute("D") == true then
+                done = done + 1
+            end
+        end
+    end
+
+    local pct = total > 0 and math.floor((done / total) * 100) or 0
+    ProgressLabel.Text = string.format("PaintBot: %d%% (%d/%d)", pct, done, total)
+    ProgressBarFill.Size = UDim2.new(pct / 100, 0, 1, 0)
+end
+
+local function attemptUnstick(humanoid, hrp, targetPos)
+    log("Stuck detected, attempting recovery...")
+    -- Jump in place first, sometimes enough to pop free of geometry
+    humanoid.Jump = true
+    task.wait(0.2)
+
+    -- Nudge toward a small random offset near current position to break
+    -- out of a bad pathing lock, then re-issue the real move
+    local nudge = hrp.Position + Vector3.new(
+        (math.random() - 0.5) * 6,
+        0,
+        (math.random() - 0.5) * 6
+    )
+    humanoid:MoveTo(nudge)
+    task.wait(0.5)
+
+    humanoid:MoveTo(targetPos)
+end
+
+local function walkToPixel(part, humanoid, hrp)
+    humanoid:MoveTo(part.Position)
+    local waited = 0
+
+    local lastCheckPos = hrp.Position
+    local lastCheckTime = tick()
+    local stuckRecoveries = 0
+
+    while getgenv().PaintBotRunning and waited < 10 do
+        if not part or not part.Parent then
+            return true -- disappeared/painted and cleaned up
+        end
+        if part:GetAttribute("D") == true then
+            return true
+        end
+        if distanceXZ(hrp.Position, part.Position) <= CONFIG.arriveDistance then
+            -- arrived, give the game a moment to auto-paint
+            local paintWaited = 0
+            while getgenv().PaintBotRunning and paintWaited < CONFIG.paintWaitTimeout do
+                if not part.Parent or part:GetAttribute("D") == true then
+                    return true
+                end
+                task.wait(0.1)
+                paintWaited = paintWaited + 0.1
+            end
+            return part.Parent == nil or part:GetAttribute("D") == true
+        end
+
+        -- Stuck check: has the character actually moved recently?
+        if tick() - lastCheckTime >= CONFIG.stuckCheckInterval then
+            local moved = distanceXZ(hrp.Position, lastCheckPos)
+            if moved < CONFIG.stuckMoveThreshold then
+                stuckRecoveries = stuckRecoveries + 1
+                if stuckRecoveries > CONFIG.maxStuckRecoveries then
+                    log("Gave up on this pixel after", stuckRecoveries, "stuck recoveries")
+                    return false
+                end
+                attemptUnstick(humanoid, hrp, part.Position)
+            end
+            lastCheckPos = hrp.Position
+            lastCheckTime = tick()
+        end
+
+        task.wait(0.1)
+        waited = waited + 0.1
+    end
+    return false
+end
+
+task.spawn(function()
+    local plot = findOwnPlot()
+    if not plot then
+        warn("[PaintBot] Aborting - no plot found. Set CONFIG.plotOwnerName manually and retry.")
+        getgenv().PaintBotRunning = false
+        return
+    end
+
+    local activePicture = plot:FindFirstChild("ActivePicture")
+    if not activePicture then
+        warn("[PaintBot] Plot has no ActivePicture folder")
+        getgenv().PaintBotRunning = false
+        return
+    end
+
+    local char = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+    local humanoid = char:FindFirstChildOfClass("Humanoid")
+    local hrp = char:WaitForChild("HumanoidRootPart")
+
+    if CONFIG.walkSpeedOverride then
+        humanoid.WalkSpeed = CONFIG.walkSpeedOverride
+    end
+
+    if CONFIG.showProgressUI then
+        createProgressUI()
+        task.spawn(function()
+            while getgenv().PaintBotRunning do
+                updateProgressUI(activePicture)
+                task.wait(CONFIG.progressUpdateInterval)
+            end
+            -- final update so it shows 100% / final state before stopping
+            updateProgressUI(activePicture)
+        end)
+    end
+
+    log("Starting. Scanning for unpainted pixels...")
+
+    while getgenv().PaintBotRunning do
+        local groups = gatherUnpaintedByNumber(activePicture)
+
+        local numbers = {}
+        for n, _ in pairs(groups) do
+            table.insert(numbers, n)
+        end
+        table.sort(numbers)
+
+        if #numbers == 0 then
+            log("No unpainted pixels found. Picture appears complete!")
+            break
+        end
+
+        for _, n in ipairs(numbers) do
+            if not getgenv().PaintBotRunning then break end
+
+            selectNumber(n)
+
+            -- Keep working this number until no unpainted pixels with it remain
+            while getgenv().PaintBotRunning do
+                -- re-scan live so we pick up pixels painted by chance and skip stale ones
+                local remaining = {}
+                for _, part in ipairs(activePicture:GetChildren()) do
+                    if part:IsA("BasePart") and part:GetAttribute("N") == n and part:GetAttribute("D") == false then
+                        table.insert(remaining, part)
+                    end
+                end
+
+                if #remaining == 0 then
+                    break
+                end
+
+                -- pick nearest remaining pixel for this number
+                local nearest, nearestDist = nil, math.huge
+                for _, part in ipairs(remaining) do
+                    local d = distanceXZ(hrp.Position, part.Position)
+                    if d < nearestDist then
+                        nearestDist = d
+                        nearest = part
+                    end
+                end
+
+                if nearest then
+                    log("Walking to pixel N=" .. tostring(n) .. " at distance " .. math.floor(nearestDist))
+                    local success = walkToPixel(nearest, humanoid, hrp)
+                    if not success then
+                        log("Timed out / gave up on a pixel, moving on")
+                    end
+                end
+            end
+        end
+    end
+
+    log("Finished (or stopped).")
+    getgenv().PaintBotRunning = false
+end)
