@@ -54,6 +54,15 @@ local CONFIG = {
     -- via the buttons on the progress UI.
     drawMode = "ascending",
 
+    -- Persist settings (currently just drawMode) to a file so they survive
+    -- rejoining the game. Requires writefile/readfile/isfile support.
+    saveConfig = true,
+    configFile = "paintbot_config.json",
+
+    -- Anti-AFK: nudges the game whenever Roblox's own idle detector fires,
+    -- so the ~20 minute AFK kick doesn't happen during long runs.
+    antiAfk = true,
+
     -- Print progress as it works
     verbose = true,
 }
@@ -62,6 +71,8 @@ local CONFIG = {
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local HttpService = game:GetService("HttpService")
+local VirtualUser = game:GetService("VirtualUser")
 local LocalPlayer = Players.LocalPlayer
 
 local SelectNumberEvent = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("SelectNumber")
@@ -161,8 +172,48 @@ local function distanceXZ(a, b)
     return math.sqrt(dx * dx + dz * dz)
 end
 
+-- Config save/load (persists drawMode across game rejoins)
+local function loadConfig()
+    if not CONFIG.saveConfig then return end
+    local ok, exists = pcall(function() return isfile and isfile(CONFIG.configFile) end)
+    if not ok or not exists then return end
+
+    local okRead, content = pcall(function() return readfile(CONFIG.configFile) end)
+    if not okRead or not content then return end
+
+    local okDecode, data = pcall(function() return HttpService:JSONDecode(content) end)
+    if okDecode and type(data) == "table" and data.drawMode then
+        getgenv().PaintBotDrawMode = data.drawMode
+        log("Loaded saved config, drawMode =", data.drawMode)
+    end
+end
+
+local function saveConfigToFile()
+    if not CONFIG.saveConfig then return end
+    local data = { drawMode = getgenv().PaintBotDrawMode }
+    local okEncode, json = pcall(function() return HttpService:JSONEncode(data) end)
+    if okEncode then
+        pcall(function() writefile(CONFIG.configFile, json) end)
+    end
+end
+
+-- Anti-AFK: fires whenever Roblox detects no input for a while, simulating
+-- a harmless click to reset its internal idle timer
+local function setupAntiAfk()
+    if not CONFIG.antiAfk then return end
+    LocalPlayer.Idled:Connect(function()
+        log("Anti-AFK: nudging to prevent idle kick")
+        pcall(function()
+            VirtualUser:CaptureController()
+            VirtualUser:ClickButton2(Vector2.new())
+        end)
+    end)
+end
+setupAntiAfk()
+
 -- Live-adjustable draw mode (buttons on the UI can change this mid-run)
 getgenv().PaintBotDrawMode = CONFIG.drawMode
+loadConfig()
 
 local function pickNextNumber(numbers)
     local mode = getgenv().PaintBotDrawMode or "ascending"
