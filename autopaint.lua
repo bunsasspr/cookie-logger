@@ -32,6 +32,19 @@ local CONFIG = {
     -- Optional walk speed boost. Set to nil to leave WalkSpeed untouched.
     walkSpeedOverride = nil,
 
+    -- STUCK RECOVERY: how often (seconds) to check whether the character
+    -- has actually moved while walking to a pixel
+    stuckCheckInterval = 1.0,
+
+    -- If the character has moved less than this many studs since the last
+    -- check, it's considered stuck
+    stuckMoveThreshold = 1.5,
+
+    -- How many recovery attempts to make on a single pixel before giving
+    -- up on it entirely and moving to a different one (it'll be picked up
+    -- again on a later pass if still unpainted)
+    maxStuckRecoveries = 3,
+
     -- Print progress as it works
     verbose = true,
 }
@@ -139,9 +152,33 @@ local function distanceXZ(a, b)
     return math.sqrt(dx * dx + dz * dz)
 end
 
+local function attemptUnstick(humanoid, hrp, targetPos)
+    log("Stuck detected, attempting recovery...")
+    -- Jump in place first, sometimes enough to pop free of geometry
+    humanoid.Jump = true
+    task.wait(0.2)
+
+    -- Nudge toward a small random offset near current position to break
+    -- out of a bad pathing lock, then re-issue the real move
+    local nudge = hrp.Position + Vector3.new(
+        (math.random() - 0.5) * 6,
+        0,
+        (math.random() - 0.5) * 6
+    )
+    humanoid:MoveTo(nudge)
+    task.wait(0.5)
+
+    humanoid:MoveTo(targetPos)
+end
+
 local function walkToPixel(part, humanoid, hrp)
     humanoid:MoveTo(part.Position)
     local waited = 0
+
+    local lastCheckPos = hrp.Position
+    local lastCheckTime = tick()
+    local stuckRecoveries = 0
+
     while getgenv().PaintBotRunning and waited < 10 do
         if not part or not part.Parent then
             return true -- disappeared/painted and cleaned up
@@ -161,6 +198,22 @@ local function walkToPixel(part, humanoid, hrp)
             end
             return part.Parent == nil or part:GetAttribute("D") == true
         end
+
+        -- Stuck check: has the character actually moved recently?
+        if tick() - lastCheckTime >= CONFIG.stuckCheckInterval then
+            local moved = distanceXZ(hrp.Position, lastCheckPos)
+            if moved < CONFIG.stuckMoveThreshold then
+                stuckRecoveries = stuckRecoveries + 1
+                if stuckRecoveries > CONFIG.maxStuckRecoveries then
+                    log("Gave up on this pixel after", stuckRecoveries, "stuck recoveries")
+                    return false
+                end
+                attemptUnstick(humanoid, hrp, part.Position)
+            end
+            lastCheckPos = hrp.Position
+            lastCheckTime = tick()
+        end
+
         task.wait(0.1)
         waited = waited + 0.1
     end
