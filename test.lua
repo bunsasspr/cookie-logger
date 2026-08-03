@@ -300,7 +300,7 @@ local function attemptUnstick(humanoid, hrp, targetPos)
     humanoid:MoveTo(targetPos)
 end
 
-local function walkToPixel(part, humanoid, hrp)
+local function walkToPixel(part, humanoid, hrp, expectedMode)
     humanoid:MoveTo(part.Position)
     local waited = 0
 
@@ -308,7 +308,13 @@ local function walkToPixel(part, humanoid, hrp)
     local lastCheckTime = tick()
     local stuckRecoveries = 0
 
-    while getgenv().PaintBotRunning and waited < 10 do
+    while getgenv().PaintBotRunning do
+        if expectedMode and getgenv().PaintBotDrawMode ~= expectedMode then
+            return false -- mode changed mid-walk, abandon this pixel immediately
+        end
+        if waited >= 10 then
+            return false
+        end
         if not part or not part.Parent then
             return true -- disappeared/painted and cleaned up
         end
@@ -319,6 +325,9 @@ local function walkToPixel(part, humanoid, hrp)
             -- arrived, give the game a moment to auto-paint
             local paintWaited = 0
             while getgenv().PaintBotRunning and paintWaited < CONFIG.paintWaitTimeout do
+                if expectedMode and getgenv().PaintBotDrawMode ~= expectedMode then
+                    return false
+                end
                 if not part.Parent or part:GetAttribute("D") == true then
                     return true
                 end
@@ -400,10 +409,17 @@ task.spawn(function()
         end
 
         local n = pickNextNumber(numbers)
+        local workingMode = getgenv().PaintBotDrawMode
         selectNumber(n)
 
-        -- Keep working this number until no unpainted pixels with it remain
+        -- Keep working this number until no unpainted pixels with it remain,
+        -- OR until the draw mode changes (then abandon and re-pick immediately)
         while getgenv().PaintBotRunning do
+            if getgenv().PaintBotDrawMode ~= workingMode then
+                log("Mode changed mid-color -- switching immediately")
+                break
+            end
+
             -- re-scan live so we pick up pixels painted by chance and skip stale ones
             local remaining = {}
             for _, part in ipairs(activePicture:GetChildren()) do
@@ -428,7 +444,7 @@ task.spawn(function()
 
             if nearest then
                 log("Walking to pixel N=" .. tostring(n) .. " at distance " .. math.floor(nearestDist))
-                local success = walkToPixel(nearest, humanoid, hrp)
+                local success = walkToPixel(nearest, humanoid, hrp, workingMode)
                 if not success then
                     log("Timed out / gave up on a pixel, moving on")
                 end
