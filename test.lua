@@ -8,7 +8,16 @@
     the next number. Repeats until nothing unpainted is left.
 
     CONTROLS (run in console):
-        PaintBotStop()   -- stops the bot cleanly
+        PaintBotStop()    -- stops the bot cleanly (cannot be resumed)
+        PaintBotPause()   -- pauses in place (can be resumed)
+        PaintBotResume()  -- resumes after a pause
+
+    There's also a Start/Stop button on the on-screen progress UI that
+    does the same pause/resume toggle as the console functions above.
+
+    FPS: other players' canvases are cleared with a repeating sweep (see
+    CONFIG.hideOtherCanvases / canvasScanInterval) so plots/pixels that
+    stream in a moment after you join still get caught.
 
     CONFIG — check these before running
 ]]
@@ -65,6 +74,22 @@ local CONFIG = {
 
     -- Print progress as it works
     verbose = true,
+
+    -- Default WalkSpeed to apply to the local player once the bot has
+    -- started (applies on spawn/respawn too). Set to nil to disable and
+    -- rely solely on walkSpeedOverride above.
+    defaultPlayerSpeed = 50,
+
+    -- FPS BOOST: destroy the pixel parts belonging to every other plot's
+    -- ActivePicture folder (your own plot is left untouched). Runs as a
+    -- repeating sweep rather than a single pass, since other plots (and
+    -- their pixels) can stream in gradually after you join.
+    -- Set to false to leave other canvases alone.
+    hideOtherCanvases = true,
+
+    -- How often (seconds) to re-sweep all plots for the above. Keeps
+    -- catching neighbors/pixels that stream in after the first pass.
+    canvasScanInterval = 1.0,
 }
 
 ----------------------------------------------------------------
@@ -83,32 +108,33 @@ local function log(...)
     end
 end
 
--- Forward declarations so the Start/Stop UI button can control the main loop
-local runMainLoop
-local StoredActivePicture, StoredHumanoid, StoredHrp
-
 -- Stop switch
 if getgenv().PaintBotRunning then
     getgenv().PaintBotRunning = false
     task.wait(0.3)
 end
 getgenv().PaintBotRunning = true
+getgenv().PaintBotPaused = false
+
 getgenv().PaintBotStop = function()
     getgenv().PaintBotRunning = false
     print("[PaintBot] Stop requested.")
 end
-getgenv().PaintBotStart = function()
-    if getgenv().PaintBotRunning then
-        print("[PaintBot] Already running.")
-        return
+getgenv().PaintBotPause = function()
+    getgenv().PaintBotPaused = true
+    print("[PaintBot] Paused.")
+end
+getgenv().PaintBotResume = function()
+    getgenv().PaintBotPaused = false
+    print("[PaintBot] Resumed.")
+end
+
+-- Sleeps in short increments while paused, returns early if the bot is
+-- stopped entirely so callers can bail out of their own loops.
+local function waitWhilePaused()
+    while getgenv().PaintBotRunning and getgenv().PaintBotPaused do
+        task.wait(0.15)
     end
-    if not StoredActivePicture or not StoredHumanoid or not StoredHrp then
-        warn("[PaintBot] Cannot start yet -- plot/character not found.")
-        return
-    end
-    getgenv().PaintBotRunning = true
-    print("[PaintBot] Start requested.")
-    task.spawn(runMainLoop, StoredActivePicture, StoredHumanoid, StoredHrp)
 end
 
 local function findOwnPlot()
@@ -260,6 +286,62 @@ setupAntiAfk()
 getgenv().PaintBotDrawMode = CONFIG.drawMode
 loadConfig()
 
+-- Default speed hookup. This only starts watching for character spawns
+-- once armSpeedHook() is called (done from task.spawn below, right after
+-- the main bot confirms it has a plot and is starting), so it doesn't do
+-- anything before the bot itself is actually running.
+local function applySpeed(character)
+    local humanoid = character:WaitForChild("Humanoid")
+    humanoid.WalkSpeed = CONFIG.defaultPlayerSpeed
+end
+
+local function armSpeedHook()
+    if not CONFIG.defaultPlayerSpeed then return end
+    if LocalPlayer.Character then
+        applySpeed(LocalPlayer.Character)
+    end
+    LocalPlayer.CharacterAdded:Connect(applySpeed)
+    log("Default speed hook armed (WalkSpeed =", CONFIG.defaultPlayerSpeed, ")")
+end
+
+-- FPS boost: repeatedly sweeps every other plot and destroys whatever is
+-- currently inside its ActivePicture folder. A repeating sweep (rather
+-- than a one-shot pass + ChildAdded hook) is what actually caught plots
+-- and pixels that stream in a moment after you join, in testing.
+local function armCanvasClearing(plotModels, ownPlot)
+    if not CONFIG.hideOtherCanvases then return end
+
+    task.spawn(function()
+        local firstPass = true
+        while getgenv().PaintBotRunning do
+            local plotsSeen, plotsWithCanvas, destroyed = 0, 0, 0
+
+            for _, candidate in ipairs(plotModels:GetChildren()) do
+                plotsSeen = plotsSeen + 1
+                if candidate ~= ownPlot then
+                    local ap = candidate:FindFirstChild("ActivePicture")
+                    if ap then
+                        plotsWithCanvas = plotsWithCanvas + 1
+                        for _, part in ipairs(ap:GetChildren()) do
+                            local ok = pcall(function() part:Destroy() end)
+                            if ok then destroyed = destroyed + 1 end
+                        end
+                    end
+                end
+            end
+
+            if firstPass then
+                log(string.format(
+                    "Canvas clearing: saw %d plot(s), %d with a canvas, destroyed %d pixel(s) on first pass",
+                    plotsSeen, plotsWithCanvas, destroyed))
+                firstPass = false
+            end
+
+            task.wait(CONFIG.canvasScanInterval)
+        end
+    end)
+end
+
 local function pickNextNumber(numbers)
     local mode = getgenv().PaintBotDrawMode or "ascending"
     if mode == "descending" then
@@ -279,7 +361,20 @@ local function pickNextNumber(numbers)
     end
 end
 
-local ProgressLabel, ProgressBarFill
+local ProgressLabel, ProgressBarFill, ControlButton
+
+local function refreshControlButton()
+    if not ControlButton then return end
+    if getgenv().PaintBotPaused then
+        ControlButton.Text = "▶ Start"
+        ControlButton.BackgroundColor3 = Color3.fromRGB(0, 255, 140)
+        ControlButton.BackgroundTransparency = 0.3
+    else
+        ControlButton.Text = "⏹ Stop"
+        ControlButton.BackgroundColor3 = Color3.fromRGB(255, 70, 70)
+        ControlButton.BackgroundTransparency = 0.3
+    end
+end
 
 local function createProgressUI()
     local screenGui = Instance.new("ScreenGui")
@@ -288,15 +383,56 @@ local function createProgressUI()
     screenGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
 
     local frame = Instance.new("Frame")
-    frame.Size = UDim2.new(0, 220, 0, 50)
+    frame.Size = UDim2.new(0, 220, 0, 102)
     frame.Position = UDim2.new(0.5, -110, 0, 20)
     frame.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
     frame.BackgroundTransparency = 0.25
     frame.Parent = screenGui
     Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 8)
 
+    -- Minimized "reopen" tab, shown only while the menu is closed
+    local reopenTab = Instance.new("TextButton")
+    reopenTab.Name = "ReopenTab"
+    reopenTab.Size = UDim2.new(0, 34, 0, 22)
+    reopenTab.Position = UDim2.new(0.5, -17, 0, 20)
+    reopenTab.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+    reopenTab.BackgroundTransparency = 0.25
+    reopenTab.Text = "▤"
+    reopenTab.Font = Enum.Font.GothamBold
+    reopenTab.TextSize = 16
+    reopenTab.TextColor3 = Color3.new(1, 1, 1)
+    reopenTab.Visible = false
+    reopenTab.Parent = screenGui
+    Instance.new("UICorner", reopenTab).CornerRadius = UDim.new(0, 6)
+
+    local function setMenuOpen(open)
+        frame.Visible = open
+        reopenTab.Visible = not open
+    end
+
+    reopenTab.MouseButton1Click:Connect(function()
+        setMenuOpen(true)
+    end)
+
+    -- Close ("X") button, top-right corner of the main frame
+    local closeButton = Instance.new("TextButton")
+    closeButton.Size = UDim2.new(0, 18, 0, 18)
+    closeButton.Position = UDim2.new(1, -22, 0, 2)
+    closeButton.BackgroundColor3 = Color3.fromRGB(60, 60, 60)
+    closeButton.BackgroundTransparency = 0.4
+    closeButton.Text = "✕"
+    closeButton.Font = Enum.Font.GothamBold
+    closeButton.TextSize = 12
+    closeButton.TextColor3 = Color3.new(1, 1, 1)
+    closeButton.Parent = frame
+    Instance.new("UICorner", closeButton).CornerRadius = UDim.new(0, 4)
+
+    closeButton.MouseButton1Click:Connect(function()
+        setMenuOpen(false)
+    end)
+
     ProgressLabel = Instance.new("TextLabel")
-    ProgressLabel.Size = UDim2.new(1, 0, 0, 18)
+    ProgressLabel.Size = UDim2.new(1, -24, 0, 18)
     ProgressLabel.Position = UDim2.new(0, 0, 0, 2)
     ProgressLabel.BackgroundTransparency = 1
     ProgressLabel.TextColor3 = Color3.new(1, 1, 1)
@@ -319,8 +455,6 @@ local function createProgressUI()
     Instance.new("UICorner", ProgressBarFill).CornerRadius = UDim.new(0, 6)
 
     -- Draw mode buttons
-    frame.Size = UDim2.new(0, 220, 0, 76)
-
     local modeRow = Instance.new("Frame")
     modeRow.Size = UDim2.new(0.9, 0, 0, 22)
     modeRow.Position = UDim2.new(0.05, 0, 0, 44)
@@ -358,6 +492,27 @@ local function createProgressUI()
     end
 
     setActiveMode(getgenv().PaintBotDrawMode or "ascending")
+
+    -- Start/Stop (pause/resume) button
+    ControlButton = Instance.new("TextButton")
+    ControlButton.Size = UDim2.new(0.9, 0, 0, 22)
+    ControlButton.Position = UDim2.new(0.05, 0, 0, 72)
+    ControlButton.Font = Enum.Font.GothamBold
+    ControlButton.TextSize = 12
+    ControlButton.TextColor3 = Color3.new(1, 1, 1)
+    ControlButton.Parent = frame
+    Instance.new("UICorner", ControlButton).CornerRadius = UDim.new(0, 4)
+
+    ControlButton.MouseButton1Click:Connect(function()
+        if getgenv().PaintBotPaused then
+            getgenv().PaintBotResume()
+        else
+            getgenv().PaintBotPause()
+        end
+        refreshControlButton()
+    end)
+
+    refreshControlButton()
 end
 
 local function updateProgressUI(activePicture)
@@ -374,8 +529,10 @@ local function updateProgressUI(activePicture)
     end
 
     local pct = total > 0 and math.floor((done / total) * 100) or 0
-    ProgressLabel.Text = string.format("PaintBot: %d%% (%d/%d)", pct, done, total)
+    local statusSuffix = getgenv().PaintBotPaused and " [Paused]" or ""
+    ProgressLabel.Text = string.format("PaintBot: %d%% (%d/%d)%s", pct, done, total, statusSuffix)
     ProgressBarFill.Size = UDim2.new(pct / 100, 0, 1, 0)
+    refreshControlButton()
 end
 
 local function attemptUnstick(humanoid, hrp, targetPos)
@@ -406,6 +563,18 @@ local function walkToPixel(part, humanoid, hrp, expectedMode)
     local stuckRecoveries = 0
 
     while getgenv().PaintBotRunning do
+        if getgenv().PaintBotPaused then
+            -- Hold position while paused; don't count this time against
+            -- the walk timeout or the stuck-recovery clock.
+            waitWhilePaused()
+            if not getgenv().PaintBotRunning then
+                return false
+            end
+            humanoid:MoveTo(part.Position)
+            lastCheckPos = hrp.Position
+            lastCheckTime = tick()
+            continue
+        end
         if expectedMode and getgenv().PaintBotDrawMode ~= expectedMode then
             return false -- mode changed mid-walk, abandon this pixel immediately
         end
@@ -422,6 +591,9 @@ local function walkToPixel(part, humanoid, hrp, expectedMode)
             -- arrived, give the game a moment to auto-paint
             local paintWaited = 0
             while getgenv().PaintBotRunning and paintWaited < CONFIG.paintWaitTimeout do
+                if getgenv().PaintBotPaused then
+                    waitWhilePaused()
+                end
                 if expectedMode and getgenv().PaintBotDrawMode ~= expectedMode then
                     return false
                 end
@@ -470,6 +642,8 @@ task.spawn(function()
         return
     end
 
+    armCanvasClearing(plot.Parent, plot)
+
     local char = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
     local humanoid = char:FindFirstChildOfClass("Humanoid")
     local hrp = char:WaitForChild("HumanoidRootPart")
@@ -490,9 +664,16 @@ task.spawn(function()
         end)
     end
 
+    armSpeedHook()
+
     log("Starting. Scanning for unpainted pixels...")
 
     while getgenv().PaintBotRunning do
+        waitWhilePaused()
+        if not getgenv().PaintBotRunning then
+            break
+        end
+
         local groups = gatherUnpaintedByNumber(activePicture)
 
         local numbers = {}
@@ -512,6 +693,11 @@ task.spawn(function()
         -- Keep working this number until no unpainted pixels with it remain,
         -- OR until the draw mode changes (then abandon and re-pick immediately)
         while getgenv().PaintBotRunning do
+            waitWhilePaused()
+            if not getgenv().PaintBotRunning then
+                break
+            end
+
             if getgenv().PaintBotDrawMode ~= workingMode then
                 log("Mode changed mid-color -- switching immediately")
                 break
