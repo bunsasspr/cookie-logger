@@ -45,6 +45,10 @@ local CONFIG = {
     -- again on a later pass if still unpainted)
     maxStuckRecoveries = 3,
 
+    -- On-screen progress bar
+    showProgressUI = true,
+    progressUpdateInterval = 0.5,
+
     -- Print progress as it works
     verbose = true,
 }
@@ -152,6 +156,64 @@ local function distanceXZ(a, b)
     return math.sqrt(dx * dx + dz * dz)
 end
 
+local ProgressLabel, ProgressBarFill
+
+local function createProgressUI()
+    local screenGui = Instance.new("ScreenGui")
+    screenGui.Name = "PaintBotProgressUI"
+    screenGui.ResetOnSpawn = false
+    screenGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+
+    local frame = Instance.new("Frame")
+    frame.Size = UDim2.new(0, 220, 0, 50)
+    frame.Position = UDim2.new(0.5, -110, 0, 20)
+    frame.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+    frame.BackgroundTransparency = 0.25
+    frame.Parent = screenGui
+    Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 8)
+
+    ProgressLabel = Instance.new("TextLabel")
+    ProgressLabel.Size = UDim2.new(1, 0, 0, 18)
+    ProgressLabel.Position = UDim2.new(0, 0, 0, 2)
+    ProgressLabel.BackgroundTransparency = 1
+    ProgressLabel.TextColor3 = Color3.new(1, 1, 1)
+    ProgressLabel.Font = Enum.Font.GothamBold
+    ProgressLabel.TextSize = 13
+    ProgressLabel.Text = "PaintBot: 0% (0/0)"
+    ProgressLabel.Parent = frame
+
+    local barBG = Instance.new("Frame")
+    barBG.Size = UDim2.new(0.9, 0, 0, 12)
+    barBG.Position = UDim2.new(0.05, 0, 0, 26)
+    barBG.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+    barBG.Parent = frame
+    Instance.new("UICorner", barBG).CornerRadius = UDim.new(0, 6)
+
+    ProgressBarFill = Instance.new("Frame")
+    ProgressBarFill.Size = UDim2.new(0, 0, 1, 0)
+    ProgressBarFill.BackgroundColor3 = Color3.fromRGB(0, 255, 140)
+    ProgressBarFill.Parent = barBG
+    Instance.new("UICorner", ProgressBarFill).CornerRadius = UDim.new(0, 6)
+end
+
+local function updateProgressUI(activePicture)
+    if not ProgressLabel or not ProgressBarFill then return end
+
+    local total, done = 0, 0
+    for _, part in ipairs(activePicture:GetChildren()) do
+        if part:IsA("BasePart") and part:GetAttribute("N") ~= nil then
+            total = total + 1
+            if part:GetAttribute("D") == true then
+                done = done + 1
+            end
+        end
+    end
+
+    local pct = total > 0 and math.floor((done / total) * 100) or 0
+    ProgressLabel.Text = string.format("PaintBot: %d%% (%d/%d)", pct, done, total)
+    ProgressBarFill.Size = UDim2.new(pct / 100, 0, 1, 0)
+end
+
 local function attemptUnstick(humanoid, hrp, targetPos)
     log("Stuck detected, attempting recovery...")
     -- Jump in place first, sometimes enough to pop free of geometry
@@ -241,6 +303,18 @@ task.spawn(function()
 
     if CONFIG.walkSpeedOverride then
         humanoid.WalkSpeed = CONFIG.walkSpeedOverride
+    end
+
+    if CONFIG.showProgressUI then
+        createProgressUI()
+        task.spawn(function()
+            while getgenv().PaintBotRunning do
+                updateProgressUI(activePicture)
+                task.wait(CONFIG.progressUpdateInterval)
+            end
+            -- final update so it shows 100% / final state before stopping
+            updateProgressUI(activePicture)
+        end)
     end
 
     log("Starting. Scanning for unpainted pixels...")
