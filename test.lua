@@ -285,6 +285,7 @@ local function createProgressUI()
     local modeButtons = {}
     local function setActiveMode(mode)
         getgenv().PaintBotDrawMode = mode
+        saveConfigToFile()
         for m, btn in pairs(modeButtons) do
             btn.BackgroundColor3 = (m == mode) and Color3.fromRGB(0, 255, 140) or Color3.fromRGB(60, 60, 60)
             btn.BackgroundTransparency = (m == mode) and 0.3 or 0.6
