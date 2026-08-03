@@ -78,7 +78,7 @@ local CONFIG = {
     -- Default WalkSpeed to apply to the local player once the bot has
     -- started (applies on spawn/respawn too). Set to nil to disable and
     -- rely solely on walkSpeedOverride above.
-    defaultPlayerSpeed = 25,
+    defaultPlayerSpeed = nil,
 
     -- FPS BOOST: destroy the pixel parts belonging to every other plot's
     -- ActivePicture folder (your own plot is left untouched). Runs as a
