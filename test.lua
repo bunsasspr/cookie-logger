@@ -361,18 +361,100 @@ local function pickNextNumber(numbers)
     end
 end
 
+-- ===== UI theme + small helpers (keeps the widget code below short) =====
+local THEME = {
+    bg        = Color3.fromRGB(24, 24, 27),
+    titlebar  = Color3.fromRGB(32, 32, 36),
+    accent    = Color3.fromRGB(0, 255, 140),
+    danger    = Color3.fromRGB(255, 70, 70),
+    chipOff   = Color3.fromRGB(50, 50, 55),
+    barBg     = Color3.fromRGB(45, 45, 50),
+    text      = Color3.fromRGB(235, 235, 240),
+    subtext   = Color3.fromRGB(170, 170, 180),
+}
+
+local function corner(inst, radius)
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, radius or 8)
+    c.Parent = inst
+    return c
+end
+
+local function stroke(inst, color, thickness)
+    local s = Instance.new("UIStroke")
+    s.Color = color or Color3.fromRGB(0, 0, 0)
+    s.Thickness = thickness or 1
+    s.Transparency = 0.5
+    s.Parent = inst
+    return s
+end
+
+-- Small flat button factory. opts: {size, bg, textColor, textSize, bold}
+local function makeButton(parent, text, opts)
+    opts = opts or {}
+    local btn = Instance.new("TextButton")
+    btn.Size = opts.size or UDim2.new(1, 0, 0, 26)
+    btn.BackgroundColor3 = opts.bg or THEME.chipOff
+    btn.BackgroundTransparency = opts.transparency or 0.15
+    btn.AutoButtonColor = false
+    btn.Text = text
+    btn.Font = opts.bold == false and Enum.Font.Gotham or Enum.Font.GothamBold
+    btn.TextSize = opts.textSize or 13
+    btn.TextColor3 = opts.textColor or THEME.text
+    btn.Parent = parent
+    corner(btn, opts.radius or 6)
+    return btn
+end
+
+-- Makes `frame` draggable by pressing/dragging on `handle` (mouse + touch)
+local function makeDraggable(handle, frame)
+    local UserInputService = game:GetService("UserInputService")
+    local dragging, dragInput, dragStart, startPos
+
+    handle.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPos = frame.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                end
+            end)
+        end
+    end)
+
+    handle.InputChanged:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragInput = input
+        end
+    end)
+
+    UserInputService.InputChanged:Connect(function(input)
+        if input == dragInput and dragging then
+            local delta = input.Position - dragStart
+            frame.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + delta.X,
+                startPos.Y.Scale, startPos.Y.Offset + delta.Y
+            )
+        end
+    end)
+end
+
 local ProgressLabel, ProgressBarFill, ControlButton
 
 local function refreshControlButton()
     if not ControlButton then return end
     if getgenv().PaintBotPaused then
-        ControlButton.Text = "▶ Start"
-        ControlButton.BackgroundColor3 = Color3.fromRGB(0, 255, 140)
-        ControlButton.BackgroundTransparency = 0.3
+        ControlButton.Text = "Start"
+        ControlButton.BackgroundColor3 = THEME.accent
+        ControlButton.TextColor3 = Color3.fromRGB(10, 10, 10)
     else
-        ControlButton.Text = "⏹ Stop"
-        ControlButton.BackgroundColor3 = Color3.fromRGB(255, 70, 70)
-        ControlButton.BackgroundTransparency = 0.3
+        ControlButton.Text = "Stop"
+        ControlButton.BackgroundColor3 = THEME.danger
+        ControlButton.TextColor3 = Color3.new(1, 1, 1)
     end
 end
 
@@ -382,127 +464,148 @@ local function createProgressUI()
     screenGui.ResetOnSpawn = false
     screenGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
 
+    -- Main window
     local frame = Instance.new("Frame")
-    frame.Size = UDim2.new(0, 220, 0, 102)
-    frame.Position = UDim2.new(0.5, -110, 0, 20)
-    frame.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
-    frame.BackgroundTransparency = 0.25
+    frame.Size = UDim2.new(0, 240, 0, 178)
+    frame.Position = UDim2.new(0.5, -120, 0, 20)
+    frame.BackgroundColor3 = THEME.bg
     frame.Parent = screenGui
-    Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 8)
+    corner(frame, 10)
+    stroke(frame, Color3.new(0, 0, 0), 1)
+
+    -- Title bar (drag handle)
+    local titleBar = Instance.new("Frame")
+    titleBar.Size = UDim2.new(1, 0, 0, 32)
+    titleBar.BackgroundColor3 = THEME.titlebar
+    titleBar.Parent = frame
+    corner(titleBar, 10)
+    -- square off the bottom corners of the title bar so it doesn't look pill-shaped
+    local titleBarMask = Instance.new("Frame")
+    titleBarMask.Size = UDim2.new(1, 0, 0, 10)
+    titleBarMask.Position = UDim2.new(0, 0, 1, -10)
+    titleBarMask.BackgroundColor3 = THEME.titlebar
+    titleBarMask.BorderSizePixel = 0
+    titleBarMask.Parent = titleBar
+
+    local titleLabel = Instance.new("TextLabel")
+    titleLabel.Size = UDim2.new(1, -40, 1, 0)
+    titleLabel.Position = UDim2.new(0, 12, 0, 0)
+    titleLabel.BackgroundTransparency = 1
+    titleLabel.Text = "PaintBot"
+    titleLabel.Font = Enum.Font.GothamBold
+    titleLabel.TextSize = 14
+    titleLabel.TextColor3 = THEME.text
+    titleLabel.TextXAlignment = Enum.TextXAlignment.Left
+    titleLabel.Parent = titleBar
+
+    makeDraggable(titleBar, frame)
 
     -- Minimized "reopen" tab, shown only while the menu is closed
-    local reopenTab = Instance.new("TextButton")
-    reopenTab.Name = "ReopenTab"
-    reopenTab.Size = UDim2.new(0, 34, 0, 22)
-    reopenTab.Position = UDim2.new(0.5, -17, 0, 20)
-    reopenTab.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
-    reopenTab.BackgroundTransparency = 0.25
-    reopenTab.Text = "▤"
-    reopenTab.Font = Enum.Font.GothamBold
-    reopenTab.TextSize = 16
-    reopenTab.TextColor3 = Color3.new(1, 1, 1)
+    local reopenTab = makeButton(screenGui, "≡ Menu", {
+        size = UDim2.new(0, 70, 0, 26),
+        bg = THEME.bg,
+        textSize = 12,
+    })
+    reopenTab.Position = UDim2.new(0.5, -35, 0, 20)
     reopenTab.Visible = false
-    reopenTab.Parent = screenGui
-    Instance.new("UICorner", reopenTab).CornerRadius = UDim.new(0, 6)
+    stroke(reopenTab, Color3.new(0, 0, 0), 1)
 
     local function setMenuOpen(open)
         frame.Visible = open
         reopenTab.Visible = not open
     end
-
     reopenTab.MouseButton1Click:Connect(function()
         setMenuOpen(true)
     end)
 
-    -- Close ("X") button, top-right corner of the main frame
-    local closeButton = Instance.new("TextButton")
-    closeButton.Size = UDim2.new(0, 18, 0, 18)
-    closeButton.Position = UDim2.new(1, -22, 0, 2)
-    closeButton.BackgroundColor3 = Color3.fromRGB(60, 60, 60)
-    closeButton.BackgroundTransparency = 0.4
-    closeButton.Text = "X"
-    closeButton.Font = Enum.Font.GothamBold
-    closeButton.TextSize = 12
-    closeButton.TextColor3 = Color3.new(1, 1, 1)
-    closeButton.Parent = frame
-    Instance.new("UICorner", closeButton).CornerRadius = UDim.new(0, 4)
-
+    local closeButton = makeButton(titleBar, "X", {
+        size = UDim2.new(0, 22, 0, 22),
+        bg = Color3.fromRGB(60, 60, 66),
+        textSize = 13,
+    })
+    closeButton.Position = UDim2.new(1, -28, 0.5, -11)
     closeButton.MouseButton1Click:Connect(function()
         setMenuOpen(false)
     end)
 
+    -- Content area
+    local content = Instance.new("Frame")
+    content.Size = UDim2.new(1, -20, 1, -42)
+    content.Position = UDim2.new(0, 10, 0, 38)
+    content.BackgroundTransparency = 1
+    content.Parent = frame
+
+    local layout = Instance.new("UIListLayout")
+    layout.FillDirection = Enum.FillDirection.Vertical
+    layout.Padding = UDim.new(0, 8)
+    layout.Parent = content
+
     ProgressLabel = Instance.new("TextLabel")
-    ProgressLabel.Size = UDim2.new(1, -24, 0, 18)
-    ProgressLabel.Position = UDim2.new(0, 0, 0, 2)
+    ProgressLabel.Size = UDim2.new(1, 0, 0, 16)
     ProgressLabel.BackgroundTransparency = 1
-    ProgressLabel.TextColor3 = Color3.new(1, 1, 1)
-    ProgressLabel.Font = Enum.Font.GothamBold
-    ProgressLabel.TextSize = 13
-    ProgressLabel.Text = "PaintBot: 0% (0/0)"
-    ProgressLabel.Parent = frame
+    ProgressLabel.TextColor3 = THEME.subtext
+    ProgressLabel.Font = Enum.Font.Gotham
+    ProgressLabel.TextSize = 12
+    ProgressLabel.TextXAlignment = Enum.TextXAlignment.Left
+    ProgressLabel.Text = "0% (0/0)"
+    ProgressLabel.LayoutOrder = 1
+    ProgressLabel.Parent = content
 
     local barBG = Instance.new("Frame")
-    barBG.Size = UDim2.new(0.9, 0, 0, 12)
-    barBG.Position = UDim2.new(0.05, 0, 0, 26)
-    barBG.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
-    barBG.Parent = frame
-    Instance.new("UICorner", barBG).CornerRadius = UDim.new(0, 6)
+    barBG.Size = UDim2.new(1, 0, 0, 12)
+    barBG.BackgroundColor3 = THEME.barBg
+    barBG.LayoutOrder = 2
+    barBG.Parent = content
+    corner(barBG, 6)
 
     ProgressBarFill = Instance.new("Frame")
     ProgressBarFill.Size = UDim2.new(0, 0, 1, 0)
-    ProgressBarFill.BackgroundColor3 = Color3.fromRGB(0, 255, 140)
+    ProgressBarFill.BackgroundColor3 = THEME.accent
     ProgressBarFill.Parent = barBG
-    Instance.new("UICorner", ProgressBarFill).CornerRadius = UDim.new(0, 6)
+    corner(ProgressBarFill, 6)
 
-    -- Draw mode buttons
+    -- Draw mode row
     local modeRow = Instance.new("Frame")
-    modeRow.Size = UDim2.new(0.9, 0, 0, 22)
-    modeRow.Position = UDim2.new(0.05, 0, 0, 44)
+    modeRow.Size = UDim2.new(1, 0, 0, 26)
     modeRow.BackgroundTransparency = 1
-    modeRow.Parent = frame
+    modeRow.LayoutOrder = 3
+    modeRow.Parent = content
+
+    local modeLayout = Instance.new("UIListLayout")
+    modeLayout.FillDirection = Enum.FillDirection.Horizontal
+    modeLayout.Padding = UDim.new(0, 6)
+    modeLayout.Parent = modeRow
 
     local modeButtons = {}
     local function setActiveMode(mode)
         getgenv().PaintBotDrawMode = mode
         saveConfigToFile()
         for m, btn in pairs(modeButtons) do
-            btn.BackgroundColor3 = (m == mode) and Color3.fromRGB(0, 255, 140) or Color3.fromRGB(60, 60, 60)
-            btn.BackgroundTransparency = (m == mode) and 0.3 or 0.6
+            btn.BackgroundColor3 = (m == mode) and THEME.accent or THEME.chipOff
+            btn.TextColor3 = (m == mode) and Color3.fromRGB(10, 10, 10) or THEME.text
         end
     end
 
     local modes = {"ascending", "descending", "random"}
     local labels = {ascending = "Asc", descending = "Desc", random = "Random"}
-    for i, mode in ipairs(modes) do
-        local btn = Instance.new("TextButton")
-        btn.Size = UDim2.new(1/3, -4, 1, 0)
-        btn.Position = UDim2.new((i - 1) / 3, 2, 0, 0)
-        btn.Text = labels[mode]
-        btn.Font = Enum.Font.GothamBold
-        btn.TextSize = 11
-        btn.TextColor3 = Color3.new(1, 1, 1)
-        btn.BackgroundColor3 = Color3.fromRGB(60, 60, 60)
-        btn.BackgroundTransparency = 0.6
-        btn.Parent = modeRow
-        Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 4)
+    for _, mode in ipairs(modes) do
+        local btn = makeButton(modeRow, labels[mode], {
+            size = UDim2.new(1 / 3, -4, 1, 0),
+            textSize = 12,
+        })
         modeButtons[mode] = btn
         btn.MouseButton1Click:Connect(function()
             setActiveMode(mode)
         end)
     end
-
     setActiveMode(getgenv().PaintBotDrawMode or "ascending")
 
     -- Start/Stop (pause/resume) button
-    ControlButton = Instance.new("TextButton")
-    ControlButton.Size = UDim2.new(0.9, 0, 0, 22)
-    ControlButton.Position = UDim2.new(0.05, 0, 0, 72)
-    ControlButton.Font = Enum.Font.GothamBold
-    ControlButton.TextSize = 12
-    ControlButton.TextColor3 = Color3.new(1, 1, 1)
-    ControlButton.Parent = frame
-    Instance.new("UICorner", ControlButton).CornerRadius = UDim.new(0, 4)
-
+    ControlButton = makeButton(content, "Stop", {
+        size = UDim2.new(1, 0, 0, 30),
+        textSize = 13,
+    })
+    ControlButton.LayoutOrder = 4
     ControlButton.MouseButton1Click:Connect(function()
         if getgenv().PaintBotPaused then
             getgenv().PaintBotResume()
@@ -529,8 +632,8 @@ local function updateProgressUI(activePicture)
     end
 
     local pct = total > 0 and math.floor((done / total) * 100) or 0
-    local statusSuffix = getgenv().PaintBotPaused and " [Paused]" or ""
-    ProgressLabel.Text = string.format("PaintBot: %d%% (%d/%d)%s", pct, done, total, statusSuffix)
+    local statusSuffix = getgenv().PaintBotPaused and "  ·  Paused" or ""
+    ProgressLabel.Text = string.format("%d%% (%d/%d)%s", pct, done, total, statusSuffix)
     ProgressBarFill.Size = UDim2.new(pct / 100, 0, 1, 0)
     refreshControlButton()
 end
