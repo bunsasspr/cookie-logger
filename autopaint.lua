@@ -70,6 +70,11 @@ local CONFIG = {
 
     -- Print progress as it works
     verbose = true,
+
+    -- Default WalkSpeed to apply to the local player once the bot has
+    -- started (applies on spawn/respawn too). Set to nil to disable and
+    -- rely solely on walkSpeedOverride above.
+    defaultPlayerSpeed = 50,
 }
 
 ----------------------------------------------------------------
@@ -265,6 +270,24 @@ setupAntiAfk()
 -- Live-adjustable draw mode (buttons on the UI can change this mid-run)
 getgenv().PaintBotDrawMode = CONFIG.drawMode
 loadConfig()
+
+-- Default speed hookup. This only starts watching for character spawns
+-- once armSpeedHook() is called (done from task.spawn below, right after
+-- the main bot confirms it has a plot and is starting), so it doesn't do
+-- anything before the bot itself is actually running.
+local function applySpeed(character)
+    local humanoid = character:WaitForChild("Humanoid")
+    humanoid.WalkSpeed = CONFIG.defaultPlayerSpeed
+end
+
+local function armSpeedHook()
+    if not CONFIG.defaultPlayerSpeed then return end
+    if LocalPlayer.Character then
+        applySpeed(LocalPlayer.Character)
+    end
+    LocalPlayer.CharacterAdded:Connect(applySpeed)
+    log("Default speed hook armed (WalkSpeed =", CONFIG.defaultPlayerSpeed, ")")
+end
 
 local function pickNextNumber(numbers)
     local mode = getgenv().PaintBotDrawMode or "ascending"
@@ -544,6 +567,8 @@ task.spawn(function()
             updateProgressUI(activePicture)
         end)
     end
+
+    armSpeedHook()
 
     log("Starting. Scanning for unpainted pixels...")
 
