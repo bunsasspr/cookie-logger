@@ -8,7 +8,12 @@
     the next number. Repeats until nothing unpainted is left.
 
     CONTROLS (run in console):
-        PaintBotStop()   -- stops the bot cleanly
+        PaintBotStop()    -- stops the bot cleanly (cannot be resumed)
+        PaintBotPause()   -- pauses in place (can be resumed)
+        PaintBotResume()  -- resumes after a pause
+
+    There's also a Start/Stop button on the on-screen progress UI that
+    does the same pause/resume toggle as the console functions above.
 
     CONFIG — check these before running
 ]]
@@ -49,6 +54,20 @@ local CONFIG = {
     showProgressUI = true,
     progressUpdateInterval = 0.5,
 
+    -- Order colors are worked through: "ascending" (1->30), "descending"
+    -- (30->1), or "random" (shuffled each pass). Can also be changed live
+    -- via the buttons on the progress UI.
+    drawMode = "ascending",
+
+    -- Persist settings (currently just drawMode) to a file so they survive
+    -- rejoining the game. Requires writefile/readfile/isfile support.
+    saveConfig = true,
+    configFile = "paintbot_config.json",
+
+    -- Anti-AFK: nudges the game whenever Roblox's own idle detector fires,
+    -- so the ~20 minute AFK kick doesn't happen during long runs.
+    antiAfk = true,
+
     -- Print progress as it works
     verbose = true,
 }
@@ -57,6 +76,8 @@ local CONFIG = {
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local HttpService = game:GetService("HttpService")
+local VirtualUser = game:GetService("VirtualUser")
 local LocalPlayer = Players.LocalPlayer
 
 local SelectNumberEvent = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("SelectNumber")
@@ -73,9 +94,27 @@ if getgenv().PaintBotRunning then
     task.wait(0.3)
 end
 getgenv().PaintBotRunning = true
+getgenv().PaintBotPaused = false
+
 getgenv().PaintBotStop = function()
     getgenv().PaintBotRunning = false
     print("[PaintBot] Stop requested.")
+end
+getgenv().PaintBotPause = function()
+    getgenv().PaintBotPaused = true
+    print("[PaintBot] Paused.")
+end
+getgenv().PaintBotResume = function()
+    getgenv().PaintBotPaused = false
+    print("[PaintBot] Resumed.")
+end
+
+-- Sleeps in short increments while paused, returns early if the bot is
+-- stopped entirely so callers can bail out of their own loops.
+local function waitWhilePaused()
+    while getgenv().PaintBotRunning and getgenv().PaintBotPaused do
+        task.wait(0.15)
+    end
 end
 
 local function findOwnPlot()
@@ -156,7 +195,110 @@ local function distanceXZ(a, b)
     return math.sqrt(dx * dx + dz * dz)
 end
 
-local ProgressLabel, ProgressBarFill
+-- Config save/load (persists drawMode across game rejoins)
+local function loadConfig()
+    if not CONFIG.saveConfig then return end
+
+    print("[PaintBot][Config] Checking for", CONFIG.configFile)
+
+    local okCheck, exists = pcall(function() return isfile and isfile(CONFIG.configFile) end)
+    if not okCheck then
+        warn("[PaintBot][Config] isfile() check errored:", exists)
+        return
+    end
+    if not exists then
+        print("[PaintBot][Config] No saved config file found (isfile returned false/nil). Using defaults.")
+        return
+    end
+
+    local okRead, content = pcall(function() return readfile(CONFIG.configFile) end)
+    if not okRead then
+        warn("[PaintBot][Config] readfile() failed:", content)
+        return
+    end
+    print("[PaintBot][Config] Raw file content:", tostring(content))
+
+    local okDecode, data = pcall(function() return HttpService:JSONDecode(content) end)
+    if not okDecode then
+        warn("[PaintBot][Config] JSONDecode failed:", data)
+        return
+    end
+    if type(data) ~= "table" or not data.drawMode then
+        warn("[PaintBot][Config] Decoded data missing drawMode:", tostring(data))
+        return
+    end
+
+    getgenv().PaintBotDrawMode = data.drawMode
+    print("[PaintBot][Config] Loaded saved drawMode =", data.drawMode)
+end
+
+local function saveConfigToFile()
+    if not CONFIG.saveConfig then return end
+    local data = { drawMode = getgenv().PaintBotDrawMode }
+    local okEncode, json = pcall(function() return HttpService:JSONEncode(data) end)
+    if not okEncode then
+        warn("[PaintBot][Config] JSONEncode failed:", json)
+        return
+    end
+    local okWrite, errWrite = pcall(function() writefile(CONFIG.configFile, json) end)
+    if okWrite then
+        print("[PaintBot][Config] Saved:", json)
+    else
+        warn("[PaintBot][Config] writefile() failed:", errWrite)
+    end
+end
+
+-- Anti-AFK: fires whenever Roblox detects no input for a while, simulating
+-- a harmless click to reset its internal idle timer
+local function setupAntiAfk()
+    if not CONFIG.antiAfk then return end
+    LocalPlayer.Idled:Connect(function()
+        log("Anti-AFK: nudging to prevent idle kick")
+        pcall(function()
+            VirtualUser:CaptureController()
+            VirtualUser:ClickButton2(Vector2.new())
+        end)
+    end)
+end
+setupAntiAfk()
+
+-- Live-adjustable draw mode (buttons on the UI can change this mid-run)
+getgenv().PaintBotDrawMode = CONFIG.drawMode
+loadConfig()
+
+local function pickNextNumber(numbers)
+    local mode = getgenv().PaintBotDrawMode or "ascending"
+    if mode == "descending" then
+        local best = numbers[1]
+        for _, n in ipairs(numbers) do
+            if n > best then best = n end
+        end
+        return best
+    elseif mode == "random" then
+        return numbers[math.random(#numbers)]
+    else
+        local best = numbers[1]
+        for _, n in ipairs(numbers) do
+            if n < best then best = n end
+        end
+        return best
+    end
+end
+
+local ProgressLabel, ProgressBarFill, ControlButton
+
+local function refreshControlButton()
+    if not ControlButton then return end
+    if getgenv().PaintBotPaused then
+        ControlButton.Text = "▶ Start"
+        ControlButton.BackgroundColor3 = Color3.fromRGB(0, 255, 140)
+        ControlButton.BackgroundTransparency = 0.3
+    else
+        ControlButton.Text = "⏹ Stop"
+        ControlButton.BackgroundColor3 = Color3.fromRGB(255, 70, 70)
+        ControlButton.BackgroundTransparency = 0.3
+    end
+end
 
 local function createProgressUI()
     local screenGui = Instance.new("ScreenGui")
@@ -165,7 +307,7 @@ local function createProgressUI()
     screenGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
 
     local frame = Instance.new("Frame")
-    frame.Size = UDim2.new(0, 220, 0, 50)
+    frame.Size = UDim2.new(0, 220, 0, 102)
     frame.Position = UDim2.new(0.5, -110, 0, 20)
     frame.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
     frame.BackgroundTransparency = 0.25
@@ -194,6 +336,66 @@ local function createProgressUI()
     ProgressBarFill.BackgroundColor3 = Color3.fromRGB(0, 255, 140)
     ProgressBarFill.Parent = barBG
     Instance.new("UICorner", ProgressBarFill).CornerRadius = UDim.new(0, 6)
+
+    -- Draw mode buttons
+    local modeRow = Instance.new("Frame")
+    modeRow.Size = UDim2.new(0.9, 0, 0, 22)
+    modeRow.Position = UDim2.new(0.05, 0, 0, 44)
+    modeRow.BackgroundTransparency = 1
+    modeRow.Parent = frame
+
+    local modeButtons = {}
+    local function setActiveMode(mode)
+        getgenv().PaintBotDrawMode = mode
+        saveConfigToFile()
+        for m, btn in pairs(modeButtons) do
+            btn.BackgroundColor3 = (m == mode) and Color3.fromRGB(0, 255, 140) or Color3.fromRGB(60, 60, 60)
+            btn.BackgroundTransparency = (m == mode) and 0.3 or 0.6
+        end
+    end
+
+    local modes = {"ascending", "descending", "random"}
+    local labels = {ascending = "Asc", descending = "Desc", random = "Random"}
+    for i, mode in ipairs(modes) do
+        local btn = Instance.new("TextButton")
+        btn.Size = UDim2.new(1/3, -4, 1, 0)
+        btn.Position = UDim2.new((i - 1) / 3, 2, 0, 0)
+        btn.Text = labels[mode]
+        btn.Font = Enum.Font.GothamBold
+        btn.TextSize = 11
+        btn.TextColor3 = Color3.new(1, 1, 1)
+        btn.BackgroundColor3 = Color3.fromRGB(60, 60, 60)
+        btn.BackgroundTransparency = 0.6
+        btn.Parent = modeRow
+        Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 4)
+        modeButtons[mode] = btn
+        btn.MouseButton1Click:Connect(function()
+            setActiveMode(mode)
+        end)
+    end
+
+    setActiveMode(getgenv().PaintBotDrawMode or "ascending")
+
+    -- Start/Stop (pause/resume) button
+    ControlButton = Instance.new("TextButton")
+    ControlButton.Size = UDim2.new(0.9, 0, 0, 22)
+    ControlButton.Position = UDim2.new(0.05, 0, 0, 72)
+    ControlButton.Font = Enum.Font.GothamBold
+    ControlButton.TextSize = 12
+    ControlButton.TextColor3 = Color3.new(1, 1, 1)
+    ControlButton.Parent = frame
+    Instance.new("UICorner", ControlButton).CornerRadius = UDim.new(0, 4)
+
+    ControlButton.MouseButton1Click:Connect(function()
+        if getgenv().PaintBotPaused then
+            getgenv().PaintBotResume()
+        else
+            getgenv().PaintBotPause()
+        end
+        refreshControlButton()
+    end)
+
+    refreshControlButton()
 end
 
 local function updateProgressUI(activePicture)
@@ -210,8 +412,10 @@ local function updateProgressUI(activePicture)
     end
 
     local pct = total > 0 and math.floor((done / total) * 100) or 0
-    ProgressLabel.Text = string.format("PaintBot: %d%% (%d/%d)", pct, done, total)
+    local statusSuffix = getgenv().PaintBotPaused and " [Paused]" or ""
+    ProgressLabel.Text = string.format("PaintBot: %d%% (%d/%d)%s", pct, done, total, statusSuffix)
     ProgressBarFill.Size = UDim2.new(pct / 100, 0, 1, 0)
+    refreshControlButton()
 end
 
 local function attemptUnstick(humanoid, hrp, targetPos)
@@ -233,7 +437,7 @@ local function attemptUnstick(humanoid, hrp, targetPos)
     humanoid:MoveTo(targetPos)
 end
 
-local function walkToPixel(part, humanoid, hrp)
+local function walkToPixel(part, humanoid, hrp, expectedMode)
     humanoid:MoveTo(part.Position)
     local waited = 0
 
@@ -241,7 +445,25 @@ local function walkToPixel(part, humanoid, hrp)
     local lastCheckTime = tick()
     local stuckRecoveries = 0
 
-    while getgenv().PaintBotRunning and waited < 10 do
+    while getgenv().PaintBotRunning do
+        if getgenv().PaintBotPaused then
+            -- Hold position while paused; don't count this time against
+            -- the walk timeout or the stuck-recovery clock.
+            waitWhilePaused()
+            if not getgenv().PaintBotRunning then
+                return false
+            end
+            humanoid:MoveTo(part.Position)
+            lastCheckPos = hrp.Position
+            lastCheckTime = tick()
+            continue
+        end
+        if expectedMode and getgenv().PaintBotDrawMode ~= expectedMode then
+            return false -- mode changed mid-walk, abandon this pixel immediately
+        end
+        if waited >= 10 then
+            return false
+        end
         if not part or not part.Parent then
             return true -- disappeared/painted and cleaned up
         end
@@ -252,6 +474,12 @@ local function walkToPixel(part, humanoid, hrp)
             -- arrived, give the game a moment to auto-paint
             local paintWaited = 0
             while getgenv().PaintBotRunning and paintWaited < CONFIG.paintWaitTimeout do
+                if getgenv().PaintBotPaused then
+                    waitWhilePaused()
+                end
+                if expectedMode and getgenv().PaintBotDrawMode ~= expectedMode then
+                    return false
+                end
                 if not part.Parent or part:GetAttribute("D") == true then
                     return true
                 end
@@ -320,54 +548,67 @@ task.spawn(function()
     log("Starting. Scanning for unpainted pixels...")
 
     while getgenv().PaintBotRunning do
+        waitWhilePaused()
+        if not getgenv().PaintBotRunning then
+            break
+        end
+
         local groups = gatherUnpaintedByNumber(activePicture)
 
         local numbers = {}
         for n, _ in pairs(groups) do
             table.insert(numbers, n)
         end
-        table.sort(numbers)
 
         if #numbers == 0 then
             log("No unpainted pixels found. Picture appears complete!")
             break
         end
 
-        for _, n in ipairs(numbers) do
-            if not getgenv().PaintBotRunning then break end
+        local n = pickNextNumber(numbers)
+        local workingMode = getgenv().PaintBotDrawMode
+        selectNumber(n)
 
-            selectNumber(n)
+        -- Keep working this number until no unpainted pixels with it remain,
+        -- OR until the draw mode changes (then abandon and re-pick immediately)
+        while getgenv().PaintBotRunning do
+            waitWhilePaused()
+            if not getgenv().PaintBotRunning then
+                break
+            end
 
-            -- Keep working this number until no unpainted pixels with it remain
-            while getgenv().PaintBotRunning do
-                -- re-scan live so we pick up pixels painted by chance and skip stale ones
-                local remaining = {}
-                for _, part in ipairs(activePicture:GetChildren()) do
-                    if part:IsA("BasePart") and part:GetAttribute("N") == n and part:GetAttribute("D") == false then
-                        table.insert(remaining, part)
-                    end
+            if getgenv().PaintBotDrawMode ~= workingMode then
+                log("Mode changed mid-color -- switching immediately")
+                break
+            end
+
+            -- re-scan live so we pick up pixels painted by chance and skip stale ones
+            local remaining = {}
+            for _, part in ipairs(activePicture:GetChildren()) do
+                if part:IsA("BasePart") and part:GetAttribute("N") == n and part:GetAttribute("D") == false then
+                    table.insert(remaining, part)
                 end
+            end
 
-                if #remaining == 0 then
-                    break
+            if #remaining == 0 then
+                break
+            end
+
+            -- pick nearest remaining pixel for this number
+            local nearest, nearestDist = nil, math.huge
+            for _, part in ipairs(remaining) do
+                local d = distanceXZ(hrp.Position, part.Position)
+                if d < nearestDist then
+                    nearestDist = d
+                    nearest = part
                 end
+            end
 
-                -- pick nearest remaining pixel for this number
-                local nearest, nearestDist = nil, math.huge
-                for _, part in ipairs(remaining) do
-                    local d = distanceXZ(hrp.Position, part.Position)
-                    if d < nearestDist then
-                        nearestDist = d
-                        nearest = part
-                    end
-                end
-
-                if nearest then
-                    log("Walking to pixel N=" .. tostring(n) .. " at distance " .. math.floor(nearestDist))
-                    local success = walkToPixel(nearest, humanoid, hrp)
-                    if not success then
-                        log("Timed out / gave up on a pixel, moving on")
-                    end
+            if nearest then
+                log("Walking to pixel N=" .. tostring(n) .. " at distance " .. math.floor(nearestDist))
+                local success = walkToPixel(nearest, humanoid, hrp, workingMode)
+                if not success then
+                    log("Timed out / gave up on a pixel, moving on")
                 end
             end
         end
