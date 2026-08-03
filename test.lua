@@ -15,6 +15,10 @@
     There's also a Start/Stop button on the on-screen progress UI that
     does the same pause/resume toggle as the console functions above.
 
+    FPS: other players' canvases are cleared with a repeating sweep (see
+    CONFIG.hideOtherCanvases / canvasScanInterval) so plots/pixels that
+    stream in a moment after you join still get caught.
+
     CONFIG — check these before running
 ]]
 
@@ -74,13 +78,18 @@ local CONFIG = {
     -- Default WalkSpeed to apply to the local player once the bot has
     -- started (applies on spawn/respawn too). Set to nil to disable and
     -- rely solely on walkSpeedOverride above.
-    defaultPlayerSpeed = 32,
+    defaultPlayerSpeed = 50,
 
     -- FPS BOOST: destroy the pixel parts belonging to every other plot's
-    -- ActivePicture folder (your own plot is left untouched), and keep
-    -- clearing any new ones that stream in as other players draw or join.
+    -- ActivePicture folder (your own plot is left untouched). Runs as a
+    -- repeating sweep rather than a single pass, since other plots (and
+    -- their pixels) can stream in gradually after you join.
     -- Set to false to leave other canvases alone.
     hideOtherCanvases = true,
+
+    -- How often (seconds) to re-sweep all plots for the above. Keeps
+    -- catching neighbors/pixels that stream in after the first pass.
+    canvasScanInterval = 1.0,
 }
 
 ----------------------------------------------------------------
@@ -295,45 +304,42 @@ local function armSpeedHook()
     log("Default speed hook armed (WalkSpeed =", CONFIG.defaultPlayerSpeed, ")")
 end
 
--- FPS boost: destroys the pixel parts under an ActivePicture folder and
--- keeps destroying any new ones added afterward (covers pixels that
--- stream in as the other player draws, or a repainted/refreshed picture).
-local function watchAndClearCanvas(activePicture)
-    for _, part in ipairs(activePicture:GetChildren()) do
-        part:Destroy()
-    end
-    activePicture.ChildAdded:Connect(function(part)
-        part:Destroy()
-    end)
-end
-
--- Clears every other plot's canvas (never touches ownPlot), and keeps
--- watching for plots that load in later (e.g. a player joining after us).
-local function clearOtherCanvases(plotModels, ownPlot)
+-- FPS boost: repeatedly sweeps every other plot and destroys whatever is
+-- currently inside its ActivePicture folder. A repeating sweep (rather
+-- than a one-shot pass + ChildAdded hook) is what actually caught plots
+-- and pixels that stream in a moment after you join, in testing.
+local function armCanvasClearing(plotModels, ownPlot)
     if not CONFIG.hideOtherCanvases then return end
 
-    local watched = 0
-    for _, candidate in ipairs(plotModels:GetChildren()) do
-        if candidate ~= ownPlot then
-            local ap = candidate:FindFirstChild("ActivePicture")
-            if ap then
-                watchAndClearCanvas(ap)
-                watched = watched + 1
+    task.spawn(function()
+        local firstPass = true
+        while getgenv().PaintBotRunning do
+            local plotsSeen, plotsWithCanvas, destroyed = 0, 0, 0
+
+            for _, candidate in ipairs(plotModels:GetChildren()) do
+                plotsSeen = plotsSeen + 1
+                if candidate ~= ownPlot then
+                    local ap = candidate:FindFirstChild("ActivePicture")
+                    if ap then
+                        plotsWithCanvas = plotsWithCanvas + 1
+                        for _, part in ipairs(ap:GetChildren()) do
+                            local ok = pcall(function() part:Destroy() end)
+                            if ok then destroyed = destroyed + 1 end
+                        end
+                    end
+                end
             end
+
+            if firstPass then
+                log(string.format(
+                    "Canvas clearing: saw %d plot(s), %d with a canvas, destroyed %d pixel(s) on first pass",
+                    plotsSeen, plotsWithCanvas, destroyed))
+                firstPass = false
+            end
+
+            task.wait(CONFIG.canvasScanInterval)
         end
-    end
-
-    plotModels.ChildAdded:Connect(function(candidate)
-        if candidate == ownPlot then return end
-        task.spawn(function()
-            local ap = candidate:WaitForChild("ActivePicture", 10)
-            if ap then
-                watchAndClearCanvas(ap)
-            end
-        end)
     end)
-
-    log("Clearing other players' canvases (", watched, "plots on start) to reduce lag")
 end
 
 local function pickNextNumber(numbers)
@@ -595,7 +601,7 @@ task.spawn(function()
         return
     end
 
-    clearOtherCanvases(plot.Parent, plot)
+    armCanvasClearing(plot.Parent, plot)
 
     local char = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
     local humanoid = char:FindFirstChildOfClass("Humanoid")
