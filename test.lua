@@ -175,25 +175,53 @@ end
 -- Config save/load (persists drawMode across game rejoins)
 local function loadConfig()
     if not CONFIG.saveConfig then return end
-    local ok, exists = pcall(function() return isfile and isfile(CONFIG.configFile) end)
-    if not ok or not exists then return end
+
+    print("[PaintBot][Config] Checking for", CONFIG.configFile)
+
+    local okCheck, exists = pcall(function() return isfile and isfile(CONFIG.configFile) end)
+    if not okCheck then
+        warn("[PaintBot][Config] isfile() check errored:", exists)
+        return
+    end
+    if not exists then
+        print("[PaintBot][Config] No saved config file found (isfile returned false/nil). Using defaults.")
+        return
+    end
 
     local okRead, content = pcall(function() return readfile(CONFIG.configFile) end)
-    if not okRead or not content then return end
+    if not okRead then
+        warn("[PaintBot][Config] readfile() failed:", content)
+        return
+    end
+    print("[PaintBot][Config] Raw file content:", tostring(content))
 
     local okDecode, data = pcall(function() return HttpService:JSONDecode(content) end)
-    if okDecode and type(data) == "table" and data.drawMode then
-        getgenv().PaintBotDrawMode = data.drawMode
-        log("Loaded saved config, drawMode =", data.drawMode)
+    if not okDecode then
+        warn("[PaintBot][Config] JSONDecode failed:", data)
+        return
     end
+    if type(data) ~= "table" or not data.drawMode then
+        warn("[PaintBot][Config] Decoded data missing drawMode:", tostring(data))
+        return
+    end
+
+    getgenv().PaintBotDrawMode = data.drawMode
+    print("[PaintBot][Config] Loaded saved drawMode =", data.drawMode)
 end
 
 local function saveConfigToFile()
     if not CONFIG.saveConfig then return end
     local data = { drawMode = getgenv().PaintBotDrawMode }
     local okEncode, json = pcall(function() return HttpService:JSONEncode(data) end)
-    if okEncode then
-        pcall(function() writefile(CONFIG.configFile, json) end)
+    if not okEncode then
+        warn("[PaintBot][Config] JSONEncode failed:", json)
+        return
+    end
+    local okWrite, errWrite = pcall(function() writefile(CONFIG.configFile, json) end)
+    if okWrite then
+        print("[PaintBot][Config] Saved:", json)
+    else
+        warn("[PaintBot][Config] writefile() failed:", errWrite)
     end
 end
 
