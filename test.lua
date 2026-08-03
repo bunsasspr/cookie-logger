@@ -420,7 +420,7 @@ local function createProgressUI()
     closeButton.Position = UDim2.new(1, -22, 0, 2)
     closeButton.BackgroundColor3 = Color3.fromRGB(60, 60, 60)
     closeButton.BackgroundTransparency = 0.4
-    closeButton.Text = "✕"
+    closeButton.Text = "X"
     closeButton.Font = Enum.Font.GothamBold
     closeButton.TextSize = 12
     closeButton.TextColor3 = Color3.new(1, 1, 1)
