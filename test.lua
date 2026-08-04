@@ -51,37 +51,9 @@ local CONFIG = {
     -- 0.1–0.2 is a good range.
     retargetInterval = 0.1,
 
-    -- SPEED: how targets are chosen within continuousMode.
-    -- "sweep"   (default) — sorts unpainted pixels of the current number
-    --           into rows and walks them boustrophedon-style (left-right,
-    --           then right-left), like a printer head. Cuts the zig-zag
-    --           backtracking that pure nearest-neighbor produces on
-    --           scattered clusters, so less total distance walked.
-    -- "nearest" — legacy behaviour: always walk to whichever unpainted
-    --           pixel is closest right now.
-    pathMode = "sweep",
-
-    -- SPEED: only used when pathMode == "sweep". Instead of aiming at the
-    -- very next pixel in sweep order, aim this many pixels further down
-    -- the line. Pixels in between still get painted automatically as you
-    -- walk over them, so this just means fewer discrete "arrive, retarget"
-    -- events for the same coverage. Too high can overshoot on sparse/gappy
-    -- rows and skip pixels that then need a second pass; 2-5 is a good
-    -- range for dense pictures, 0 disables it (aim at the very next one).
-    lookaheadPixels = 3,
-
-    -- SPEED: only used when pathMode == "sweep". Exact spacing between
-    -- adjacent pixels along the row axis, if you know it. Leave nil to
-    -- auto-detect it from the pixel set (works fine in practice; only set
-    -- this if auto-detect picks a wrong pitch on your picture's layout).
-    sweepRowSpacingHint = nil,
-
-    -- How close (studs, horizontal XZ distance) counts as "arrived" at a
-    -- pixel. Used by legacy mode as its paint-wait gate, and by continuous
-    -- mode's stuck check to tell "arrived and legitimately idling" apart
-    -- from "actually blocked" — the bot still never intentionally waits on
-    -- a pixel in continuous mode, this just stops it from misreading a
-    -- healthy standstill as being stuck.
+    -- How close (studs, horizontal XZ distance) counts as "arrived" at a pixel.
+    -- Only used in legacy (continuousMode = false) mode for the paint-wait gate.
+    -- In continuous mode the bot never waits on arrival; this is unused there.
     arriveDistance = 3,
 
     -- LEGACY ONLY (continuousMode = false): after arriving, how long to wait
@@ -90,21 +62,10 @@ local CONFIG = {
     paintWaitTimeout = 2,
 
     -- Delay after firing SelectNumber before starting to walk, to give the
-    -- game time to register the color switch. SPEED: this is paid once per
-    -- color, not per pixel, so it's a small win at best (e.g. 30 colors ×
-    -- 0.25s = 7.5s total) — worth trying lower if you want to squeeze it,
-    -- but don't expect much from it compared to walkSpeedOverride or pathMode.
+    -- game time to register the color switch
     selectNumberSettleTime = 0.25,
 
     -- Optional walk speed boost. Set to nil to leave WalkSpeed untouched.
-    -- SPEED: this is the single biggest lever you have — every pixel takes
-    -- distance/WalkSpeed seconds no matter how good the targeting logic is.
-    -- Try pushing defaultPlayerSpeed (below) up first; come back to this
-    -- only if you need something even higher applied on a delay/condition.
-    -- Ceiling in practice is whatever the game's own movement validation
-    -- tolerates before it snaps you back or flags something — there's no
-    -- universal safe number, so raise it in steps and watch for rubber-
-    -- banding rather than jumping straight to something extreme.
     walkSpeedOverride = nil,
 
     -- STUCK RECOVERY: how often (seconds) to check whether the character
@@ -157,6 +118,17 @@ local CONFIG = {
     -- How often (seconds) to re-sweep all plots for the above. Keeps
     -- catching neighbors/pixels that stream in after the first pass.
     canvasScanInterval = 1.0,
+
+    -- FREEZE FIX: the sweep above destroys parts in a plain synchronous
+    -- loop. Luau only switches threads at yield points, so if a burst of
+    -- neighbor pixels streams in at once (walking near several plots,
+    -- multiple players loading together, etc.), destroying all of them
+    -- in one unbroken loop hogs the whole script's execution slice for
+    -- that frame -- including the paint loop's Heartbeat:Wait(), which
+    -- can't run until the destroy loop finishes. That's the 2-3s freeze.
+    -- This setting yields every N destroys so the sweep spreads across
+    -- several frames instead of stalling everything at once.
+    canvasClearYieldEvery = 40,
 }
 
 ----------------------------------------------------------------
@@ -301,85 +273,6 @@ local function findNearestPixel(parts, hrp)
     return nearest, nearestDist
 end
 
-----------------------------------------------------------------
--- SWEEP PATH ORDERING: the real cost isn't the little hitch, it's
--- distance traveled. Pure "walk to whichever pixel is nearest right
--- now" zig-zags across scattered clusters and backtracks a lot.
--- This sorts pixels into rows (boustrophedon: left-right, then
--- right-left, like a printer head) so consecutive pixels are almost
--- always adjacent, and auto-picks which axis to sweep along based
--- on the pixel set's own spread, so it adapts to the picture's
--- actual orientation without needing to know its geometry ahead of
--- time.
-----------------------------------------------------------------
-local function computeSweepOrder(parts)
-    if #parts <= 1 then return parts end
-
-    local minX, maxX, minZ, maxZ = math.huge, -math.huge, math.huge, -math.huge
-    for _, p in ipairs(parts) do
-        local x, z = p.Position.X, p.Position.Z
-        if x < minX then minX = x end
-        if x > maxX then maxX = x end
-        if z < minZ then minZ = z end
-        if z > maxZ then maxZ = z end
-    end
-
-    -- Sweep along whichever axis spans more distance; bucket rows along
-    -- the other one. Adapts to the picture being wider along X or Z.
-    local sweepAlongX = (maxX - minX) >= (maxZ - minZ)
-    local function rowCoord(p) return sweepAlongX and p.Position.Z or p.Position.X end
-    local function colCoord(p) return sweepAlongX and p.Position.X or p.Position.Z end
-
-    -- Auto-detect row pitch (smallest real gap between distinct row
-    -- coordinates) unless the user has hinted at an exact spacing.
-    local pitch = CONFIG.sweepRowSpacingHint
-    if not pitch then
-        local coords = {}
-        for _, p in ipairs(parts) do
-            table.insert(coords, rowCoord(p))
-        end
-        table.sort(coords)
-        pitch = math.huge
-        for i = 2, #coords do
-            local gap = coords[i] - coords[i - 1]
-            if gap > 0.01 and gap < pitch then
-                pitch = gap
-            end
-        end
-        if pitch == math.huge then
-            pitch = 1 -- everything's on one row; exact value doesn't matter
-        end
-    end
-
-    local rows, rowKeys = {}, {}
-    for _, p in ipairs(parts) do
-        local key = math.floor((rowCoord(p) / pitch) + 0.5)
-        if not rows[key] then
-            rows[key] = {}
-            table.insert(rowKeys, key)
-        end
-        table.insert(rows[key], p)
-    end
-    table.sort(rowKeys)
-
-    local ordered = {}
-    for i, key in ipairs(rowKeys) do
-        local row = rows[key]
-        table.sort(row, function(a, b) return colCoord(a) < colCoord(b) end)
-        if i % 2 == 0 then
-            local reversed = {}
-            for j = #row, 1, -1 do
-                table.insert(reversed, row[j])
-            end
-            row = reversed
-        end
-        for _, p in ipairs(row) do
-            table.insert(ordered, p)
-        end
-    end
-    return ordered
-end
-
 local function selectNumber(n)
     local okFire, errFire = pcall(function()
         SelectNumberEvent:FireServer(n)
@@ -508,10 +401,13 @@ end
 local function armCanvasClearing(plotModels, ownPlot)
     if not CONFIG.hideOtherCanvases then return end
 
+    local yieldEvery = math.max(1, CONFIG.canvasClearYieldEvery or 40)
+
     task.spawn(function()
         local firstPass = true
         while getgenv().PaintBotRunning do
             local plotsSeen, plotsWithCanvas, destroyed = 0, 0, 0
+            local sinceYield = 0
 
             for _, candidate in ipairs(plotModels:GetChildren()) do
                 plotsSeen = plotsSeen + 1
@@ -522,6 +418,20 @@ local function armCanvasClearing(plotModels, ownPlot)
                         for _, part in ipairs(ap:GetChildren()) do
                             local ok = pcall(function() part:Destroy() end)
                             if ok then destroyed = destroyed + 1 end
+
+                            -- Yield periodically instead of destroying an
+                            -- entire burst in one unbroken loop. This is
+                            -- what stops the sweep from stalling the paint
+                            -- loop's Heartbeat:Wait() for multiple seconds
+                            -- when a lot of neighbor pixels stream in at once.
+                            sinceYield = sinceYield + 1
+                            if sinceYield >= yieldEvery then
+                                sinceYield = 0
+                                task.wait()
+                                if not getgenv().PaintBotRunning then
+                                    return
+                                end
+                            end
                         end
                     end
                 end
@@ -967,38 +877,7 @@ local function paintNumberContinuous(n, activePicture, humanoid, hrp, expectedMo
     local rescanInterval = CONFIG.retargetInterval or 0.1
     local lastRescanTime = 0
 
-    -- A pixel counts as "consumable" if it's still unpainted and we
-    -- haven't given up on it this pass.
-    local function isConsumable(part)
-        return isPixelStillOpen(part) and not skipSet[part]
-    end
-
-    -- SWEEP MODE state: a fixed order for this pass, walked with a
-    -- forward-only cursor. Earlier this recomputed "which pixel is
-    -- nearest to me right now" from scratch every tick and jumped
-    -- lookaheadPixels past *that* -- which meant standing near the
-    -- midpoint between two pixels could flip the "nearest" answer from
-    -- tick to tick, sending the lookahead target to two different far
-    -- pixels in a row and yanking the bot back and forth between them.
-    -- A cursor that only ever moves forward can't flip like that.
-    local sweepOrder = nil
-    local sweepCursor = 1
-
-    local function rebuildSweepOrder()
-        local remaining = gatherRemainingForNumber(activePicture, n, skipSet)
-        sweepOrder = computeSweepOrder(remaining)
-        sweepCursor = 1
-        return #remaining > 0
-    end
-
     log("Continuous paint starting for N=" .. tostring(n))
-
-    if CONFIG.pathMode == "sweep" then
-        if not rebuildSweepOrder() then
-            log("Nothing to paint for N=" .. tostring(n))
-            return
-        end
-    end
 
     while getgenv().PaintBotRunning do
         -- Pause: freeze in place, reset stuck clock on resume
@@ -1024,20 +903,28 @@ local function paintNumberContinuous(n, activePicture, humanoid, hrp, expectedMo
             return
         end
 
-        if CONFIG.pathMode == "sweep" then
-            -- Advance the cursor past anything already painted or skipped.
-            -- This is amortized O(1) per tick over the whole pass (the
-            -- cursor only ever moves forward), not a fresh scan each time.
-            while sweepCursor <= #sweepOrder and not isConsumable(sweepOrder[sweepCursor]) do
-                sweepCursor = sweepCursor + 1
-            end
+        -- Cheap every-frame check: is the pixel we're currently walking to
+        -- still open? This is a single attribute read, not a list scan, so
+        -- doing it every frame costs nothing and means we react the instant
+        -- it flips rather than waiting on the next scan tick.
+        local targetLost = currentTarget ~= nil and not isPixelStillOpen(currentTarget)
+        local dueForRescan = (tick() - lastRescanTime) >= rescanInterval
 
-            if sweepCursor > #sweepOrder then
-                -- Exhausted this pass's order.
+        if currentTarget == nil or targetLost or dueForRescan then
+            lastRescanTime = tick()
+
+            -- Live scan of still-unpainted pixels for this number
+            local remaining = gatherRemainingForNumber(activePicture, n, skipSet)
+            if #remaining == 0 then
+                -- If we only emptied the list because of skips, clear skips once
+                -- and retry anything still actually unpainted before giving up.
                 if next(skipSet) ~= nil then
-                    skipSet = {}
-                    stuckRecoveries = 0
-                    if not rebuildSweepOrder() then
+                    local anyLeft = gatherRemainingForNumber(activePicture, n, nil)
+                    if #anyLeft > 0 then
+                        skipSet = {}
+                        stuckRecoveries = 0
+                        remaining = anyLeft
+                    else
                         break
                     end
                 else
@@ -1045,98 +932,39 @@ local function paintNumberContinuous(n, activePicture, humanoid, hrp, expectedMo
                 end
             end
 
-            -- Aim lookaheadPixels ahead of the cursor, but never past the
-            -- last still-open pixel in that window -- walk back down to
-            -- the cursor itself if everything further ahead already got
-            -- painted (e.g. someone/something else touched them first).
-            local aheadIdx = math.min(sweepCursor + (CONFIG.lookaheadPixels or 0), #sweepOrder)
-            local target = nil
-            for i = aheadIdx, sweepCursor, -1 do
-                if isConsumable(sweepOrder[i]) then
-                    target = sweepOrder[i]
-                    break
-                end
+            local nearest, nearestDist = findNearestPixel(remaining, hrp)
+            if not nearest then
+                break
             end
 
-            if target and target ~= currentTarget then
-                currentTarget = target
+            -- Only touch MoveTo when the target actually changes. Re-sending
+            -- MoveTo to the same point every tick is what caused the stutter,
+            -- so a same-target rescan now leaves movement completely alone.
+            if nearest ~= currentTarget then
+                currentTarget = nearest
                 stuckRecoveries = 0
                 lastCheckPos = hrp.Position
                 lastCheckTime = tick()
                 humanoid:MoveTo(currentTarget.Position)
 
+                -- Throttled log: at most once per ~1.5s, or when remaining count drops
                 local now = tick()
-                local remainingCount = #sweepOrder - sweepCursor + 1
-                if now - lastLogTime >= 1.5 or remainingCount ~= lastRemainingLog then
+                if now - lastLogTime >= 1.5 or #remaining ~= lastRemainingLog then
                     log(string.format(
                         "N=%s  target dist=%d  remaining=%d",
-                        tostring(n), math.floor(distanceXZ(hrp.Position, currentTarget.Position)), remainingCount))
+                        tostring(n), math.floor(nearestDist), #remaining))
                     lastLogTime = now
-                    lastRemainingLog = remainingCount
-                end
-            end
-        else
-            -- LEGACY "nearest" mode: throttled full rescan + pure nearest-
-            -- neighbor targeting, same as the original continuous mode.
-            local targetLost = currentTarget ~= nil and not isPixelStillOpen(currentTarget)
-            local dueForRescan = (tick() - lastRescanTime) >= rescanInterval
-
-            if currentTarget == nil or targetLost or dueForRescan then
-                lastRescanTime = tick()
-
-                local remaining = gatherRemainingForNumber(activePicture, n, skipSet)
-                if #remaining == 0 then
-                    if next(skipSet) ~= nil then
-                        local anyLeft = gatherRemainingForNumber(activePicture, n, nil)
-                        if #anyLeft > 0 then
-                            skipSet = {}
-                            stuckRecoveries = 0
-                            remaining = anyLeft
-                        else
-                            break
-                        end
-                    else
-                        break
-                    end
-                end
-
-                local nearest, nearestDist = findNearestPixel(remaining, hrp)
-                if not nearest then
-                    break
-                end
-
-                if nearest ~= currentTarget then
-                    currentTarget = nearest
-                    stuckRecoveries = 0
-                    lastCheckPos = hrp.Position
-                    lastCheckTime = tick()
-                    humanoid:MoveTo(currentTarget.Position)
-
-                    local now = tick()
-                    if now - lastLogTime >= 1.5 or #remaining ~= lastRemainingLog then
-                        log(string.format(
-                            "N=%s  target dist=%d  remaining=%d",
-                            tostring(n), math.floor(nearestDist), #remaining))
-                        lastLogTime = now
-                        lastRemainingLog = #remaining
-                    end
+                    lastRemainingLog = #remaining
                 end
             end
         end
 
-        -- Stuck check. "Not moving" has two very different causes: actually
-        -- blocked, or arrived at the target and legitimately standing still
-        -- (waiting for the next retarget / for D to flip). At low speed you
-        -- were basically always still traveling when this fired, so the two
-        -- never got confused. At high speed you often reach the target in
-        -- well under a second, so without this distinction the checker
-        -- misfires on completely healthy "arrived and waiting" moments.
+        -- Stuck check (same recovery logic as before — on give-up we skip
+        -- this pixel and immediately retarget the next nearest instead of
+        -- blocking in a paint-wait loop).
         if tick() - lastCheckTime >= CONFIG.stuckCheckInterval then
             local moved = distanceXZ(hrp.Position, lastCheckPos)
-            local distToTarget = currentTarget and distanceXZ(hrp.Position, currentTarget.Position) or math.huge
-            local arrived = distToTarget <= CONFIG.arriveDistance
-
-            if moved < CONFIG.stuckMoveThreshold and not arrived then
+            if moved < CONFIG.stuckMoveThreshold then
                 stuckRecoveries = stuckRecoveries + 1
                 if stuckRecoveries > CONFIG.maxStuckRecoveries then
                     log("Skipping stuck pixel N=" .. tostring(n) .. " after", stuckRecoveries, "recoveries")
@@ -1147,10 +975,6 @@ local function paintNumberContinuous(n, activePicture, humanoid, hrp, expectedMo
                     local targetPos = currentTarget and currentTarget.Position or hrp.Position
                     attemptUnstick(humanoid, hrp, targetPos)
                 end
-            else
-                -- Either moving fine, or arrived and legitimately idling —
-                -- both are healthy, so clear any strikes from earlier.
-                stuckRecoveries = 0
             end
             lastCheckPos = hrp.Position
             lastCheckTime = tick()
