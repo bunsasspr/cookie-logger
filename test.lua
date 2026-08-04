@@ -7,20 +7,26 @@
     across matching pixels until they're painted (D flips to true), before
     moving to the next number. Repeats until nothing unpainted is left.
 
-    CONTINUOUS MODE (default):
-      - Character never stops to wait for a single pixel.
-      - Loop is paced by RunService.Heartbeat (no fixed sleep).
-      - MoveTo is issued only when the target actually changes
-        (re-issuing to the same point caused stutter).
-      - Current target is checked every frame (cheap attribute read).
-      - Full O(n) rescan for a closer pixel is throttled by retargetInterval.
+    CONTINUOUS MODE (default): the character never stops to wait for a single
+    pixel to paint. Movement is paced by the render heartbeat (no fixed sleep
+    between steps), and the moment the current pixel is painted it retargets
+    immediately rather than on a poll timer — MoveTo is only re-issued when
+    the target actually changes, not repeatedly to the same point, since that
+    repeated re-issue was itself the source of the old brief stutter. A full
+    list re-scan (for a closer/new pixel appearing) is still throttled by
+    retargetInterval, since that part is an O(n) scan and worth rate-limiting.
 
-    CONTROLS (console):
-        PaintBotStop()    -- stop permanently
-        PaintBotPause()   -- pause in place
-        PaintBotResume()  -- resume
+    CONTROLS (run in console):
+        PaintBotStop()    -- stops the bot cleanly (cannot be resumed)
+        PaintBotPause()   -- pauses in place (can be resumed)
+        PaintBotResume()  -- resumes after a pause
 
-    On-screen UI Start/Stop button does the same pause/resume toggle.
+    There's also a Start/Stop button on the on-screen progress UI that
+    does the same pause/resume toggle as the console functions above.
+
+    FPS: other players' canvases are cleared with a repeating sweep (see
+    CONFIG.hideOtherCanvases / canvasScanInterval) so plots/pixels that
+    stream in a moment after you join still get caught.
 
     CONFIG — check these before running
 ]]
@@ -30,77 +36,111 @@ local CONFIG = {
     -- username here (case-sensitive) and re-run.
     plotOwnerName = nil,
 
-    -- Keep character in motion; retarget nearest unpainted pixel of the
-    -- current number. When true, paintWaitTimeout is ignored.
+    -- CONTINUOUS MODE: keep the character in motion and retarget the nearest
+    -- still-unpainted pixel of the current number on a short interval.
+    -- When true, paintWaitTimeout is ignored and there is no intentional
+    -- stop-and-wait on each pixel. Set false to restore the legacy
+    -- "walk → arrive → wait for paint" behaviour.
     continuousMode = true,
 
-    -- How often (seconds) to fully rescan pixels for a closer/new target
-    -- while continuousMode is active. Only throttles the O(n) scan.
+    -- How often (seconds) to run a full re-scan of all pixels for this
+    -- number to check for a closer/new one, while continuousMode is active.
+    -- This does NOT pace movement or MoveTo anymore (that happens every
+    -- frame with no artificial delay) — it only throttles the O(n) list
+    -- scan, which is the one part that's actually worth rate-limiting.
+    -- 0.1–0.2 is a good range.
     retargetInterval = 0.1,
 
-    -- Horizontal distance (studs) that counts as "arrived".
-    -- Used only in legacy mode.
+    -- How close (studs, horizontal XZ distance) counts as "arrived" at a pixel.
+    -- Only used in legacy (continuousMode = false) mode for the paint-wait gate.
+    -- In continuous mode the bot never waits on arrival; this is unused there.
     arriveDistance = 3,
 
-    -- LEGACY ONLY: after arriving, how long to wait for D to flip true.
+    -- LEGACY ONLY (continuousMode = false): after arriving, how long to wait
+    -- for the game to auto-paint (D flips to true) before giving up on this
+    -- pixel and moving to the next. Ignored when continuousMode is true.
     paintWaitTimeout = 2,
 
-    -- Delay after SelectNumber so the game registers the color switch.
+    -- Delay after firing SelectNumber before starting to walk, to give the
+    -- game time to register the color switch
     selectNumberSettleTime = 0.25,
 
-    -- Optional walk speed boost. nil = leave WalkSpeed alone.
+    -- Optional walk speed boost. Set to nil to leave WalkSpeed untouched.
     walkSpeedOverride = nil,
 
-    -- Stuck recovery
+    -- STUCK RECOVERY: how often (seconds) to check whether the character
+    -- has actually moved while walking to a pixel
     stuckCheckInterval = 1.0,
+
+    -- If the character has moved less than this many studs since the last
+    -- check, it's considered stuck
     stuckMoveThreshold = 1.5,
+
+    -- How many recovery attempts to make on a single pixel before giving
+    -- up on it entirely and moving to a different one (it'll be picked up
+    -- again on a later pass if still unpainted)
     maxStuckRecoveries = 3,
 
-    -- Progress UI
+    -- On-screen progress bar
     showProgressUI = true,
     progressUpdateInterval = 0.5,
 
-    -- "ascending" | "descending" | "random"  (changeable live via UI)
+    -- Order colors are worked through: "ascending" (1->30), "descending"
+    -- (30->1), or "random" (shuffled each pass). Can also be changed live
+    -- via the buttons on the progress UI.
     drawMode = "ascending",
 
-    -- Persist drawMode across rejoins (needs writefile/readfile/isfile)
+    -- Persist settings (currently just drawMode) to a file so they survive
+    -- rejoining the game. Requires writefile/readfile/isfile support.
     saveConfig = true,
     configFile = "paintbot_config.json",
 
-    -- Prevent ~20 min AFK kick
+    -- Anti-AFK: nudges the game whenever Roblox's own idle detector fires,
+    -- so the ~20 minute AFK kick doesn't happen during long runs.
     antiAfk = true,
 
-    -- Console logging
+    -- Print progress as it works. In continuous mode, per-pixel walk logs
+    -- are throttled so the console isn't spammed every retarget.
     verbose = true,
 
-    -- Applied on spawn/respawn once the bot starts. nil to disable.
+    -- Default WalkSpeed to apply to the local player once the bot has
+    -- started (applies on spawn/respawn too). Set to nil to disable and
+    -- rely solely on walkSpeedOverride above.
     defaultPlayerSpeed = 50,
 
-    -- Destroy other players' ActivePicture parts for FPS.
+    -- FPS BOOST: destroy the pixel parts belonging to every other plot's
+    -- ActivePicture folder (your own plot is left untouched). Runs as a
+    -- repeating sweep rather than a single pass, since other plots (and
+    -- their pixels) can stream in gradually after you join.
+    -- Set to false to leave other canvases alone.
     hideOtherCanvases = true,
+
+    -- How often (seconds) to re-sweep all plots for the above. Keeps
+    -- catching neighbors/pixels that stream in after the first pass.
     canvasScanInterval = 1.0,
-    -- Yield every N destroys so a burst of streamed pixels doesn't freeze
-    -- the paint loop for multiple seconds.
+
+    -- FREEZE FIX: the sweep above destroys parts in a plain synchronous
+    -- loop. Luau only switches threads at yield points, so if a burst of
+    -- neighbor pixels streams in at once (walking near several plots,
+    -- multiple players loading together, etc.), destroying all of them
+    -- in one unbroken loop hogs the whole script's execution slice for
+    -- that frame -- including the paint loop's Heartbeat:Wait(), which
+    -- can't run until the destroy loop finishes. That's the 2-3s freeze.
+    -- This setting yields every N destroys so the sweep spreads across
+    -- several frames instead of stalling everything at once.
     canvasClearYieldEvery = 40,
 }
 
 ----------------------------------------------------------------
--- Services
-----------------------------------------------------------------
 
-local Players           = game:GetService("Players")
+local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local HttpService       = game:GetService("HttpService")
-local VirtualUser       = game:GetService("VirtualUser")
-local RunService        = game:GetService("RunService")
-local UserInputService  = game:GetService("UserInputService")
-
+local HttpService = game:GetService("HttpService")
+local VirtualUser = game:GetService("VirtualUser")
+local RunService = game:GetService("RunService")
 local LocalPlayer = Players.LocalPlayer
-local SelectNumberEvent = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("SelectNumber")
 
-----------------------------------------------------------------
--- Logging / control flags
-----------------------------------------------------------------
+local SelectNumberEvent = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("SelectNumber")
 
 local function log(...)
     if CONFIG.verbose then
@@ -108,12 +148,13 @@ local function log(...)
     end
 end
 
+-- Stop switch
 if getgenv().PaintBotRunning then
     getgenv().PaintBotRunning = false
     task.wait(0.3)
 end
 getgenv().PaintBotRunning = true
-getgenv().PaintBotPaused  = false
+getgenv().PaintBotPaused = false
 
 getgenv().PaintBotStop = function()
     getgenv().PaintBotRunning = false
@@ -128,34 +169,22 @@ getgenv().PaintBotResume = function()
     print("[PaintBot] Resumed.")
 end
 
--- Sleeps while paused; returns as soon as running is false so callers can exit.
+-- Sleeps in short increments while paused, returns early if the bot is
+-- stopped entirely so callers can bail out of their own loops.
 local function waitWhilePaused()
     while getgenv().PaintBotRunning and getgenv().PaintBotPaused do
         task.wait(0.15)
     end
 end
 
-local function stillRunning()
-    return getgenv().PaintBotRunning == true
-end
-
-local function modeChanged(expected)
-    return expected ~= nil and getgenv().PaintBotDrawMode ~= expected
-end
-
-----------------------------------------------------------------
--- Plot detection
-----------------------------------------------------------------
-
 local function findOwnPlot()
-    local plotModels = workspace:FindFirstChild("Map")
-        and workspace.Map:FindFirstChild("PlotModels")
+    local plotModels = workspace:FindFirstChild("Map") and workspace.Map:FindFirstChild("PlotModels")
     if not plotModels then
         warn("[PaintBot] Could not find Workspace.Map.PlotModels")
         return nil
     end
 
-    -- 1) Exact name match
+    -- 1) Try exact name match (config override or player's own name)
     local tryName = CONFIG.plotOwnerName or LocalPlayer.Name
     local plot = plotModels:FindFirstChild(tryName)
     if plot and plot:FindFirstChild("ActivePicture") then
@@ -163,11 +192,11 @@ local function findOwnPlot()
         return plot
     end
 
-    -- 2) Closest plot with an ActivePicture
+    -- 2) Fallback: closest plot to the player's character
     local char = LocalPlayer.Character
     local hrp = char and char:FindFirstChild("HumanoidRootPart")
     if not hrp then
-        warn("[PaintBot] No character/HumanoidRootPart for proximity fallback")
+        warn("[PaintBot] No character/HumanoidRootPart to use for fallback plot detection")
         return nil
     end
 
@@ -176,185 +205,144 @@ local function findOwnPlot()
         local ap = candidate:FindFirstChild("ActivePicture")
         if ap then
             local base = candidate:FindFirstChild("PersistentParts")
-            local ref = (base and base:FindFirstChild("Base"))
-                or ap:FindFirstChildWhichIsA("Part")
-            if ref then
-                local d = (ref.Position - hrp.Position).Magnitude
+            local refPart = (base and base:FindFirstChild("Base")) or ap:FindFirstChildWhichIsA("Part")
+            if refPart then
+                local d = (refPart.Position - hrp.Position).Magnitude
                 if d < bestDist then
-                    bestDist, best = d, candidate
+                    bestDist = d
+                    best = candidate
                 end
             end
         end
     end
 
     if best then
-        log("Found plot by proximity:", best.Name, "(", math.floor(bestDist), "studs)")
+        log("Found plot by proximity fallback:", best.Name, "(distance:", math.floor(bestDist), "studs)")
     else
-        warn("[PaintBot] No plot with ActivePicture found")
+        warn("[PaintBot] Could not find any plot with an ActivePicture folder")
     end
     return best
 end
-
-----------------------------------------------------------------
--- Pixel helpers (pure, no side effects)
-----------------------------------------------------------------
 
 local function distanceXZ(a, b)
     local dx, dz = a.X - b.X, a.Z - b.Z
     return math.sqrt(dx * dx + dz * dz)
 end
 
--- True if the part still exists and is unpainted.
-local function isOpen(part)
-    return part ~= nil
-        and part.Parent ~= nil
-        and part:GetAttribute("D") ~= true
-end
-
--- Group all unpainted pixels by their N attribute.
--- Returns: groups = { [n] = {part, part, ...}, ... }
 local function gatherUnpaintedByNumber(activePicture)
     local groups = {}
     for _, part in ipairs(activePicture:GetChildren()) do
         if part:IsA("BasePart") then
+            local done = part:GetAttribute("D")
             local n = part:GetAttribute("N")
-            if n ~= nil and part:GetAttribute("D") == false then
-                local list = groups[n]
-                if not list then
-                    list = {}
-                    groups[n] = list
-                end
-                list[#list + 1] = part
+            if done == false and n ~= nil then
+                groups[n] = groups[n] or {}
+                table.insert(groups[n], part)
             end
         end
     end
     return groups
 end
 
--- Live list of still-unpainted parts for one number.
--- skipSet (optional table): parts to ignore this pass (stuck give-ups).
-local function gatherForNumber(activePicture, n, skipSet)
-    local out = {}
+-- Live scan: all still-unpainted parts for a single number N.
+-- skipSet (optional): weak set of parts to ignore this pass (stuck give-ups).
+local function gatherRemainingForNumber(activePicture, n, skipSet)
+    local remaining = {}
     for _, part in ipairs(activePicture:GetChildren()) do
         if part:IsA("BasePart")
             and part:GetAttribute("N") == n
             and part:GetAttribute("D") == false
-            and not (skipSet and skipSet[part])
-        then
-            out[#out + 1] = part
+            and not (skipSet and skipSet[part]) then
+            table.insert(remaining, part)
         end
     end
-    return out
+    return remaining
 end
 
-local function findNearest(parts, fromPos)
-    local best, bestDist = nil, math.huge
-    for i = 1, #parts do
-        local part = parts[i]
+local function findNearestPixel(parts, hrp)
+    local nearest, nearestDist = nil, math.huge
+    for _, part in ipairs(parts) do
         if part and part.Parent then
-            local d = distanceXZ(fromPos, part.Position)
-            if d < bestDist then
-                bestDist, best = d, part
+            local d = distanceXZ(hrp.Position, part.Position)
+            if d < nearestDist then
+                nearestDist = d
+                nearest = part
             end
         end
     end
-    return best, bestDist
+    return nearest, nearestDist
 end
 
 local function selectNumber(n)
-    local ok, err = pcall(function()
+    local okFire, errFire = pcall(function()
         SelectNumberEvent:FireServer(n)
     end)
-    if not ok then
-        warn("[PaintBot] SelectNumber failed:", err)
+    if not okFire then
+        warn("[PaintBot] Failed to fire SelectNumber:", errFire)
     end
     log("Selected number", n)
     task.wait(CONFIG.selectNumberSettleTime)
 end
 
-local function pickNextNumber(numbers)
-    local mode = getgenv().PaintBotDrawMode or "ascending"
-    if mode == "descending" then
-        local best = numbers[1]
-        for i = 2, #numbers do
-            if numbers[i] > best then best = numbers[i] end
-        end
-        return best
-    elseif mode == "random" then
-        return numbers[math.random(#numbers)]
-    else
-        local best = numbers[1]
-        for i = 2, #numbers do
-            if numbers[i] < best then best = numbers[i] end
-        end
-        return best
-    end
-end
 
-----------------------------------------------------------------
--- Config persistence
-----------------------------------------------------------------
-
+-- Config save/load (persists drawMode across game rejoins)
 local function loadConfig()
     if not CONFIG.saveConfig then return end
+
     print("[PaintBot][Config] Checking for", CONFIG.configFile)
 
-    local okCheck, exists = pcall(function()
-        return isfile and isfile(CONFIG.configFile)
-    end)
+    local okCheck, exists = pcall(function() return isfile and isfile(CONFIG.configFile) end)
     if not okCheck then
-        warn("[PaintBot][Config] isfile() errored:", exists)
+        warn("[PaintBot][Config] isfile() check errored:", exists)
         return
     end
     if not exists then
-        print("[PaintBot][Config] No saved config. Using defaults.")
+        print("[PaintBot][Config] No saved config file found (isfile returned false/nil). Using defaults.")
         return
     end
 
-    local okRead, content = pcall(function()
-        return readfile(CONFIG.configFile)
-    end)
+    local okRead, content = pcall(function() return readfile(CONFIG.configFile) end)
     if not okRead then
-        warn("[PaintBot][Config] readfile failed:", content)
+        warn("[PaintBot][Config] readfile() failed:", content)
         return
     end
+    print("[PaintBot][Config] Raw file content:", tostring(content))
 
-    local okDecode, data = pcall(function()
-        return HttpService:JSONDecode(content)
-    end)
-    if not okDecode or type(data) ~= "table" or not data.drawMode then
-        warn("[PaintBot][Config] Invalid config data")
+    local okDecode, data = pcall(function() return HttpService:JSONDecode(content) end)
+    if not okDecode then
+        warn("[PaintBot][Config] JSONDecode failed:", data)
+        return
+    end
+    if type(data) ~= "table" or not data.drawMode then
+        warn("[PaintBot][Config] Decoded data missing drawMode:", tostring(data))
         return
     end
 
     getgenv().PaintBotDrawMode = data.drawMode
-    print("[PaintBot][Config] Loaded drawMode =", data.drawMode)
+    print("[PaintBot][Config] Loaded saved drawMode =", data.drawMode)
 end
 
 local function saveConfigToFile()
     if not CONFIG.saveConfig then return end
     local data = { drawMode = getgenv().PaintBotDrawMode }
-    local okEncode, json = pcall(function()
-        return HttpService:JSONEncode(data)
-    end)
+    local okEncode, json = pcall(function() return HttpService:JSONEncode(data) end)
     if not okEncode then
         warn("[PaintBot][Config] JSONEncode failed:", json)
         return
     end
-    local okWrite, err = pcall(function()
-        writefile(CONFIG.configFile, json)
-    end)
+    local okWrite, errWrite = pcall(function() writefile(CONFIG.configFile, json) end)
     if okWrite then
         print("[PaintBot][Config] Saved:", json)
     else
-        warn("[PaintBot][Config] writefile failed:", err)
+        warn("[PaintBot][Config] writefile() failed:", errWrite)
     end
 end
 
-----------------------------------------------------------------
--- Anti-AFK
-----------------------------------------------------------------
-
+-- Anti-AFK: Roblox's Idled event alone is unreliable in many executors and
+-- long sessions (kick still happens ~20 min). We mirror a proven pattern:
+-- 1) react immediately when Idled fires
+-- 2) also periodically nudge every ~10 min as a hard backup so the idle
+--    timer never reaches the kick threshold even if Idled never fires.
 local function setupAntiAfk()
     if not CONFIG.antiAfk then return end
 
@@ -366,30 +354,32 @@ local function setupAntiAfk()
     end
 
     LocalPlayer.Idled:Connect(function()
-        log("Anti-AFK: Idled fired")
+        log("Anti-AFK: Idled fired — nudging")
         nudge()
     end)
 
+    -- Backup loop: force activity every 10 minutes regardless of Idled
     task.spawn(function()
-        while stillRunning() do
-            task.wait(600)
-            if not stillRunning() then break end
+        while getgenv().PaintBotRunning do
+            task.wait(600) -- 10 minutes
+            if not getgenv().PaintBotRunning then break end
             log("Anti-AFK: periodic nudge")
             nudge()
         end
     end)
 
-    log("Anti-AFK armed")
+    log("Anti-AFK armed (Idled + 10 min periodic backup)")
 end
 setupAntiAfk()
 
+-- Live-adjustable draw mode (buttons on the UI can change this mid-run)
 getgenv().PaintBotDrawMode = CONFIG.drawMode
 loadConfig()
 
-----------------------------------------------------------------
--- Speed / canvas clearing
-----------------------------------------------------------------
-
+-- Default speed hookup. This only starts watching for character spawns
+-- once armSpeedHook() is called (done from task.spawn below, right after
+-- the main bot confirms it has a plot and is starting), so it doesn't do
+-- anything before the bot itself is actually running.
 local function applySpeed(character)
     local humanoid = character:WaitForChild("Humanoid")
     humanoid.WalkSpeed = CONFIG.defaultPlayerSpeed
@@ -401,9 +391,13 @@ local function armSpeedHook()
         applySpeed(LocalPlayer.Character)
     end
     LocalPlayer.CharacterAdded:Connect(applySpeed)
-    log("Speed hook armed (WalkSpeed =", CONFIG.defaultPlayerSpeed, ")")
+    log("Default speed hook armed (WalkSpeed =", CONFIG.defaultPlayerSpeed, ")")
 end
 
+-- FPS boost: repeatedly sweeps every other plot and destroys whatever is
+-- currently inside its ActivePicture folder. A repeating sweep (rather
+-- than a one-shot pass + ChildAdded hook) is what actually caught plots
+-- and pixels that stream in a moment after you join, in testing.
 local function armCanvasClearing(plotModels, ownPlot)
     if not CONFIG.hideOtherCanvases then return end
 
@@ -411,7 +405,7 @@ local function armCanvasClearing(plotModels, ownPlot)
 
     task.spawn(function()
         local firstPass = true
-        while stillRunning() do
+        while getgenv().PaintBotRunning do
             local plotsSeen, plotsWithCanvas, destroyed = 0, 0, 0
             local sinceYield = 0
 
@@ -422,14 +416,21 @@ local function armCanvasClearing(plotModels, ownPlot)
                     if ap then
                         plotsWithCanvas = plotsWithCanvas + 1
                         for _, part in ipairs(ap:GetChildren()) do
-                            if pcall(part.Destroy, part) then
-                                destroyed = destroyed + 1
-                            end
+                            local ok = pcall(function() part:Destroy() end)
+                            if ok then destroyed = destroyed + 1 end
+
+                            -- Yield periodically instead of destroying an
+                            -- entire burst in one unbroken loop. This is
+                            -- what stops the sweep from stalling the paint
+                            -- loop's Heartbeat:Wait() for multiple seconds
+                            -- when a lot of neighbor pixels stream in at once.
                             sinceYield = sinceYield + 1
                             if sinceYield >= yieldEvery then
                                 sinceYield = 0
                                 task.wait()
-                                if not stillRunning() then return end
+                                if not getgenv().PaintBotRunning then
+                                    return
+                                end
                             end
                         end
                     end
@@ -438,7 +439,7 @@ local function armCanvasClearing(plotModels, ownPlot)
 
             if firstPass then
                 log(string.format(
-                    "Canvas clear: %d plots, %d with canvas, destroyed %d pixels",
+                    "Canvas clearing: saw %d plot(s), %d with a canvas, destroyed %d pixel(s) on first pass",
                     plotsSeen, plotsWithCanvas, destroyed))
                 firstPass = false
             end
@@ -448,19 +449,35 @@ local function armCanvasClearing(plotModels, ownPlot)
     end)
 end
 
-----------------------------------------------------------------
--- UI
-----------------------------------------------------------------
+local function pickNextNumber(numbers)
+    local mode = getgenv().PaintBotDrawMode or "ascending"
+    if mode == "descending" then
+        local best = numbers[1]
+        for _, n in ipairs(numbers) do
+            if n > best then best = n end
+        end
+        return best
+    elseif mode == "random" then
+        return numbers[math.random(#numbers)]
+    else
+        local best = numbers[1]
+        for _, n in ipairs(numbers) do
+            if n < best then best = n end
+        end
+        return best
+    end
+end
 
+-- ===== UI theme + small helpers (keeps the widget code below short) =====
 local THEME = {
-    bg       = Color3.fromRGB(24, 24, 27),
-    titlebar = Color3.fromRGB(32, 32, 36),
-    accent   = Color3.fromRGB(0, 255, 140),
-    danger   = Color3.fromRGB(255, 70, 70),
-    chipOff  = Color3.fromRGB(50, 50, 55),
-    barBg    = Color3.fromRGB(45, 45, 50),
-    text     = Color3.fromRGB(235, 235, 240),
-    subtext  = Color3.fromRGB(170, 170, 180),
+    bg        = Color3.fromRGB(24, 24, 27),
+    titlebar  = Color3.fromRGB(32, 32, 36),
+    accent    = Color3.fromRGB(0, 255, 140),
+    danger    = Color3.fromRGB(255, 70, 70),
+    chipOff   = Color3.fromRGB(50, 50, 55),
+    barBg     = Color3.fromRGB(45, 45, 50),
+    text      = Color3.fromRGB(235, 235, 240),
+    subtext   = Color3.fromRGB(170, 170, 180),
 }
 
 local function corner(inst, radius)
@@ -472,13 +489,14 @@ end
 
 local function stroke(inst, color, thickness)
     local s = Instance.new("UIStroke")
-    s.Color = color or Color3.new(0, 0, 0)
+    s.Color = color or Color3.fromRGB(0, 0, 0)
     s.Thickness = thickness or 1
     s.Transparency = 0.5
     s.Parent = inst
     return s
 end
 
+-- Small flat button factory. opts: {size, bg, textColor, textSize, bold}
 local function makeButton(parent, text, opts)
     opts = opts or {}
     local btn = Instance.new("TextButton")
@@ -495,7 +513,9 @@ local function makeButton(parent, text, opts)
     return btn
 end
 
+-- Makes `frame` draggable by pressing/dragging on `handle` (mouse + touch)
 local function makeDraggable(handle, frame)
+    local UserInputService = game:GetService("UserInputService")
     local dragging, dragInput, dragStart, startPos
 
     handle.InputBegan:Connect(function(input)
@@ -551,6 +571,7 @@ local function createProgressUI()
     screenGui.ResetOnSpawn = false
     screenGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
 
+    -- Main window
     local frame = Instance.new("Frame")
     frame.Size = UDim2.new(0, 240, 0, 178)
     frame.Position = UDim2.new(0.5, -120, 0, 20)
@@ -559,12 +580,13 @@ local function createProgressUI()
     corner(frame, 10)
     stroke(frame, Color3.new(0, 0, 0), 1)
 
+    -- Title bar (drag handle)
     local titleBar = Instance.new("Frame")
     titleBar.Size = UDim2.new(1, 0, 0, 32)
     titleBar.BackgroundColor3 = THEME.titlebar
     titleBar.Parent = frame
     corner(titleBar, 10)
-
+    -- square off the bottom corners of the title bar so it doesn't look pill-shaped
     local titleBarMask = Instance.new("Frame")
     titleBarMask.Size = UDim2.new(1, 0, 0, 10)
     titleBarMask.Position = UDim2.new(0, 0, 1, -10)
@@ -585,6 +607,7 @@ local function createProgressUI()
 
     makeDraggable(titleBar, frame)
 
+    -- Minimized "reopen" tab, shown only while the menu is closed
     local reopenTab = makeButton(screenGui, "≡ Menu", {
         size = UDim2.new(0, 70, 0, 26),
         bg = THEME.bg,
@@ -612,6 +635,7 @@ local function createProgressUI()
         setMenuOpen(false)
     end)
 
+    -- Content area
     local content = Instance.new("Frame")
     content.Size = UDim2.new(1, -20, 1, -42)
     content.Position = UDim2.new(0, 10, 0, 38)
@@ -647,6 +671,7 @@ local function createProgressUI()
     ProgressBarFill.Parent = barBG
     corner(ProgressBarFill, 6)
 
+    -- Draw mode row
     local modeRow = Instance.new("Frame")
     modeRow.Size = UDim2.new(1, 0, 0, 26)
     modeRow.BackgroundTransparency = 1
@@ -663,14 +688,13 @@ local function createProgressUI()
         getgenv().PaintBotDrawMode = mode
         saveConfigToFile()
         for m, btn in pairs(modeButtons) do
-            local active = (m == mode)
-            btn.BackgroundColor3 = active and THEME.accent or THEME.chipOff
-            btn.TextColor3 = active and Color3.fromRGB(10, 10, 10) or THEME.text
+            btn.BackgroundColor3 = (m == mode) and THEME.accent or THEME.chipOff
+            btn.TextColor3 = (m == mode) and Color3.fromRGB(10, 10, 10) or THEME.text
         end
     end
 
-    local modes  = { "ascending", "descending", "random" }
-    local labels = { ascending = "Asc", descending = "Desc", random = "Random" }
+    local modes = {"ascending", "descending", "random"}
+    local labels = {ascending = "Asc", descending = "Desc", random = "Random"}
     for _, mode in ipairs(modes) do
         local btn = makeButton(modeRow, labels[mode], {
             size = UDim2.new(1 / 3, -4, 1, 0),
@@ -683,6 +707,7 @@ local function createProgressUI()
     end
     setActiveMode(getgenv().PaintBotDrawMode or "ascending")
 
+    -- Start/Stop (pause/resume) button
     ControlButton = makeButton(content, "Stop", {
         size = UDim2.new(1, 0, 0, 30),
         textSize = 13,
@@ -714,21 +739,20 @@ local function updateProgressUI(activePicture)
     end
 
     local pct = total > 0 and math.floor((done / total) * 100) or 0
-    local suffix = getgenv().PaintBotPaused and "  ·  Paused" or ""
-    ProgressLabel.Text = string.format("%d%% (%d/%d)%s", pct, done, total, suffix)
+    local statusSuffix = getgenv().PaintBotPaused and "  ·  Paused" or ""
+    ProgressLabel.Text = string.format("%d%% (%d/%d)%s", pct, done, total, statusSuffix)
     ProgressBarFill.Size = UDim2.new(pct / 100, 0, 1, 0)
     refreshControlButton()
 end
 
-----------------------------------------------------------------
--- Movement helpers
-----------------------------------------------------------------
-
 local function attemptUnstick(humanoid, hrp, targetPos)
-    log("Stuck detected — recovering")
+    log("Stuck detected, attempting recovery...")
+    -- Jump in place first, sometimes enough to pop free of geometry
     humanoid.Jump = true
     task.wait(0.2)
 
+    -- Nudge toward a small random offset near current position to break
+    -- out of a bad pathing lock, then re-issue the real move
     local nudge = hrp.Position + Vector3.new(
         (math.random() - 0.5) * 6,
         0,
@@ -736,226 +760,189 @@ local function attemptUnstick(humanoid, hrp, targetPos)
     )
     humanoid:MoveTo(nudge)
     task.wait(0.5)
+
     humanoid:MoveTo(targetPos)
 end
 
--- Refresh character refs after respawn. Returns humanoid, hrp (may be nil).
-local function getCharacterRefs()
-    local char = LocalPlayer.Character
-    if not char then return nil, nil end
-    local humanoid = char:FindFirstChildOfClass("Humanoid")
-    local hrp = char:FindFirstChild("HumanoidRootPart")
-    return humanoid, hrp
+-- Returns true if the part is still a valid unpainted target.
+local function isPixelStillOpen(part)
+    return part ~= nil
+        and part.Parent ~= nil
+        and part:GetAttribute("D") ~= true
 end
 
 ----------------------------------------------------------------
--- LEGACY: walk to one pixel, wait for paint, return success
+-- UNIFIED PAINT LOOP for a single number N.
+-- Handles both continuous and legacy modes via CONFIG.continuousMode.
+--
+-- Design notes:
+--   * One `currentTarget` pixel at a time. MoveTo is only re-issued
+--     when the target actually changes — re-sending it to the same
+--     point every tick was what caused the old stutter.
+--   * Continuous mode is paced by RunService.Heartbeat (no artificial
+--     sleep); legacy mode uses a short task.wait and waits for paint
+--     confirmation after arriving.
+--   * The O(n) pixel rescan is throttled to rescanInterval. It runs
+--     when we need a new target, and (continuous mode) on a timer to
+--     pick up newly-streamed or closer pixels.
+--   * Stuck recovery: if the character hasn't moved in a while, jump +
+--     nudge; after maxStuckRecoveries the pixel is skipped this pass.
+--   * A pixel that times out waiting for paint (legacy) is also skipped
+--     this pass, so we never re-pick the same un-paintable pixel forever.
 ----------------------------------------------------------------
-
-local function walkToPixel(part, humanoid, hrp, expectedMode)
-    humanoid:MoveTo(part.Position)
-
-    local waited = 0
-    local lastPos = hrp.Position
-    local lastCheck = tick()
-    local recoveries = 0
-
-    while stillRunning() do
-        if getgenv().PaintBotPaused then
-            waitWhilePaused()
-            if not stillRunning() then return false end
-            humanoid:MoveTo(part.Position)
-            lastPos = hrp.Position
-            lastCheck = tick()
-        end
-
-        if modeChanged(expectedMode) then return false end
-        if waited >= 10 then return false end
-        if not isOpen(part) then return true end
-
-        if distanceXZ(hrp.Position, part.Position) <= CONFIG.arriveDistance then
-            local paintWait = 0
-            while stillRunning() and paintWait < CONFIG.paintWaitTimeout do
-                if getgenv().PaintBotPaused then waitWhilePaused() end
-                if modeChanged(expectedMode) then return false end
-                if not isOpen(part) then return true end
-                task.wait(0.1)
-                paintWait = paintWait + 0.1
-            end
-            return not isOpen(part)
-        end
-
-        if tick() - lastCheck >= CONFIG.stuckCheckInterval then
-            if distanceXZ(hrp.Position, lastPos) < CONFIG.stuckMoveThreshold then
-                recoveries = recoveries + 1
-                if recoveries > CONFIG.maxStuckRecoveries then
-                    log("Gave up on pixel after", recoveries, "recoveries")
-                    return false
-                end
-                attemptUnstick(humanoid, hrp, part.Position)
-            end
-            lastPos = hrp.Position
-            lastCheck = tick()
-        end
-
-        task.wait(0.1)
-        waited = waited + 0.1
-    end
-    return false
-end
-
-local function paintNumberLegacy(n, activePicture, humanoid, hrp, expectedMode)
-    while stillRunning() do
-        waitWhilePaused()
-        if not stillRunning() then break end
-        if modeChanged(expectedMode) then
-            log("Mode changed mid-color — switching")
-            break
-        end
-
-        local remaining = gatherForNumber(activePicture, n, nil)
-        if #remaining == 0 then break end
-
-        local nearest, dist = findNearest(remaining, hrp.Position)
-        if nearest then
-            log(string.format("Walking to N=%s dist=%d", tostring(n), math.floor(dist)))
-            if not walkToPixel(nearest, humanoid, hrp, expectedMode) then
-                log("Timed out / gave up on a pixel")
-            end
-        end
-    end
-end
-
-----------------------------------------------------------------
--- CONTINUOUS MODE
--- One loop paced by Heartbeat.
---   every frame  → cheap "is current target still open?"
---   every retargetInterval → full O(n) rescan for closer pixel
---   MoveTo only when target identity changes
-----------------------------------------------------------------
-
-local function paintNumberContinuous(n, activePicture, humanoid, hrp, expectedMode)
-    local skipSet = {}          -- parts we gave up on (stuck)
-    local target = nil
-    local recoveries = 0
-    local lastPos = hrp.Position
-    local lastStuckCheck = tick()
-    local lastRescan = 0
-    local lastLog = 0
-    local lastRemainCount = -1
+local function paintNumber(n, activePicture, humanoid, hrp, expectedMode)
+    local skipSet = {}          -- parts given up on this pass (stuck / timed out)
+    local currentTarget = nil
+    local stuckRecoveries = 0
+    local lastCheckPos = hrp.Position
+    local lastCheckTime = tick()
+    local lastRescanTime = 0
     local rescanInterval = CONFIG.retargetInterval or 0.1
+    local lastLogTime = 0
+    local lastRemainingLog = -1
 
-    log("Continuous pass start N=" .. tostring(n))
+    log("Painting N=" .. tostring(n) .. " (" .. (CONFIG.continuousMode and "continuous" or "legacy") .. ")")
 
-    while stillRunning() do
-        ------------------------------------------------------------------
-        -- Pause
-        ------------------------------------------------------------------
+    while getgenv().PaintBotRunning do
+        -- Pause: freeze in place, reset the stuck clock on resume
         if getgenv().PaintBotPaused then
             waitWhilePaused()
-            if not stillRunning() then return end
-            lastPos = hrp.Position
-            lastStuckCheck = tick()
-            if isOpen(target) then
-                humanoid:MoveTo(target.Position)
+            if not getgenv().PaintBotRunning then return end
+            lastCheckPos = hrp.Position
+            lastCheckTime = tick()
+            if currentTarget and isPixelStillOpen(currentTarget) then
+                humanoid:MoveTo(currentTarget.Position)
             end
         end
 
-        if not stillRunning() then return end
-        if modeChanged(expectedMode) then
-            log("Mode changed mid-color — switching")
+        if not getgenv().PaintBotRunning then return end
+
+        -- Character respawned mid-run: bail so the main loop re-acquires refs
+        if not hrp or not hrp.Parent then
             return
         end
 
-        ------------------------------------------------------------------
-        -- Decide whether we need a new target
-        ------------------------------------------------------------------
-        local targetGone = target ~= nil and not isOpen(target)
-        local needRescan = (tick() - lastRescan) >= rescanInterval
+        -- Draw mode changed mid-color: abandon immediately so the outer
+        -- loop re-picks a number under the new mode.
+        if expectedMode and getgenv().PaintBotDrawMode ~= expectedMode then
+            log("Mode changed mid-color -- switching immediately")
+            return
+        end
 
-        if target == nil or targetGone or needRescan then
-            lastRescan = tick()
+        -- Do we need a fresh target? (none, or the current one got painted/removed)
+        local needTarget = currentTarget == nil or not isPixelStillOpen(currentTarget)
+        -- Continuous mode also rescans on a timer to catch new/closer pixels.
+        local dueForRescan = CONFIG.continuousMode and (tick() - lastRescanTime) >= rescanInterval
 
-            local remaining = gatherForNumber(activePicture, n, skipSet)
+        if needTarget or dueForRescan then
+            lastRescanTime = tick()
 
-            -- If skipSet emptied the list, clear skips once and retry
-            if #remaining == 0 and next(skipSet) then
-                local anyLeft = gatherForNumber(activePicture, n, nil)
-                if #anyLeft > 0 then
-                    skipSet = {}
-                    recoveries = 0
-                    remaining = anyLeft
-                end
-            end
-
+            local remaining = gatherRemainingForNumber(activePicture, n, skipSet)
             if #remaining == 0 then
-                break
-            end
-
-            local nearest, dist = findNearest(remaining, hrp.Position)
-            if not nearest then
-                break
-            end
-
-            -- Only re-issue MoveTo when the target object actually changes
-            if nearest ~= target then
-                target = nearest
-                recoveries = 0
-                lastPos = hrp.Position
-                lastStuckCheck = tick()
-                humanoid:MoveTo(target.Position)
-
-                local now = tick()
-                if now - lastLog >= 1.5 or #remaining ~= lastRemainCount then
-                    log(string.format(
-                        "N=%s  dist=%d  remaining=%d",
-                        tostring(n), math.floor(dist), #remaining))
-                    lastLog = now
-                    lastRemainCount = #remaining
-                end
-            end
-        end
-
-        ------------------------------------------------------------------
-        -- Stuck recovery
-        ------------------------------------------------------------------
-        if tick() - lastStuckCheck >= CONFIG.stuckCheckInterval then
-            if distanceXZ(hrp.Position, lastPos) < CONFIG.stuckMoveThreshold then
-                recoveries = recoveries + 1
-                if recoveries > CONFIG.maxStuckRecoveries then
-                    log("Skipping stuck pixel N=" .. tostring(n)
-                        .. " after " .. recoveries .. " recoveries")
-                    if target then
-                        skipSet[target] = true
+                -- If we only emptied the list because of skips, clear them and
+                -- retry anything still actually unpainted before giving up.
+                if next(skipSet) ~= nil then
+                    local anyLeft = gatherRemainingForNumber(activePicture, n, nil)
+                    if #anyLeft > 0 then
+                        skipSet = {}
+                        stuckRecoveries = 0
+                        remaining = anyLeft
+                    else
+                        break
                     end
-                    target = nil
-                    recoveries = 0
                 else
-                    local pos = (target and target.Position) or hrp.Position
-                    attemptUnstick(humanoid, hrp, pos)
+                    break
                 end
             end
-            lastPos = hrp.Position
-            lastStuckCheck = tick()
+
+            local nearest, nearestDist = findNearestPixel(remaining, hrp)
+            if not nearest then break end
+
+            -- Only re-issue MoveTo when the target actually changes.
+            if nearest ~= currentTarget then
+                currentTarget = nearest
+                stuckRecoveries = 0
+                lastCheckPos = hrp.Position
+                lastCheckTime = tick()
+                humanoid:MoveTo(currentTarget.Position)
+
+                -- Throttled log: at most once per ~1.5s, or when the count drops
+                local now = tick()
+                if now - lastLogTime >= 1.5 or #remaining ~= lastRemainingLog then
+                    log(string.format(
+                        "N=%s  target dist=%d  remaining=%d",
+                        tostring(n), math.floor(nearestDist), #remaining))
+                    lastLogTime = now
+                    lastRemainingLog = #remaining
+                end
+            end
         end
 
-        ------------------------------------------------------------------
-        -- Yield to next frame
-        ------------------------------------------------------------------
-        RunService.Heartbeat:Wait()
+        -- Legacy mode: once arrived, wait for the game to auto-paint.
+        if not CONFIG.continuousMode and currentTarget and isPixelStillOpen(currentTarget) then
+            if distanceXZ(hrp.Position, currentTarget.Position) <= CONFIG.arriveDistance then
+                local paintWaited = 0
+                local painted = false
+                while getgenv().PaintBotRunning and paintWaited < CONFIG.paintWaitTimeout do
+                    if getgenv().PaintBotPaused then waitWhilePaused() end
+                    if not getgenv().PaintBotRunning then return end
+                    if not isPixelStillOpen(currentTarget) then
+                        painted = true
+                        break
+                    end
+                    task.wait(0.1)
+                    paintWaited = paintWaited + 0.1
+                end
+                if not painted then
+                    -- Timed out waiting for paint — skip this pixel this pass
+                    -- so we don't re-pick the same un-paintable one forever.
+                    skipSet[currentTarget] = true
+                end
+                currentTarget = nil
+                -- Reset the stuck clock: standing still while waiting for
+                -- paint is expected, not being stuck.
+                lastCheckPos = hrp.Position
+                lastCheckTime = tick()
+            end
+        end
+
+        -- Stuck check: has the character actually moved recently?
+        if tick() - lastCheckTime >= CONFIG.stuckCheckInterval then
+            local moved = distanceXZ(hrp.Position, lastCheckPos)
+            if moved < CONFIG.stuckMoveThreshold then
+                stuckRecoveries = stuckRecoveries + 1
+                if stuckRecoveries > CONFIG.maxStuckRecoveries then
+                    log("Skipping stuck pixel N=" .. tostring(n) .. " after", stuckRecoveries, "recoveries")
+                    if currentTarget then
+                        skipSet[currentTarget] = true
+                    end
+                    currentTarget = nil
+                    stuckRecoveries = 0
+                else
+                    local targetPos = currentTarget and currentTarget.Position or hrp.Position
+                    attemptUnstick(humanoid, hrp, targetPos)
+                end
+            end
+            lastCheckPos = hrp.Position
+            lastCheckTime = tick()
+        end
+
+        -- Pace the loop: heartbeat in continuous mode (no artificial delay),
+        -- a short sleep in legacy mode.
+        if CONFIG.continuousMode then
+            RunService.Heartbeat:Wait()
+        else
+            task.wait(0.1)
+        end
     end
 
-    log("Continuous pass done N=" .. tostring(n))
+    log("Finished pass for N=" .. tostring(n))
 end
-
-----------------------------------------------------------------
--- Main
-----------------------------------------------------------------
 
 task.spawn(function()
     local plot = findOwnPlot()
     if not plot then
-        warn("[PaintBot] Aborting — no plot found. Set CONFIG.plotOwnerName and retry.")
+        warn("[PaintBot] Aborting - no plot found. Set CONFIG.plotOwnerName manually and retry.")
         getgenv().PaintBotRunning = false
         return
     end
@@ -969,12 +956,9 @@ task.spawn(function()
 
     armCanvasClearing(plot.Parent, plot)
 
-    local humanoid, hrp = getCharacterRefs()
-    if not humanoid or not hrp then
-        local char = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
-        humanoid = char:WaitForChild("Humanoid")
-        hrp = char:WaitForChild("HumanoidRootPart")
-    end
+    local char = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+    local humanoid = char:FindFirstChildOfClass("Humanoid")
+    local hrp = char:WaitForChild("HumanoidRootPart")
 
     if CONFIG.walkSpeedOverride then
         humanoid.WalkSpeed = CONFIG.walkSpeedOverride
@@ -983,44 +967,51 @@ task.spawn(function()
     if CONFIG.showProgressUI then
         createProgressUI()
         task.spawn(function()
-            while stillRunning() do
+            while getgenv().PaintBotRunning do
                 updateProgressUI(activePicture)
                 task.wait(CONFIG.progressUpdateInterval)
             end
+            -- final update so it shows 100% / final state before stopping
             updateProgressUI(activePicture)
         end)
     end
 
     armSpeedHook()
 
-    log("Starting.")
+    log("Starting. Scanning for unpainted pixels...")
     if CONFIG.continuousMode then
-        log("Continuous mode (rescan every", CONFIG.retargetInterval, "s)")
+        log("Continuous mode ON (retarget every", CONFIG.retargetInterval, "s)")
     else
-        log("Legacy mode (arrive + paint-wait)")
+        log("Legacy mode ON (arrive + paint-wait)")
     end
 
-    while stillRunning() do
+    while getgenv().PaintBotRunning do
         waitWhilePaused()
-        if not stillRunning() then break end
+        if not getgenv().PaintBotRunning then
+            break
+        end
 
-        -- Keep character refs fresh after respawn
-        local h, r = getCharacterRefs()
-        if h then humanoid = h end
-        if r then hrp = r end
-        if not humanoid or not hrp then
-            task.wait(0.5)
-            continue
+        -- Refresh character refs in case of respawn mid-run. Only swap in
+        -- the new refs once the new character is fully loaded, so we never
+        -- hand a half-built character (or a stale destroyed one) to the loop.
+        local newChar = LocalPlayer.Character
+        if newChar then
+            local newHrp = newChar:FindFirstChild("HumanoidRootPart")
+            local newHumanoid = newChar:FindFirstChildOfClass("Humanoid")
+            if newHrp and newHumanoid then
+                char, hrp, humanoid = newChar, newHrp, newHumanoid
+            end
         end
 
         local groups = gatherUnpaintedByNumber(activePicture)
+
         local numbers = {}
-        for num in pairs(groups) do
-            numbers[#numbers + 1] = num
+        for num, _ in pairs(groups) do
+            table.insert(numbers, num)
         end
 
         if #numbers == 0 then
-            log("No unpainted pixels left. Done!")
+            log("No unpainted pixels found. Picture appears complete!")
             break
         end
 
@@ -1028,11 +1019,9 @@ task.spawn(function()
         local workingMode = getgenv().PaintBotDrawMode
         selectNumber(n)
 
-        if CONFIG.continuousMode then
-            paintNumberContinuous(n, activePicture, humanoid, hrp, workingMode)
-        else
-            paintNumberLegacy(n, activePicture, humanoid, hrp, workingMode)
-        end
+        -- Keep working this number until no unpainted pixels with it remain,
+        -- OR until the draw mode changes (then abandon and re-pick immediately)
+        paintNumber(n, activePicture, humanoid, hrp, workingMode)
     end
 
     log("Finished (or stopped).")
