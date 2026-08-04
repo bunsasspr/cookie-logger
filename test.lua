@@ -81,6 +81,24 @@ local CONFIG = {
     -- again on a later pass if still unpainted)
     maxStuckRecoveries = 3,
 
+    -- FAST STALL FIX: humanoid:MoveTo() can silently fail to actually
+    -- start the character walking (dropped by the engine right after a
+    -- FireServer call, a prior MoveTo, a state transition, etc.). Since
+    -- MoveTo is only issued once per target (re-sending it every tick is
+    -- what caused the old hitch), a dropped request left the character
+    -- standing still doing nothing until the much slower position-based
+    -- stuckCheckInterval + full jump/nudge recovery kicked in a second
+    -- or more later. This is a much cheaper, faster check: if the
+    -- humanoid reports zero MoveDirection for this long while it should
+    -- be walking (target set, not already basically on top of it), just
+    -- re-send the same MoveTo -- no jump, no nudge, almost free.
+    moveDirectionGraceTime = 0.3,
+
+    -- Don't treat MoveDirection==0 as a stall if we're already this close
+    -- to the target -- the humanoid naturally stops accelerating/turns
+    -- MoveDirection to zero right as it arrives, that's not a problem.
+    moveDirectionArriveGuard = 3,
+
     -- On-screen progress bar
     showProgressUI = true,
     progressUpdateInterval = 0.5,
@@ -772,75 +790,173 @@ local function isPixelStillOpen(part)
 end
 
 ----------------------------------------------------------------
--- UNIFIED PAINT LOOP for a single number N.
--- Handles both continuous and legacy modes via CONFIG.continuousMode.
---
--- Design notes:
---   * One `currentTarget` pixel at a time. MoveTo is only re-issued
---     when the target actually changes — re-sending it to the same
---     point every tick was what caused the old stutter.
---   * Continuous mode is paced by RunService.Heartbeat (no artificial
---     sleep); legacy mode uses a short task.wait and waits for paint
---     confirmation after arriving.
---   * The O(n) pixel rescan is throttled to rescanInterval. It runs
---     when we need a new target, and (continuous mode) on a timer to
---     pick up newly-streamed or closer pixels.
---   * Stuck recovery: if the character hasn't moved in a while, jump +
---     nudge; after maxStuckRecoveries the pixel is skipped this pass.
---   * A pixel that times out waiting for paint (legacy) is also skipped
---     this pass, so we never re-pick the same un-paintable pixel forever.
+-- LEGACY walk-to-one-pixel (used only when continuousMode = false)
 ----------------------------------------------------------------
-local function paintNumber(n, activePicture, humanoid, hrp, expectedMode)
-    local skipSet = {}          -- parts given up on this pass (stuck / timed out)
+local function walkToPixel(part, humanoid, hrp, expectedMode)
+    humanoid:MoveTo(part.Position)
+    local waited = 0
+
+    local lastCheckPos = hrp.Position
+    local lastCheckTime = tick()
+    local stuckRecoveries = 0
+
+    while getgenv().PaintBotRunning do
+        if getgenv().PaintBotPaused then
+            -- Hold position while paused; don't count this time against
+            -- the walk timeout or the stuck-recovery clock.
+            waitWhilePaused()
+            if not getgenv().PaintBotRunning then
+                return false
+            end
+            humanoid:MoveTo(part.Position)
+            lastCheckPos = hrp.Position
+            lastCheckTime = tick()
+            continue
+        end
+        if expectedMode and getgenv().PaintBotDrawMode ~= expectedMode then
+            return false -- mode changed mid-walk, abandon this pixel immediately
+        end
+        if waited >= 10 then
+            return false
+        end
+        if not part or not part.Parent then
+            return true -- disappeared/painted and cleaned up
+        end
+        if part:GetAttribute("D") == true then
+            return true
+        end
+        if distanceXZ(hrp.Position, part.Position) <= CONFIG.arriveDistance then
+            -- arrived, give the game a moment to auto-paint
+            local paintWaited = 0
+            while getgenv().PaintBotRunning and paintWaited < CONFIG.paintWaitTimeout do
+                if getgenv().PaintBotPaused then
+                    waitWhilePaused()
+                end
+                if expectedMode and getgenv().PaintBotDrawMode ~= expectedMode then
+                    return false
+                end
+                if not part.Parent or part:GetAttribute("D") == true then
+                    return true
+                end
+                task.wait(0.1)
+                paintWaited = paintWaited + 0.1
+            end
+            return part.Parent == nil or part:GetAttribute("D") == true
+        end
+
+        -- Stuck check: has the character actually moved recently?
+        if tick() - lastCheckTime >= CONFIG.stuckCheckInterval then
+            local moved = distanceXZ(hrp.Position, lastCheckPos)
+            if moved < CONFIG.stuckMoveThreshold then
+                stuckRecoveries = stuckRecoveries + 1
+                if stuckRecoveries > CONFIG.maxStuckRecoveries then
+                    log("Gave up on this pixel after", stuckRecoveries, "stuck recoveries")
+                    return false
+                end
+                attemptUnstick(humanoid, hrp, part.Position)
+            end
+            lastCheckPos = hrp.Position
+            lastCheckTime = tick()
+        end
+
+        task.wait(0.1)
+        waited = waited + 0.1
+    end
+    return false
+end
+
+----------------------------------------------------------------
+-- CONTINUOUS MODE: keep moving across all pixels of number N.
+-- Never stops to wait for a paint confirmation, and never sleeps
+-- a fixed amount between steps — the loop is paced by the render
+-- heartbeat (RunService.Heartbeat) instead of task.wait, and it
+-- only re-issues MoveTo when the target actually changes. The old
+-- version re-sent MoveTo to the *same* point every single tick,
+-- which is what produced the little hitch after each pixel — the
+-- humanoid briefly resets its walk state every time MoveTo fires,
+-- even to a point it's already walking toward.
+--
+-- Full re-scans of the pixel list (CONFIG.retargetInterval) are
+-- still throttled, since that's an O(n) walk over every part in
+-- the picture and doesn't need to run every frame. But noticing
+-- that the *current* target got painted or removed is checked
+-- every frame (just one attribute read), so the bot snaps to the
+-- next pixel the instant the current one is done, not up to
+-- retargetInterval seconds later.
+----------------------------------------------------------------
+local function paintNumberContinuous(n, activePicture, humanoid, hrp, expectedMode)
+    local skipSet = {} -- parts we gave up on this pass (stuck); retried next number cycle
     local currentTarget = nil
     local stuckRecoveries = 0
     local lastCheckPos = hrp.Position
     local lastCheckTime = tick()
-    local lastRescanTime = 0
-    local rescanInterval = CONFIG.retargetInterval or 0.1
     local lastLogTime = 0
     local lastRemainingLog = -1
+    local rescanInterval = CONFIG.retargetInterval or 0.1
+    local lastRescanTime = 0
+    local notMovingSince = nil
+    local graceTime = CONFIG.moveDirectionGraceTime or 0.3
+    local arriveGuard = CONFIG.moveDirectionArriveGuard or 3
 
-    log("Painting N=" .. tostring(n) .. " (" .. (CONFIG.continuousMode and "continuous" or "legacy") .. ")")
+    log("Continuous paint starting for N=" .. tostring(n))
 
     while getgenv().PaintBotRunning do
-        -- Pause: freeze in place, reset the stuck clock on resume
+        -- Pause: freeze in place, reset stuck clock on resume
         if getgenv().PaintBotPaused then
             waitWhilePaused()
-            if not getgenv().PaintBotRunning then return end
+            if not getgenv().PaintBotRunning then
+                return
+            end
             lastCheckPos = hrp.Position
             lastCheckTime = tick()
+            notMovingSince = nil
             if currentTarget and isPixelStillOpen(currentTarget) then
                 humanoid:MoveTo(currentTarget.Position)
             end
         end
 
-        if not getgenv().PaintBotRunning then return end
+        -- Fast check: is a dropped/never-started MoveTo leaving us idle?
+        -- This is independent of (and much quicker than) the position-based
+        -- stuck check below, which only samples once a second.
+        if currentTarget ~= nil and not getgenv().PaintBotPaused then
+            local distToTarget = distanceXZ(hrp.Position, currentTarget.Position)
+            if distToTarget > arriveGuard and humanoid.MoveDirection.Magnitude < 0.05 then
+                if not notMovingSince then
+                    notMovingSince = tick()
+                elseif tick() - notMovingSince >= graceTime then
+                    humanoid:MoveTo(currentTarget.Position)
+                    notMovingSince = tick() -- give the reissue its own grace window
+                end
+            else
+                notMovingSince = nil
+            end
+        end
 
-        -- Character respawned mid-run: bail so the main loop re-acquires refs
-        if not hrp or not hrp.Parent then
+        if not getgenv().PaintBotRunning then
             return
         end
 
-        -- Draw mode changed mid-color: abandon immediately so the outer
-        -- loop re-picks a number under the new mode.
+        -- Draw mode changed mid-color — abandon immediately so outer loop re-picks
         if expectedMode and getgenv().PaintBotDrawMode ~= expectedMode then
             log("Mode changed mid-color -- switching immediately")
             return
         end
 
-        -- Do we need a fresh target? (none, or the current one got painted/removed)
-        local needTarget = currentTarget == nil or not isPixelStillOpen(currentTarget)
-        -- Continuous mode also rescans on a timer to catch new/closer pixels.
-        local dueForRescan = CONFIG.continuousMode and (tick() - lastRescanTime) >= rescanInterval
+        -- Cheap every-frame check: is the pixel we're currently walking to
+        -- still open? This is a single attribute read, not a list scan, so
+        -- doing it every frame costs nothing and means we react the instant
+        -- it flips rather than waiting on the next scan tick.
+        local targetLost = currentTarget ~= nil and not isPixelStillOpen(currentTarget)
+        local dueForRescan = (tick() - lastRescanTime) >= rescanInterval
 
-        if needTarget or dueForRescan then
+        if currentTarget == nil or targetLost or dueForRescan then
             lastRescanTime = tick()
 
+            -- Live scan of still-unpainted pixels for this number
             local remaining = gatherRemainingForNumber(activePicture, n, skipSet)
             if #remaining == 0 then
-                -- If we only emptied the list because of skips, clear them and
-                -- retry anything still actually unpainted before giving up.
+                -- If we only emptied the list because of skips, clear skips once
+                -- and retry anything still actually unpainted before giving up.
                 if next(skipSet) ~= nil then
                     local anyLeft = gatherRemainingForNumber(activePicture, n, nil)
                     if #anyLeft > 0 then
@@ -856,17 +972,22 @@ local function paintNumber(n, activePicture, humanoid, hrp, expectedMode)
             end
 
             local nearest, nearestDist = findNearestPixel(remaining, hrp)
-            if not nearest then break end
+            if not nearest then
+                break
+            end
 
-            -- Only re-issue MoveTo when the target actually changes.
+            -- Only touch MoveTo when the target actually changes. Re-sending
+            -- MoveTo to the same point every tick is what caused the stutter,
+            -- so a same-target rescan now leaves movement completely alone.
             if nearest ~= currentTarget then
                 currentTarget = nearest
                 stuckRecoveries = 0
                 lastCheckPos = hrp.Position
                 lastCheckTime = tick()
+                notMovingSince = nil
                 humanoid:MoveTo(currentTarget.Position)
 
-                -- Throttled log: at most once per ~1.5s, or when the count drops
+                -- Throttled log: at most once per ~1.5s, or when remaining count drops
                 local now = tick()
                 if now - lastLogTime >= 1.5 or #remaining ~= lastRemainingLog then
                     log(string.format(
@@ -878,44 +999,16 @@ local function paintNumber(n, activePicture, humanoid, hrp, expectedMode)
             end
         end
 
-        -- Legacy mode: once arrived, wait for the game to auto-paint.
-        if not CONFIG.continuousMode and currentTarget and isPixelStillOpen(currentTarget) then
-            if distanceXZ(hrp.Position, currentTarget.Position) <= CONFIG.arriveDistance then
-                local paintWaited = 0
-                local painted = false
-                while getgenv().PaintBotRunning and paintWaited < CONFIG.paintWaitTimeout do
-                    if getgenv().PaintBotPaused then waitWhilePaused() end
-                    if not getgenv().PaintBotRunning then return end
-                    if not isPixelStillOpen(currentTarget) then
-                        painted = true
-                        break
-                    end
-                    task.wait(0.1)
-                    paintWaited = paintWaited + 0.1
-                end
-                if not painted then
-                    -- Timed out waiting for paint — skip this pixel this pass
-                    -- so we don't re-pick the same un-paintable one forever.
-                    skipSet[currentTarget] = true
-                end
-                currentTarget = nil
-                -- Reset the stuck clock: standing still while waiting for
-                -- paint is expected, not being stuck.
-                lastCheckPos = hrp.Position
-                lastCheckTime = tick()
-            end
-        end
-
-        -- Stuck check: has the character actually moved recently?
+        -- Stuck check (same recovery logic as before — on give-up we skip
+        -- this pixel and immediately retarget the next nearest instead of
+        -- blocking in a paint-wait loop).
         if tick() - lastCheckTime >= CONFIG.stuckCheckInterval then
             local moved = distanceXZ(hrp.Position, lastCheckPos)
             if moved < CONFIG.stuckMoveThreshold then
                 stuckRecoveries = stuckRecoveries + 1
                 if stuckRecoveries > CONFIG.maxStuckRecoveries then
                     log("Skipping stuck pixel N=" .. tostring(n) .. " after", stuckRecoveries, "recoveries")
-                    if currentTarget then
-                        skipSet[currentTarget] = true
-                    end
+                    skipSet[currentTarget] = true
                     currentTarget = nil
                     stuckRecoveries = 0
                 else
@@ -927,16 +1020,44 @@ local function paintNumber(n, activePicture, humanoid, hrp, expectedMode)
             lastCheckTime = tick()
         end
 
-        -- Pace the loop: heartbeat in continuous mode (no artificial delay),
-        -- a short sleep in legacy mode.
-        if CONFIG.continuousMode then
-            RunService.Heartbeat:Wait()
-        else
-            task.wait(0.1)
-        end
+        -- Paced by the render heartbeat instead of a fixed task.wait sleep —
+        -- this is what removes the "pause": the loop simply runs again next
+        -- frame (~1/60s), same as any live gameplay logic would.
+        RunService.Heartbeat:Wait()
     end
 
-    log("Finished pass for N=" .. tostring(n))
+    log("Finished continuous pass for N=" .. tostring(n))
+end
+
+----------------------------------------------------------------
+-- LEGACY per-pixel loop for one number (continuousMode = false)
+----------------------------------------------------------------
+local function paintNumberLegacy(n, activePicture, humanoid, hrp, expectedMode)
+    while getgenv().PaintBotRunning do
+        waitWhilePaused()
+        if not getgenv().PaintBotRunning then
+            break
+        end
+
+        if getgenv().PaintBotDrawMode ~= expectedMode then
+            log("Mode changed mid-color -- switching immediately")
+            break
+        end
+
+        local remaining = gatherRemainingForNumber(activePicture, n, nil)
+        if #remaining == 0 then
+            break
+        end
+
+        local nearest, nearestDist = findNearestPixel(remaining, hrp)
+        if nearest then
+            log("Walking to pixel N=" .. tostring(n) .. " at distance " .. math.floor(nearestDist))
+            local success = walkToPixel(nearest, humanoid, hrp, expectedMode)
+            if not success then
+                log("Timed out / gave up on a pixel, moving on")
+            end
+        end
+    end
 end
 
 task.spawn(function()
@@ -991,16 +1112,11 @@ task.spawn(function()
             break
         end
 
-        -- Refresh character refs in case of respawn mid-run. Only swap in
-        -- the new refs once the new character is fully loaded, so we never
-        -- hand a half-built character (or a stale destroyed one) to the loop.
-        local newChar = LocalPlayer.Character
-        if newChar then
-            local newHrp = newChar:FindFirstChild("HumanoidRootPart")
-            local newHumanoid = newChar:FindFirstChildOfClass("Humanoid")
-            if newHrp and newHumanoid then
-                char, hrp, humanoid = newChar, newHrp, newHumanoid
-            end
+        -- Refresh character refs in case of respawn mid-run
+        char = LocalPlayer.Character
+        if char then
+            humanoid = char:FindFirstChildOfClass("Humanoid") or humanoid
+            hrp = char:FindFirstChild("HumanoidRootPart") or hrp
         end
 
         local groups = gatherUnpaintedByNumber(activePicture)
@@ -1021,7 +1137,11 @@ task.spawn(function()
 
         -- Keep working this number until no unpainted pixels with it remain,
         -- OR until the draw mode changes (then abandon and re-pick immediately)
-        paintNumber(n, activePicture, humanoid, hrp, workingMode)
+        if CONFIG.continuousMode then
+            paintNumberContinuous(n, activePicture, humanoid, hrp, workingMode)
+        else
+            paintNumberLegacy(n, activePicture, humanoid, hrp, workingMode)
+        end
     end
 
     log("Finished (or stopped).")
