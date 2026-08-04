@@ -318,17 +318,37 @@ local function saveConfigToFile()
     end
 end
 
--- Anti-AFK: fires whenever Roblox detects no input for a while, simulating
--- a harmless click to reset its internal idle timer
+-- Anti-AFK: Roblox's Idled event alone is unreliable in many executors and
+-- long sessions (kick still happens ~20 min). We mirror a proven pattern:
+-- 1) react immediately when Idled fires
+-- 2) also periodically nudge every ~10 min as a hard backup so the idle
+--    timer never reaches the kick threshold even if Idled never fires.
 local function setupAntiAfk()
     if not CONFIG.antiAfk then return end
-    LocalPlayer.Idled:Connect(function()
-        log("Anti-AFK: nudging to prevent idle kick")
+
+    local function nudge()
         pcall(function()
             VirtualUser:CaptureController()
             VirtualUser:ClickButton2(Vector2.new())
         end)
+    end
+
+    LocalPlayer.Idled:Connect(function()
+        log("Anti-AFK: Idled fired — nudging")
+        nudge()
     end)
+
+    -- Backup loop: force activity every 10 minutes regardless of Idled
+    task.spawn(function()
+        while getgenv().PaintBotRunning do
+            task.wait(600) -- 10 minutes
+            if not getgenv().PaintBotRunning then break end
+            log("Anti-AFK: periodic nudge")
+            nudge()
+        end
+    end)
+
+    log("Anti-AFK armed (Idled + 10 min periodic backup)")
 end
 setupAntiAfk()
 
