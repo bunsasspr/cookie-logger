@@ -419,50 +419,58 @@ end
 local function armCanvasClearing(plotModels, ownPlot)
     if not CONFIG.hideOtherCanvases then return end
 
-    local yieldEvery = math.max(1, CONFIG.canvasClearYieldEvery or 40)
+    local yieldEvery = math.max(1, CONFIG.canvasClearYieldEvery or 15)
+    local scanInterval = math.max(2, CONFIG.canvasScanInterval or 5)
 
     task.spawn(function()
-        local firstPass = true
         while getgenv().PaintBotRunning do
-            local plotsSeen, plotsWithCanvas, destroyed = 0, 0, 0
+            local destroyed = 0
             local sinceYield = 0
+            local hrp = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+            local myPos = hrp and hrp.Position
 
             for _, candidate in ipairs(plotModels:GetChildren()) do
-                plotsSeen = plotsSeen + 1
-                if candidate ~= ownPlot then
-                    local ap = candidate:FindFirstChild("ActivePicture")
-                    if ap then
-                        plotsWithCanvas = plotsWithCanvas + 1
-                        for _, part in ipairs(ap:GetChildren()) do
-                            local ok = pcall(function() part:Destroy() end)
-                            if ok then destroyed = destroyed + 1 end
+                if candidate == ownPlot then continue end
 
-                            -- Yield periodically instead of destroying an
-                            -- entire burst in one unbroken loop. This is
-                            -- what stops the sweep from stalling the paint
-                            -- loop's Heartbeat:Wait() for multiple seconds
-                            -- when a lot of neighbor pixels stream in at once.
-                            sinceYield = sinceYield + 1
-                            if sinceYield >= yieldEvery then
-                                sinceYield = 0
-                                task.wait()
-                                if not getgenv().PaintBotRunning then
-                                    return
-                                end
-                            end
+                -- Skip plots that are very far away (no need to clear them)
+                local ap = candidate:FindFirstChild("ActivePicture")
+                if not ap then continue end
+
+                if myPos then
+                    local ref = ap:FindFirstChildWhichIsA("BasePart")
+                    if ref and (ref.Position - myPos).Magnitude > 250 then
+                        continue
+                    end
+                end
+
+                for _, part in ipairs(ap:GetChildren()) do
+                    if part:IsA("BasePart") then
+                        -- Prefer cheap hide over Destroy when possible
+                        pcall(function()
+                            part.Transparency = 1
+                            part.CanCollide = false
+                            part.CanQuery = false
+                            part.CanTouch = false
+                            -- optional: move far away so it leaves the spatial grid
+                            -- part.CFrame = CFrame.new(0, -5000, 0)
+                        end)
+                        destroyed = destroyed + 1
+                        sinceYield = sinceYield + 1
+
+                        if sinceYield >= yieldEvery then
+                            sinceYield = 0
+                            task.wait()          -- yield every few parts
+                            if not getgenv().PaintBotRunning then return end
                         end
                     end
                 end
             end
 
-            if firstPass then
-                log(string.format(
-                    "Canvas clearing: saw %d plot(s), %d with a canvas, destroyed %d pixel(s) on first pass",
-                    plotsSeen, plotsWithCanvas, destroyed))
-                firstPass = false
+            if destroyed > 0 then
+                log("Canvas hide pass finished –", destroyed, "parts hidden")
             end
 
-            task.wait(CONFIG.canvasScanInterval)
+            task.wait(scanInterval)
         end
     end)
 end
