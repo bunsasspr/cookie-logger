@@ -81,6 +81,24 @@ local CONFIG = {
     -- again on a later pass if still unpainted)
     maxStuckRecoveries = 3,
 
+    -- FAST STALL FIX: humanoid:MoveTo() can silently fail to actually
+    -- start the character walking (dropped by the engine right after a
+    -- FireServer call, a prior MoveTo, a state transition, etc.). Since
+    -- MoveTo is only issued once per target (re-sending it every tick is
+    -- what caused the old hitch), a dropped request left the character
+    -- standing still doing nothing until the much slower position-based
+    -- stuckCheckInterval + full jump/nudge recovery kicked in a second
+    -- or more later. This is a much cheaper, faster check: if the
+    -- humanoid reports zero MoveDirection for this long while it should
+    -- be walking (target set, not already basically on top of it), just
+    -- re-send the same MoveTo -- no jump, no nudge, almost free.
+    moveDirectionGraceTime = 0.3,
+
+    -- Don't treat MoveDirection==0 as a stall if we're already this close
+    -- to the target -- the humanoid naturally stops accelerating/turns
+    -- MoveDirection to zero right as it arrives, that's not a problem.
+    moveDirectionArriveGuard = 3,
+
     -- On-screen progress bar
     showProgressUI = true,
     progressUpdateInterval = 0.5,
@@ -118,6 +136,17 @@ local CONFIG = {
     -- How often (seconds) to re-sweep all plots for the above. Keeps
     -- catching neighbors/pixels that stream in after the first pass.
     canvasScanInterval = 1.0,
+
+    -- FREEZE FIX: the sweep above destroys parts in a plain synchronous
+    -- loop. Luau only switches threads at yield points, so if a burst of
+    -- neighbor pixels streams in at once (walking near several plots,
+    -- multiple players loading together, etc.), destroying all of them
+    -- in one unbroken loop hogs the whole script's execution slice for
+    -- that frame -- including the paint loop's Heartbeat:Wait(), which
+    -- can't run until the destroy loop finishes. That's the 2-3s freeze.
+    -- This setting yields every N destroys so the sweep spreads across
+    -- several frames instead of stalling everything at once.
+    canvasClearYieldEvery = 40,
 }
 
 ----------------------------------------------------------------
@@ -218,19 +247,114 @@ local function distanceXZ(a, b)
     return math.sqrt(dx * dx + dz * dz)
 end
 
-local function gatherUnpaintedByNumber(activePicture)
-    local groups = {}
-    for _, part in ipairs(activePicture:GetChildren()) do
-        if part:IsA("BasePart") then
-            local done = part:GetAttribute("D")
-            local n = part:GetAttribute("N")
-            if done == false and n ~= nil then
-                groups[n] = groups[n] or {}
-                table.insert(groups[n], part)
+-- Event-driven cache of unpainted pixels. This is the key FPS fix: the old
+-- code re-scanned every part in the picture (calling GetAttribute twice per
+-- part) up to 10x per second in continuous mode, which is what lagged the
+-- game on large canvases. Instead we build the list once, then keep it in
+-- sync with cheap attribute-change / child events, so the hot loop never
+-- does an O(n) GetAttribute scan.
+local function createPixelCache(activePicture)
+    local cache = {
+        byNumber = {},       -- number -> { [part] = true }  (unpainted only)
+        countByNumber = {},  -- number -> count of unpainted
+        total = 0,           -- total pixels (painted + unpainted)
+        done = 0,            -- painted pixels
+        partToNumber = {},   -- part -> number (all parts, for O(1) removal)
+    }
+
+    -- A pixel got painted (D flipped to true): move it out of the unpainted set.
+    local function onPartPainted(part)
+        local n = cache.partToNumber[part]
+        if n then
+            local set = cache.byNumber[n]
+            if set and set[part] then
+                set[part] = nil
+                cache.countByNumber[n] = cache.countByNumber[n] - 1
+                cache.done = cache.done + 1
             end
+            -- keep partToNumber[part] so a later removal can still fix done/total
         end
     end
-    return groups
+
+    -- A pixel was removed from the picture entirely.
+    local function onPartRemoved(part)
+        local n = cache.partToNumber[part]
+        if n then
+            local set = cache.byNumber[n]
+            if set and set[part] then
+                -- was unpainted: counted toward total but not done
+                set[part] = nil
+                cache.countByNumber[n] = cache.countByNumber[n] - 1
+                cache.total = cache.total - 1
+            else
+                -- was already painted: counted toward both total and done
+                cache.done = cache.done - 1
+                cache.total = cache.total - 1
+            end
+            cache.partToNumber[part] = nil
+        end
+    end
+
+    local function addPart(part)
+        if not part:IsA("BasePart") then return end
+        local n = part:GetAttribute("N")
+        if n == nil then return end
+        cache.total = cache.total + 1
+        cache.partToNumber[part] = n
+        if part:GetAttribute("D") == true then
+            cache.done = cache.done + 1
+        else
+            cache.byNumber[n] = cache.byNumber[n] or {}
+            cache.byNumber[n][part] = true
+            cache.countByNumber[n] = (cache.countByNumber[n] or 0) + 1
+        end
+        -- When this pixel gets painted, drop it from the cache immediately.
+        part:GetAttributeChangedSignal("D"):Connect(function()
+            if part:GetAttribute("D") == true then
+                onPartPainted(part)
+            end
+        end)
+    end
+
+    -- Initial population
+    for _, part in ipairs(activePicture:GetChildren()) do
+        addPart(part)
+    end
+
+    -- Handle pixels that stream in / get removed later
+    activePicture.ChildAdded:Connect(addPart)
+    activePicture.ChildRemoved:Connect(onPartRemoved)
+
+    -- Fallback reconciliation: occasionally re-scan to catch anything the
+    -- events missed. This is the ONLY remaining O(n) GetAttribute scan and
+    -- it runs rarely (every few seconds) instead of 10x per second.
+    cache.reconcile = function()
+        local byNumber, countByNumber, partToNumber = {}, {}, {}
+        local total, done = 0, 0
+        for _, part in ipairs(activePicture:GetChildren()) do
+            if part:IsA("BasePart") then
+                local n = part:GetAttribute("N")
+                if n ~= nil then
+                    total = total + 1
+                    partToNumber[part] = n
+                    if part:GetAttribute("D") == true then
+                        done = done + 1
+                    else
+                        byNumber[n] = byNumber[n] or {}
+                        byNumber[n][part] = true
+                        countByNumber[n] = (countByNumber[n] or 0) + 1
+                    end
+                end
+            end
+        end
+        cache.byNumber = byNumber
+        cache.countByNumber = countByNumber
+        cache.partToNumber = partToNumber
+        cache.total = total
+        cache.done = done
+    end
+
+    return cache
 end
 
 -- Live scan: all still-unpainted parts for a single number N.
@@ -390,10 +514,13 @@ end
 local function armCanvasClearing(plotModels, ownPlot)
     if not CONFIG.hideOtherCanvases then return end
 
+    local yieldEvery = math.max(1, CONFIG.canvasClearYieldEvery or 40)
+
     task.spawn(function()
         local firstPass = true
         while getgenv().PaintBotRunning do
             local plotsSeen, plotsWithCanvas, destroyed = 0, 0, 0
+            local sinceYield = 0
 
             for _, candidate in ipairs(plotModels:GetChildren()) do
                 plotsSeen = plotsSeen + 1
@@ -404,6 +531,20 @@ local function armCanvasClearing(plotModels, ownPlot)
                         for _, part in ipairs(ap:GetChildren()) do
                             local ok = pcall(function() part:Destroy() end)
                             if ok then destroyed = destroyed + 1 end
+
+                            -- Yield periodically instead of destroying an
+                            -- entire burst in one unbroken loop. This is
+                            -- what stops the sweep from stalling the paint
+                            -- loop's Heartbeat:Wait() for multiple seconds
+                            -- when a lot of neighbor pixels stream in at once.
+                            sinceYield = sinceYield + 1
+                            if sinceYield >= yieldEvery then
+                                sinceYield = 0
+                                task.wait()
+                                if not getgenv().PaintBotRunning then
+                                    return
+                                end
+                            end
                         end
                     end
                 end
@@ -697,18 +838,11 @@ local function createProgressUI()
     refreshControlButton()
 end
 
-local function updateProgressUI(activePicture)
+local function updateProgressUI(cache)
     if not ProgressLabel or not ProgressBarFill then return end
 
-    local total, done = 0, 0
-    for _, part in ipairs(activePicture:GetChildren()) do
-        if part:IsA("BasePart") and part:GetAttribute("N") ~= nil then
-            total = total + 1
-            if part:GetAttribute("D") == true then
-                done = done + 1
-            end
-        end
-    end
+    local total = cache.total
+    local done = cache.done
 
     local pct = total > 0 and math.floor((done / total) * 100) or 0
     local statusSuffix = getgenv().PaintBotPaused and "  ·  Paused" or ""
@@ -765,56 +899,56 @@ local function walkToPixel(part, humanoid, hrp, expectedMode)
             humanoid:MoveTo(part.Position)
             lastCheckPos = hrp.Position
             lastCheckTime = tick()
-            continue
-        end
-        if expectedMode and getgenv().PaintBotDrawMode ~= expectedMode then
-            return false -- mode changed mid-walk, abandon this pixel immediately
-        end
-        if waited >= 10 then
-            return false
-        end
-        if not part or not part.Parent then
-            return true -- disappeared/painted and cleaned up
-        end
-        if part:GetAttribute("D") == true then
-            return true
-        end
-        if distanceXZ(hrp.Position, part.Position) <= CONFIG.arriveDistance then
-            -- arrived, give the game a moment to auto-paint
-            local paintWaited = 0
-            while getgenv().PaintBotRunning and paintWaited < CONFIG.paintWaitTimeout do
-                if getgenv().PaintBotPaused then
-                    waitWhilePaused()
-                end
-                if expectedMode and getgenv().PaintBotDrawMode ~= expectedMode then
-                    return false
-                end
-                if not part.Parent or part:GetAttribute("D") == true then
-                    return true
-                end
-                task.wait(0.1)
-                paintWaited = paintWaited + 0.1
+        else
+            if expectedMode and getgenv().PaintBotDrawMode ~= expectedMode then
+                return false -- mode changed mid-walk, abandon this pixel immediately
             end
-            return part.Parent == nil or part:GetAttribute("D") == true
-        end
-
-        -- Stuck check: has the character actually moved recently?
-        if tick() - lastCheckTime >= CONFIG.stuckCheckInterval then
-            local moved = distanceXZ(hrp.Position, lastCheckPos)
-            if moved < CONFIG.stuckMoveThreshold then
-                stuckRecoveries = stuckRecoveries + 1
-                if stuckRecoveries > CONFIG.maxStuckRecoveries then
-                    log("Gave up on this pixel after", stuckRecoveries, "stuck recoveries")
-                    return false
-                end
-                attemptUnstick(humanoid, hrp, part.Position)
+            if waited >= 10 then
+                return false
             end
-            lastCheckPos = hrp.Position
-            lastCheckTime = tick()
-        end
+            if not part or not part.Parent then
+                return true -- disappeared/painted and cleaned up
+            end
+            if part:GetAttribute("D") == true then
+                return true
+            end
+            if distanceXZ(hrp.Position, part.Position) <= CONFIG.arriveDistance then
+                -- arrived, give the game a moment to auto-paint
+                local paintWaited = 0
+                while getgenv().PaintBotRunning and paintWaited < CONFIG.paintWaitTimeout do
+                    if getgenv().PaintBotPaused then
+                        waitWhilePaused()
+                    end
+                    if expectedMode and getgenv().PaintBotDrawMode ~= expectedMode then
+                        return false
+                    end
+                    if not part.Parent or part:GetAttribute("D") == true then
+                        return true
+                    end
+                    task.wait(0.1)
+                    paintWaited = paintWaited + 0.1
+                end
+                return part.Parent == nil or part:GetAttribute("D") == true
+            end
 
-        task.wait(0.1)
-        waited = waited + 0.1
+            -- Stuck check: has the character actually moved recently?
+            if tick() - lastCheckTime >= CONFIG.stuckCheckInterval then
+                local moved = distanceXZ(hrp.Position, lastCheckPos)
+                if moved < CONFIG.stuckMoveThreshold then
+                    stuckRecoveries = stuckRecoveries + 1
+                    if stuckRecoveries > CONFIG.maxStuckRecoveries then
+                        log("Gave up on this pixel after", stuckRecoveries, "stuck recoveries")
+                        return false
+                    end
+                    attemptUnstick(humanoid, hrp, part.Position)
+                end
+                lastCheckPos = hrp.Position
+                lastCheckTime = tick()
+            end
+
+            task.wait(0.1)
+            waited = waited + 0.1
+        end
     end
     return false
 end
@@ -838,7 +972,7 @@ end
 -- next pixel the instant the current one is done, not up to
 -- retargetInterval seconds later.
 ----------------------------------------------------------------
-local function paintNumberContinuous(n, activePicture, humanoid, hrp, expectedMode)
+local function paintNumberContinuous(n, cache, humanoid, hrp, expectedMode)
     local skipSet = {} -- parts we gave up on this pass (stuck); retried next number cycle
     local currentTarget = nil
     local stuckRecoveries = 0
@@ -848,6 +982,11 @@ local function paintNumberContinuous(n, activePicture, humanoid, hrp, expectedMo
     local lastRemainingLog = -1
     local rescanInterval = CONFIG.retargetInterval or 0.1
     local lastRescanTime = 0
+    local notMovingSince = nil
+    local graceTime = CONFIG.moveDirectionGraceTime or 0.3
+    local arriveGuard = CONFIG.moveDirectionArriveGuard or 3
+    local reconcileInterval = 3.0
+    local lastReconcileTime = 0
 
     log("Continuous paint starting for N=" .. tostring(n))
 
@@ -860,8 +999,26 @@ local function paintNumberContinuous(n, activePicture, humanoid, hrp, expectedMo
             end
             lastCheckPos = hrp.Position
             lastCheckTime = tick()
+            notMovingSince = nil
             if currentTarget and isPixelStillOpen(currentTarget) then
                 humanoid:MoveTo(currentTarget.Position)
+            end
+        end
+
+        -- Fast check: is a dropped/never-started MoveTo leaving us idle?
+        -- This is independent of (and much quicker than) the position-based
+        -- stuck check below, which only samples once a second.
+        if currentTarget ~= nil and not getgenv().PaintBotPaused then
+            local distToTarget = distanceXZ(hrp.Position, currentTarget.Position)
+            if distToTarget > arriveGuard and humanoid.MoveDirection.Magnitude < 0.05 then
+                if not notMovingSince then
+                    notMovingSince = tick()
+                elseif tick() - notMovingSince >= graceTime then
+                    humanoid:MoveTo(currentTarget.Position)
+                    notMovingSince = tick() -- give the reissue its own grace window
+                end
+            else
+                notMovingSince = nil
             end
         end
 
@@ -882,16 +1039,39 @@ local function paintNumberContinuous(n, activePicture, humanoid, hrp, expectedMo
         local targetLost = currentTarget ~= nil and not isPixelStillOpen(currentTarget)
         local dueForRescan = (tick() - lastRescanTime) >= rescanInterval
 
+        -- Rare fallback: re-sync the cache from the live tree every few
+        -- seconds in case an attribute change event was missed. This is the
+        -- ONLY remaining O(n) GetAttribute scan and it runs ~0.3x/sec instead
+        -- of 10x/sec, so it's effectively free.
+        if tick() - lastReconcileTime >= reconcileInterval then
+            lastReconcileTime = tick()
+            cache.reconcile()
+        end
+
         if currentTarget == nil or targetLost or dueForRescan then
             lastRescanTime = tick()
 
-            -- Live scan of still-unpainted pixels for this number
-            local remaining = gatherRemainingForNumber(activePicture, n, skipSet)
+            -- Build the candidate list from the cache (O(1) lookup, no scan).
+            local remaining = {}
+            local set = cache.byNumber[n]
+            if set then
+                for part in pairs(set) do
+                    if not (skipSet and skipSet[part]) then
+                        table.insert(remaining, part)
+                    end
+                end
+            end
             if #remaining == 0 then
                 -- If we only emptied the list because of skips, clear skips once
                 -- and retry anything still actually unpainted before giving up.
                 if next(skipSet) ~= nil then
-                    local anyLeft = gatherRemainingForNumber(activePicture, n, nil)
+                    local anyLeft = {}
+                    local set2 = cache.byNumber[n]
+                    if set2 then
+                        for part in pairs(set2) do
+                            table.insert(anyLeft, part)
+                        end
+                    end
                     if #anyLeft > 0 then
                         skipSet = {}
                         stuckRecoveries = 0
@@ -917,6 +1097,7 @@ local function paintNumberContinuous(n, activePicture, humanoid, hrp, expectedMo
                 stuckRecoveries = 0
                 lastCheckPos = hrp.Position
                 lastCheckTime = tick()
+                notMovingSince = nil
                 humanoid:MoveTo(currentTarget.Position)
 
                 -- Throttled log: at most once per ~1.5s, or when remaining count drops
@@ -1009,6 +1190,11 @@ task.spawn(function()
 
     armCanvasClearing(plot.Parent, plot)
 
+    -- Build the event-driven pixel cache once. All subsequent scans (number
+    -- grouping, progress, continuous retargeting) read from this instead of
+    -- re-scanning the whole picture with GetAttribute calls every frame.
+    local cache = createPixelCache(activePicture)
+
     local char = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
     local humanoid = char:FindFirstChildOfClass("Humanoid")
     local hrp = char:WaitForChild("HumanoidRootPart")
@@ -1021,11 +1207,11 @@ task.spawn(function()
         createProgressUI()
         task.spawn(function()
             while getgenv().PaintBotRunning do
-                updateProgressUI(activePicture)
+                updateProgressUI(cache)
                 task.wait(CONFIG.progressUpdateInterval)
             end
             -- final update so it shows 100% / final state before stopping
-            updateProgressUI(activePicture)
+            updateProgressUI(cache)
         end)
     end
 
@@ -1051,11 +1237,13 @@ task.spawn(function()
             hrp = char:FindFirstChild("HumanoidRootPart") or hrp
         end
 
-        local groups = gatherUnpaintedByNumber(activePicture)
-
+        -- Build the list of numbers that still have unpainted pixels from
+        -- the cache (O(1) per number, no full scan).
         local numbers = {}
-        for num, _ in pairs(groups) do
-            table.insert(numbers, num)
+        for num, count in pairs(cache.countByNumber) do
+            if count > 0 then
+                table.insert(numbers, num)
+            end
         end
 
         if #numbers == 0 then
@@ -1070,7 +1258,7 @@ task.spawn(function()
         -- Keep working this number until no unpainted pixels with it remain,
         -- OR until the draw mode changes (then abandon and re-pick immediately)
         if CONFIG.continuousMode then
-            paintNumberContinuous(n, activePicture, humanoid, hrp, workingMode)
+            paintNumberContinuous(n, cache, humanoid, hrp, workingMode)
         else
             paintNumberLegacy(n, activePicture, humanoid, hrp, workingMode)
         end
