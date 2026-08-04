@@ -8,9 +8,13 @@
     moving to the next number. Repeats until nothing unpainted is left.
 
     CONTINUOUS MODE (default): the character never stops to wait for a single
-    pixel to paint. The nearest still-unpainted pixel of the current number is
-    re-evaluated every retargetInterval seconds, so motion stays smooth and
-    the bot streams through clusters without the old "stop → wait → go" stutter.
+    pixel to paint. Movement is paced by the render heartbeat (no fixed sleep
+    between steps), and the moment the current pixel is painted it retargets
+    immediately rather than on a poll timer — MoveTo is only re-issued when
+    the target actually changes, not repeatedly to the same point, since that
+    repeated re-issue was itself the source of the old brief stutter. A full
+    list re-scan (for a closer/new pixel appearing) is still throttled by
+    retargetInterval, since that part is an O(n) scan and worth rate-limiting.
 
     CONTROLS (run in console):
         PaintBotStop()    -- stops the bot cleanly (cannot be resumed)
@@ -39,8 +43,12 @@ local CONFIG = {
     -- "walk → arrive → wait for paint" behaviour.
     continuousMode = true,
 
-    -- How often (seconds) to re-scan for the nearest unpainted pixel and
-    -- re-issue MoveTo while continuousMode is active. 0.1–0.2 is a good range.
+    -- How often (seconds) to run a full re-scan of all pixels for this
+    -- number to check for a closer/new one, while continuousMode is active.
+    -- This does NOT pace movement or MoveTo anymore (that happens every
+    -- frame with no artificial delay) — it only throttles the O(n) list
+    -- scan, which is the one part that's actually worth rate-limiting.
+    -- 0.1–0.2 is a good range.
     retargetInterval = 0.1,
 
     -- How close (studs, horizontal XZ distance) counts as "arrived" at a pixel.
@@ -118,6 +126,7 @@ local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local HttpService = game:GetService("HttpService")
 local VirtualUser = game:GetService("VirtualUser")
+local RunService = game:GetService("RunService")
 local LocalPlayer = Players.LocalPlayer
 
 local SelectNumberEvent = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("SelectNumber")
@@ -812,8 +821,22 @@ end
 
 ----------------------------------------------------------------
 -- CONTINUOUS MODE: keep moving across all pixels of number N.
--- Never stops to wait for a paint confirmation. Retargets the
--- nearest still-unpainted pixel every CONFIG.retargetInterval.
+-- Never stops to wait for a paint confirmation, and never sleeps
+-- a fixed amount between steps — the loop is paced by the render
+-- heartbeat (RunService.Heartbeat) instead of task.wait, and it
+-- only re-issues MoveTo when the target actually changes. The old
+-- version re-sent MoveTo to the *same* point every single tick,
+-- which is what produced the little hitch after each pixel — the
+-- humanoid briefly resets its walk state every time MoveTo fires,
+-- even to a point it's already walking toward.
+--
+-- Full re-scans of the pixel list (CONFIG.retargetInterval) are
+-- still throttled, since that's an O(n) walk over every part in
+-- the picture and doesn't need to run every frame. But noticing
+-- that the *current* target got painted or removed is checked
+-- every frame (just one attribute read), so the bot snaps to the
+-- next pixel the instant the current one is done, not up to
+-- retargetInterval seconds later.
 ----------------------------------------------------------------
 local function paintNumberContinuous(n, activePicture, humanoid, hrp, expectedMode)
     local skipSet = {} -- parts we gave up on this pass (stuck); retried next number cycle
@@ -823,7 +846,8 @@ local function paintNumberContinuous(n, activePicture, humanoid, hrp, expectedMo
     local lastCheckTime = tick()
     local lastLogTime = 0
     local lastRemainingLog = -1
-    local tickInterval = CONFIG.retargetInterval or 0.1
+    local rescanInterval = CONFIG.retargetInterval or 0.1
+    local lastRescanTime = 0
 
     log("Continuous paint starting for N=" .. tostring(n))
 
@@ -836,7 +860,6 @@ local function paintNumberContinuous(n, activePicture, humanoid, hrp, expectedMo
             end
             lastCheckPos = hrp.Position
             lastCheckTime = tick()
-            -- Re-issue move toward whatever we were heading to (or retarget below)
             if currentTarget and isPixelStillOpen(currentTarget) then
                 humanoid:MoveTo(currentTarget.Position)
             end
@@ -852,56 +875,63 @@ local function paintNumberContinuous(n, activePicture, humanoid, hrp, expectedMo
             return
         end
 
-        -- Live scan of still-unpainted pixels for this number
-        local remaining = gatherRemainingForNumber(activePicture, n, skipSet)
-        if #remaining == 0 then
-            -- If we only emptied the list because of skips, clear skips once
-            -- and retry anything still actually unpainted before giving up.
-            if next(skipSet) ~= nil then
-                local anyLeft = gatherRemainingForNumber(activePicture, n, nil)
-                if #anyLeft > 0 then
-                    skipSet = {}
-                    stuckRecoveries = 0
-                    remaining = anyLeft
+        -- Cheap every-frame check: is the pixel we're currently walking to
+        -- still open? This is a single attribute read, not a list scan, so
+        -- doing it every frame costs nothing and means we react the instant
+        -- it flips rather than waiting on the next scan tick.
+        local targetLost = currentTarget ~= nil and not isPixelStillOpen(currentTarget)
+        local dueForRescan = (tick() - lastRescanTime) >= rescanInterval
+
+        if currentTarget == nil or targetLost or dueForRescan then
+            lastRescanTime = tick()
+
+            -- Live scan of still-unpainted pixels for this number
+            local remaining = gatherRemainingForNumber(activePicture, n, skipSet)
+            if #remaining == 0 then
+                -- If we only emptied the list because of skips, clear skips once
+                -- and retry anything still actually unpainted before giving up.
+                if next(skipSet) ~= nil then
+                    local anyLeft = gatherRemainingForNumber(activePicture, n, nil)
+                    if #anyLeft > 0 then
+                        skipSet = {}
+                        stuckRecoveries = 0
+                        remaining = anyLeft
+                    else
+                        break
+                    end
                 else
                     break
                 end
-            else
+            end
+
+            local nearest, nearestDist = findNearestPixel(remaining, hrp)
+            if not nearest then
                 break
             end
-        end
 
-        local nearest, nearestDist = findNearestPixel(remaining, hrp)
-        if not nearest then
-            break
-        end
+            -- Only touch MoveTo when the target actually changes. Re-sending
+            -- MoveTo to the same point every tick is what caused the stutter,
+            -- so a same-target rescan now leaves movement completely alone.
+            if nearest ~= currentTarget then
+                currentTarget = nearest
+                stuckRecoveries = 0
+                lastCheckPos = hrp.Position
+                lastCheckTime = tick()
+                humanoid:MoveTo(currentTarget.Position)
 
-        -- Retarget whenever the nearest open pixel changes (painted, destroyed,
-        -- or a closer one appeared). Never wait on the old target.
-        local targetChanged = (nearest ~= currentTarget)
-        if targetChanged then
-            currentTarget = nearest
-            stuckRecoveries = 0
-            lastCheckPos = hrp.Position
-            lastCheckTime = tick()
-            humanoid:MoveTo(currentTarget.Position)
-
-            -- Throttled log: at most once per ~1.5s, or when remaining count drops
-            local now = tick()
-            if now - lastLogTime >= 1.5 or #remaining ~= lastRemainingLog then
-                log(string.format(
-                    "N=%s  target dist=%d  remaining=%d",
-                    tostring(n), math.floor(nearestDist), #remaining))
-                lastLogTime = now
-                lastRemainingLog = #remaining
+                -- Throttled log: at most once per ~1.5s, or when remaining count drops
+                local now = tick()
+                if now - lastLogTime >= 1.5 or #remaining ~= lastRemainingLog then
+                    log(string.format(
+                        "N=%s  target dist=%d  remaining=%d",
+                        tostring(n), math.floor(nearestDist), #remaining))
+                    lastLogTime = now
+                    lastRemainingLog = #remaining
+                end
             end
-        else
-            -- Same target still open — periodically re-issue MoveTo in case
-            -- pathing stalled without a full stuck event, and keep moving.
-            humanoid:MoveTo(currentTarget.Position)
         end
 
-        -- Stuck check (same recovery logic as legacy, but on give-up we skip
+        -- Stuck check (same recovery logic as before — on give-up we skip
         -- this pixel and immediately retarget the next nearest instead of
         -- blocking in a paint-wait loop).
         if tick() - lastCheckTime >= CONFIG.stuckCheckInterval then
@@ -922,7 +952,10 @@ local function paintNumberContinuous(n, activePicture, humanoid, hrp, expectedMo
             lastCheckTime = tick()
         end
 
-        task.wait(tickInterval)
+        -- Paced by the render heartbeat instead of a fixed task.wait sleep —
+        -- this is what removes the "pause": the loop simply runs again next
+        -- frame (~1/60s), same as any live gameplay logic would.
+        RunService.Heartbeat:Wait()
     end
 
     log("Finished continuous pass for N=" .. tostring(n))
