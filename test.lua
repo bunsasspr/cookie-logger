@@ -147,6 +147,16 @@ local CONFIG = {
     -- This setting yields every N destroys so the sweep spreads across
     -- several frames instead of stalling everything at once.
     canvasClearYieldEvery = 40,
+
+    -- CACHE CLEARING: the event-driven pixel cache holds per-pixel data and
+    -- attribute-change connections for every currently-unpainted pixel, plus
+    -- a lightweight countedPart set for all live pixels (so removals can
+    -- correctly adjust the done/total progress counts). Over a very long run
+    -- this still accumulates a little, so every cacheRebuildInterval seconds
+    -- the cache is fully torn down and rebuilt from scratch (connections
+    -- disconnected, tables cleared). Lower = more frequent cleanup but more
+    -- rebuild cost; 20-60s is a good range.
+    cacheRebuildInterval = 30,
 }
 
 ----------------------------------------------------------------
@@ -253,45 +263,64 @@ end
 -- game on large canvases. Instead we build the list once, then keep it in
 -- sync with cheap attribute-change / child events, so the hot loop never
 -- does an O(n) GetAttribute scan.
+--
+-- Connections for painted pixels are disconnected and their entries removed
+-- immediately, so the cache only ever holds data for currently-unpainted
+-- pixels. Long runs no longer accumulate memory/connection overhead.
+-- rebuild() fully tears the cache down and rebuilds it from scratch.
 local function createPixelCache(activePicture)
     local cache = {
         byNumber = {},       -- number -> { [part] = true }  (unpainted only)
         countByNumber = {},  -- number -> count of unpainted
         total = 0,           -- total pixels (painted + unpainted)
         done = 0,            -- painted pixels
-        partToNumber = {},   -- part -> number (all parts, for O(1) removal)
+        -- Maps below are UNPAINTED ONLY. Keys are removed (and connections
+        -- disconnected) the moment a pixel gets painted or removed, so they
+        -- stay bounded by the current work set instead of growing forever.
+        partToNumber = {},   -- part -> number  (unpainted only)
+        partConns = {},      -- part -> Connection (attribute change watcher)
+        -- Every part we've counted toward total/done is listed here so a
+        -- ChildRemoved can tell "already painted" apart from "never counted
+        -- (non-pixel child)". Cleared on removal, so it stays bounded by the
+        -- number of live parts in the picture.
+        countedPart = {},    -- part -> true
+        childAddConn = nil,
+        childRemoveConn = nil,
     }
 
-    -- A pixel got painted (D flipped to true): move it out of the unpainted set.
-    local function onPartPainted(part)
+    -- Drop a pixel from the unpainted maps and disconnect its watcher.
+    -- Returns true if it was still tracked as unpainted.
+    local function removeFromCache(part)
         local n = cache.partToNumber[part]
         if n then
             local set = cache.byNumber[n]
-            if set and set[part] then
+            if set then
                 set[part] = nil
                 cache.countByNumber[n] = cache.countByNumber[n] - 1
-                cache.done = cache.done + 1
             end
-            -- keep partToNumber[part] so a later removal can still fix done/total
+            cache.partToNumber[part] = nil
         end
+        local conn = cache.partConns[part]
+        if conn then
+            pcall(function() conn:Disconnect() end)
+            cache.partConns[part] = nil
+        end
+        return n ~= nil
     end
 
     -- A pixel was removed from the picture entirely.
     local function onPartRemoved(part)
-        local n = cache.partToNumber[part]
-        if n then
-            local set = cache.byNumber[n]
-            if set and set[part] then
-                -- was unpainted: counted toward total but not done
-                set[part] = nil
-                cache.countByNumber[n] = cache.countByNumber[n] - 1
-                cache.total = cache.total - 1
-            else
-                -- was already painted: counted toward both total and done
-                cache.done = cache.done - 1
-                cache.total = cache.total - 1
-            end
-            cache.partToNumber[part] = nil
+        if not cache.countedPart[part] then
+            -- Never counted (non-pixel child or missing N attribute): ignore.
+            return
+        end
+        local wasUnpainted = removeFromCache(part) -- no-op if it was already painted
+        cache.countedPart[part] = nil
+        cache.total = cache.total - 1
+        if not wasUnpainted then
+            -- Was already painted (conn already freed, unpainted entries
+            -- already cleared): it counted toward both total and done.
+            cache.done = cache.done - 1
         end
     end
 
@@ -300,59 +329,77 @@ local function createPixelCache(activePicture)
         local n = part:GetAttribute("N")
         if n == nil then return end
         cache.total = cache.total + 1
-        cache.partToNumber[part] = n
+        cache.countedPart[part] = true
         if part:GetAttribute("D") == true then
             cache.done = cache.done + 1
         else
             cache.byNumber[n] = cache.byNumber[n] or {}
             cache.byNumber[n][part] = true
             cache.countByNumber[n] = (cache.countByNumber[n] or 0) + 1
+            cache.partToNumber[part] = n
+            -- Watch this pixel; as soon as it's painted, drop it from the
+            -- cache AND disconnect this connection so nothing accumulates.
+            local conn = part:GetAttributeChangedSignal("D"):Connect(function()
+                if part:GetAttribute("D") == true then
+                    removeFromCache(part)
+                    cache.done = cache.done + 1
+                end
+            end)
+            cache.partConns[part] = conn
         end
-        -- When this pixel gets painted, drop it from the cache immediately.
-        part:GetAttributeChangedSignal("D"):Connect(function()
-            if part:GetAttribute("D") == true then
-                onPartPainted(part)
-            end
-        end)
+    end
+
+    local function armChildConnections()
+        cache.childAddConn = activePicture.ChildAdded:Connect(addPart)
+        cache.childRemoveConn = activePicture.ChildRemoved:Connect(onPartRemoved)
+    end
+
+    local function populate()
+        for _, part in ipairs(activePicture:GetChildren()) do
+            addPart(part)
+        end
+    end
+
+    -- CACHE CLEARING: tear down every connection and table, then rebuild
+    -- from scratch. This is what resets the slow accumulation that makes
+    -- the lag return after long runs. Runs atomically (no yields inside),
+    -- so the paint loop always sees a consistent cache.
+    cache.rebuild = function()
+        if cache.childAddConn then pcall(function() cache.childAddConn:Disconnect() end) end
+        if cache.childRemoveConn then pcall(function() cache.childRemoveConn:Disconnect() end) end
+        for _, conn in pairs(cache.partConns) do
+            pcall(function() conn:Disconnect() end)
+        end
+        cache.byNumber = {}
+        cache.countByNumber = {}
+        cache.partToNumber = {}
+        cache.partConns = {}
+        cache.countedPart = {}
+        cache.total = 0
+        cache.done = 0
+        populate()
+        armChildConnections()
+    end
+
+    -- Release everything on stop. Can't be resumed after this.
+    cache.destroy = function()
+        if cache.childAddConn then pcall(function() cache.childAddConn:Disconnect() end) end
+        if cache.childRemoveConn then pcall(function() cache.childRemoveConn:Disconnect() end) end
+        for _, conn in pairs(cache.partConns) do
+            pcall(function() conn:Disconnect() end)
+        end
+        cache.byNumber = {}
+        cache.countByNumber = {}
+        cache.partToNumber = {}
+        cache.partConns = {}
+        cache.countedPart = {}
+        cache.total = 0
+        cache.done = 0
     end
 
     -- Initial population
-    for _, part in ipairs(activePicture:GetChildren()) do
-        addPart(part)
-    end
-
-    -- Handle pixels that stream in / get removed later
-    activePicture.ChildAdded:Connect(addPart)
-    activePicture.ChildRemoved:Connect(onPartRemoved)
-
-    -- Fallback reconciliation: occasionally re-scan to catch anything the
-    -- events missed. This is the ONLY remaining O(n) GetAttribute scan and
-    -- it runs rarely (every few seconds) instead of 10x per second.
-    cache.reconcile = function()
-        local byNumber, countByNumber, partToNumber = {}, {}, {}
-        local total, done = 0, 0
-        for _, part in ipairs(activePicture:GetChildren()) do
-            if part:IsA("BasePart") then
-                local n = part:GetAttribute("N")
-                if n ~= nil then
-                    total = total + 1
-                    partToNumber[part] = n
-                    if part:GetAttribute("D") == true then
-                        done = done + 1
-                    else
-                        byNumber[n] = byNumber[n] or {}
-                        byNumber[n][part] = true
-                        countByNumber[n] = (countByNumber[n] or 0) + 1
-                    end
-                end
-            end
-        end
-        cache.byNumber = byNumber
-        cache.countByNumber = countByNumber
-        cache.partToNumber = partToNumber
-        cache.total = total
-        cache.done = done
-    end
+    populate()
+    armChildConnections()
 
     return cache
 end
@@ -964,13 +1011,13 @@ end
 -- humanoid briefly resets its walk state every time MoveTo fires,
 -- even to a point it's already walking toward.
 --
--- Full re-scans of the pixel list (CONFIG.retargetInterval) are
--- still throttled, since that's an O(n) walk over every part in
--- the picture and doesn't need to run every frame. But noticing
--- that the *current* target got painted or removed is checked
--- every frame (just one attribute read), so the bot snaps to the
--- next pixel the instant the current one is done, not up to
--- retargetInterval seconds later.
+-- Re-picking from the cached unpainted set (CONFIG.retargetInterval) is
+-- throttled, since building the candidate list + nearest-search is still a
+-- walk over that number's remaining pixels. But noticing that the *current*
+-- target got painted or removed is checked every frame (just one attribute
+-- read), so the bot snaps to the next pixel the instant the current one is
+-- done, not up to retargetInterval seconds later. The cache itself is kept
+-- in sync by attribute/child events, so no full-tree scan ever runs here.
 ----------------------------------------------------------------
 local function paintNumberContinuous(n, cache, humanoid, hrp, expectedMode)
     local skipSet = {} -- parts we gave up on this pass (stuck); retried next number cycle
@@ -985,8 +1032,6 @@ local function paintNumberContinuous(n, cache, humanoid, hrp, expectedMode)
     local notMovingSince = nil
     local graceTime = CONFIG.moveDirectionGraceTime or 0.3
     local arriveGuard = CONFIG.moveDirectionArriveGuard or 3
-    local reconcileInterval = 3.0
-    local lastReconcileTime = 0
 
     log("Continuous paint starting for N=" .. tostring(n))
 
@@ -1038,15 +1083,6 @@ local function paintNumberContinuous(n, cache, humanoid, hrp, expectedMode)
         -- it flips rather than waiting on the next scan tick.
         local targetLost = currentTarget ~= nil and not isPixelStillOpen(currentTarget)
         local dueForRescan = (tick() - lastRescanTime) >= rescanInterval
-
-        -- Rare fallback: re-sync the cache from the live tree every few
-        -- seconds in case an attribute change event was missed. This is the
-        -- ONLY remaining O(n) GetAttribute scan and it runs ~0.3x/sec instead
-        -- of 10x/sec, so it's effectively free.
-        if tick() - lastReconcileTime >= reconcileInterval then
-            lastReconcileTime = tick()
-            cache.reconcile()
-        end
 
         if currentTarget == nil or targetLost or dueForRescan then
             lastRescanTime = tick()
@@ -1195,6 +1231,22 @@ task.spawn(function()
     -- re-scanning the whole picture with GetAttribute calls every frame.
     local cache = createPixelCache(activePicture)
 
+    -- CACHE CLEARING: periodically tear the cache down and rebuild it from
+    -- scratch so per-pixel connection/entry overhead can never accumulate
+    -- over a long run (the cause of the lag slowly returning). The rebuild
+    -- has no yields inside, so it completes atomically within its own slice
+    -- and can't corrupt the paint loop's view of the cache.
+    if CONFIG.cacheRebuildInterval and CONFIG.cacheRebuildInterval > 0 then
+        task.spawn(function()
+            while getgenv().PaintBotRunning do
+                task.wait(CONFIG.cacheRebuildInterval)
+                if not getgenv().PaintBotRunning then break end
+                cache.rebuild()
+                log("Cache rebuilt (cleared", cache.total, "pixels)")
+            end
+        end)
+    end
+
     local char = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
     local humanoid = char:FindFirstChildOfClass("Humanoid")
     local hrp = char:WaitForChild("HumanoidRootPart")
@@ -1264,6 +1316,9 @@ task.spawn(function()
         end
     end
 
-    log("Finished (or stopped).")
+    -- Release every cache connection/table so nothing lingers after stop.
+    cache.destroy()
+
+    log("Finished (or stopped). Cache released.")
     getgenv().PaintBotRunning = false
 end)
