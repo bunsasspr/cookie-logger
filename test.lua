@@ -380,37 +380,6 @@ local function computeSweepOrder(parts)
     return ordered
 end
 
--- Finds the closest point on the sweep line to the character, then aims
--- `lookaheadPixels` further down that line instead of at the very next
--- pixel. Pixels in between still get painted automatically as the walk
--- passes over them (that's how continuous mode already works) — aiming
--- ahead just means far fewer discrete "arrive, retarget" events, which
--- is where the actual time is lost, not the correction hitch itself.
-local function pickSweepTarget(parts, hrp)
-    local order = computeSweepOrder(parts)
-    if #order == 0 then return nil, 0 end
-
-    local nearestIdx, nearestDist = 1, math.huge
-    for i, p in ipairs(order) do
-        local d = distanceXZ(hrp.Position, p.Position)
-        if d < nearestDist then
-            nearestDist = d
-            nearestIdx = i
-        end
-    end
-
-    local aheadIdx = math.min(nearestIdx + (CONFIG.lookaheadPixels or 0), #order)
-    local target = order[aheadIdx]
-    return target, distanceXZ(hrp.Position, target.Position)
-end
-
-local function pickNextTarget(parts, hrp)
-    if CONFIG.pathMode == "sweep" then
-        return pickSweepTarget(parts, hrp)
-    end
-    return findNearestPixel(parts, hrp)
-end
-
 local function selectNumber(n)
     local okFire, errFire = pcall(function()
         SelectNumberEvent:FireServer(n)
@@ -998,7 +967,38 @@ local function paintNumberContinuous(n, activePicture, humanoid, hrp, expectedMo
     local rescanInterval = CONFIG.retargetInterval or 0.1
     local lastRescanTime = 0
 
+    -- A pixel counts as "consumable" if it's still unpainted and we
+    -- haven't given up on it this pass.
+    local function isConsumable(part)
+        return isPixelStillOpen(part) and not skipSet[part]
+    end
+
+    -- SWEEP MODE state: a fixed order for this pass, walked with a
+    -- forward-only cursor. Earlier this recomputed "which pixel is
+    -- nearest to me right now" from scratch every tick and jumped
+    -- lookaheadPixels past *that* -- which meant standing near the
+    -- midpoint between two pixels could flip the "nearest" answer from
+    -- tick to tick, sending the lookahead target to two different far
+    -- pixels in a row and yanking the bot back and forth between them.
+    -- A cursor that only ever moves forward can't flip like that.
+    local sweepOrder = nil
+    local sweepCursor = 1
+
+    local function rebuildSweepOrder()
+        local remaining = gatherRemainingForNumber(activePicture, n, skipSet)
+        sweepOrder = computeSweepOrder(remaining)
+        sweepCursor = 1
+        return #remaining > 0
+    end
+
     log("Continuous paint starting for N=" .. tostring(n))
+
+    if CONFIG.pathMode == "sweep" then
+        if not rebuildSweepOrder() then
+            log("Nothing to paint for N=" .. tostring(n))
+            return
+        end
+    end
 
     while getgenv().PaintBotRunning do
         -- Pause: freeze in place, reset stuck clock on resume
@@ -1024,28 +1024,20 @@ local function paintNumberContinuous(n, activePicture, humanoid, hrp, expectedMo
             return
         end
 
-        -- Cheap every-frame check: is the pixel we're currently walking to
-        -- still open? This is a single attribute read, not a list scan, so
-        -- doing it every frame costs nothing and means we react the instant
-        -- it flips rather than waiting on the next scan tick.
-        local targetLost = currentTarget ~= nil and not isPixelStillOpen(currentTarget)
-        local dueForRescan = (tick() - lastRescanTime) >= rescanInterval
+        if CONFIG.pathMode == "sweep" then
+            -- Advance the cursor past anything already painted or skipped.
+            -- This is amortized O(1) per tick over the whole pass (the
+            -- cursor only ever moves forward), not a fresh scan each time.
+            while sweepCursor <= #sweepOrder and not isConsumable(sweepOrder[sweepCursor]) do
+                sweepCursor = sweepCursor + 1
+            end
 
-        if currentTarget == nil or targetLost or dueForRescan then
-            lastRescanTime = tick()
-
-            -- Live scan of still-unpainted pixels for this number
-            local remaining = gatherRemainingForNumber(activePicture, n, skipSet)
-            if #remaining == 0 then
-                -- If we only emptied the list because of skips, clear skips once
-                -- and retry anything still actually unpainted before giving up.
+            if sweepCursor > #sweepOrder then
+                -- Exhausted this pass's order.
                 if next(skipSet) ~= nil then
-                    local anyLeft = gatherRemainingForNumber(activePicture, n, nil)
-                    if #anyLeft > 0 then
-                        skipSet = {}
-                        stuckRecoveries = 0
-                        remaining = anyLeft
-                    else
+                    skipSet = {}
+                    stuckRecoveries = 0
+                    if not rebuildSweepOrder() then
                         break
                     end
                 else
@@ -1053,29 +1045,81 @@ local function paintNumberContinuous(n, activePicture, humanoid, hrp, expectedMo
                 end
             end
 
-            local nearest, nearestDist = pickNextTarget(remaining, hrp)
-            if not nearest then
-                break
+            -- Aim lookaheadPixels ahead of the cursor, but never past the
+            -- last still-open pixel in that window -- walk back down to
+            -- the cursor itself if everything further ahead already got
+            -- painted (e.g. someone/something else touched them first).
+            local aheadIdx = math.min(sweepCursor + (CONFIG.lookaheadPixels or 0), #sweepOrder)
+            local target = nil
+            for i = aheadIdx, sweepCursor, -1 do
+                if isConsumable(sweepOrder[i]) then
+                    target = sweepOrder[i]
+                    break
+                end
             end
 
-            -- Only touch MoveTo when the target actually changes. Re-sending
-            -- MoveTo to the same point every tick is what caused the stutter,
-            -- so a same-target rescan now leaves movement completely alone.
-            if nearest ~= currentTarget then
-                currentTarget = nearest
+            if target and target ~= currentTarget then
+                currentTarget = target
                 stuckRecoveries = 0
                 lastCheckPos = hrp.Position
                 lastCheckTime = tick()
                 humanoid:MoveTo(currentTarget.Position)
 
-                -- Throttled log: at most once per ~1.5s, or when remaining count drops
                 local now = tick()
-                if now - lastLogTime >= 1.5 or #remaining ~= lastRemainingLog then
+                local remainingCount = #sweepOrder - sweepCursor + 1
+                if now - lastLogTime >= 1.5 or remainingCount ~= lastRemainingLog then
                     log(string.format(
                         "N=%s  target dist=%d  remaining=%d",
-                        tostring(n), math.floor(nearestDist), #remaining))
+                        tostring(n), math.floor(distanceXZ(hrp.Position, currentTarget.Position)), remainingCount))
                     lastLogTime = now
-                    lastRemainingLog = #remaining
+                    lastRemainingLog = remainingCount
+                end
+            end
+        else
+            -- LEGACY "nearest" mode: throttled full rescan + pure nearest-
+            -- neighbor targeting, same as the original continuous mode.
+            local targetLost = currentTarget ~= nil and not isPixelStillOpen(currentTarget)
+            local dueForRescan = (tick() - lastRescanTime) >= rescanInterval
+
+            if currentTarget == nil or targetLost or dueForRescan then
+                lastRescanTime = tick()
+
+                local remaining = gatherRemainingForNumber(activePicture, n, skipSet)
+                if #remaining == 0 then
+                    if next(skipSet) ~= nil then
+                        local anyLeft = gatherRemainingForNumber(activePicture, n, nil)
+                        if #anyLeft > 0 then
+                            skipSet = {}
+                            stuckRecoveries = 0
+                            remaining = anyLeft
+                        else
+                            break
+                        end
+                    else
+                        break
+                    end
+                end
+
+                local nearest, nearestDist = findNearestPixel(remaining, hrp)
+                if not nearest then
+                    break
+                end
+
+                if nearest ~= currentTarget then
+                    currentTarget = nearest
+                    stuckRecoveries = 0
+                    lastCheckPos = hrp.Position
+                    lastCheckTime = tick()
+                    humanoid:MoveTo(currentTarget.Position)
+
+                    local now = tick()
+                    if now - lastLogTime >= 1.5 or #remaining ~= lastRemainingLog then
+                        log(string.format(
+                            "N=%s  target dist=%d  remaining=%d",
+                            tostring(n), math.floor(nearestDist), #remaining))
+                        lastLogTime = now
+                        lastRemainingLog = #remaining
+                    end
                 end
             end
         end
