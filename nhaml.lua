@@ -1,4 +1,4 @@
--- Auto Buy + Use Potions + EquipBest + Return to Plot
+-- ===== Auto Buy + Use Potions + EquipBest + Return to Plot + Auto Sell =====
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
 local UIS = game:GetService("UserInputService")
@@ -10,13 +10,17 @@ local BuyDice = remotes:WaitForChild("BuyDice")
 local BuyPotion = remotes:WaitForChild("BuyPotion")
 local EquipBest = remotes:WaitForChild("EquipBest")
 local UsePotion = remotes:WaitForChild("UsePotion")
+local Dialogue = remotes:WaitForChild("Dialogue")
 
--- Shop positions
+-- Shop / sell positions
 local DICE_SHOP = CFrame.new(179.709259, 4.53835154, -144.103485, 0.909164608, -2.76407324e-08, -0.41643694, -1.1623088e-09, 1, -6.8911902e-08, 0.41643694, 6.31362909e-08, 0.909164608)
 local POTION_SHOP = CFrame.new(153.449585, 4.03330231, -138.129669, 0.814049244, 6.003647e-08, 0.580795884, -6.18439913e-08, 1, -1.66881726e-08, -0.580795884, -2.23337384e-08, 0.814049244)
+local SELL_CFRAME = CFrame.new(185.339233, 3.67208314, -117.684746, 0.0844980627, 5.13176062e-08, -0.996423662, -1.29543869e-08, 1, 5.04032442e-08, 0.996423662, 8.64908056e-09, 0.0844980627)
 
 local enabled = false
 local WAIT_AFTER_BUY = 120 -- 2 minutes
+local SELL_THRESHOLD = 30
+local SELL_CHECK_INTERVAL = 5 -- seconds
 
 -- Potion list (cleaner format)
 local potions = {
@@ -120,6 +124,34 @@ local function tryBuy()
     useAllPotions()
 end
 
+-- ===== Auto Sell =====
+local function getInventoryCount()
+    local counter = player.PlayerGui.Main.Canvas.Inventory.MainFrame:FindFirstChild("Counter")
+    if counter and counter:IsA("TextLabel") then
+        local current = counter.Text:match("(%d+)/")
+        return tonumber(current) or 0
+    end
+    return 0
+end
+
+local function sellInventory()
+    local hrp = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
+    hrp.CFrame = SELL_CFRAME
+    task.wait(0.4)
+    -- Preview first
+    pcall(function()
+        Dialogue:InvokeServer("SellNpc", 1, "I want to sell my inventory", "preview")
+    end)
+    task.wait(1.5) -- small delay between preview and commit
+    -- Then commit
+    pcall(function()
+        Dialogue:InvokeServer("SellNpc", 1, "I want to sell my inventory", "commit")
+    end)
+    print("Sold inventory")
+end
+
+-- ===== Main buy/potion/equip loop =====
 task.spawn(function()
     while true do
         if enabled then
@@ -140,12 +172,27 @@ task.spawn(function()
     end
 end)
 
+-- ===== Auto sell loop (runs independently, checks inventory count) =====
+task.spawn(function()
+    while true do
+        if enabled then
+            local count = getInventoryCount()
+            if count >= SELL_THRESHOLD then
+                print("Inventory is", count, "→ Selling...")
+                sellInventory()
+                task.wait(3)
+            end
+        end
+        task.wait(SELL_CHECK_INTERVAL)
+    end
+end)
+
 UIS.InputBegan:Connect(function(input, gpe)
     if gpe then return end
     if input.KeyCode == Enum.KeyCode.B then
         enabled = not enabled
-        print(enabled and "✅ Auto Buy: ON" or "❌ Auto Buy: OFF")
+        print(enabled and "✅ Auto Farm: ON" or "❌ Auto Farm: OFF")
     end
 end)
 
-print("Full script loaded. Press B to toggle Auto Buy")
+print("Full script loaded. Press B to toggle Auto Farm (buy + potions + equip + sell)")
