@@ -18,7 +18,8 @@ local POTION_SHOP = CFrame.new(153.449585, 4.03330231, -138.129669, 0.814049244,
 local SELL_CFRAME = CFrame.new(185.339233, 3.67208314, -117.684746, 0.0844980627, 5.13176062e-08, -0.996423662, -1.29543869e-08, 1, 5.04032442e-08, 0.996423662, 8.64908056e-09, 0.0844980627)
 
 local enabled = false
-local WAIT_AFTER_BUY = 120 -- 2 minutes
+local WAIT_AFTER_BUY = 120 -- fallback if the timer label can't be read
+local RESTOCK_BUFFER = 2 -- extra seconds after "0:00" to make sure server has actually restocked
 local SELL_THRESHOLD = 30
 local SELL_CHECK_INTERVAL = 5 -- seconds
 
@@ -56,6 +57,18 @@ local potions = {
     {Name = "Rainbow Godly", Arg = "Max"},
     {Name = "Rainbow Potion", Arg = "Max"},
 }
+
+local function getRestockSeconds()
+    local ok, label = pcall(function()
+        return player.PlayerGui.Main.Canvas.MapShops.Main.Holder.Timer.TextLabel
+    end)
+    if not ok or not label then return nil end
+
+    local min, sec = label.Text:match("(%d+):(%d+)")
+    if not min or not sec then return nil end
+
+    return tonumber(min) * 60 + tonumber(sec)
+end
 
 local function getHRP()
     local char = player.Character or player.CharacterAdded:Wait()
@@ -157,9 +170,19 @@ task.spawn(function()
         if enabled then
             tryBuy()
 
-            -- Wait 2 minutes while firing EquipBest every 5 seconds
+            -- Figure out how long until the shop actually restocks
+            local restockWait = getRestockSeconds()
+            if restockWait then
+                print(("Restocking in %ds — waiting for that instead of a fixed timer"):format(restockWait))
+                restockWait += RESTOCK_BUFFER
+            else
+                warn("Couldn't read restock timer, falling back to fixed wait")
+                restockWait = WAIT_AFTER_BUY
+            end
+
+            -- Wait until restock while firing EquipBest every 5 seconds
             local waited = 0
-            while waited < WAIT_AFTER_BUY and enabled do
+            while waited < restockWait and enabled do
                 pcall(function()
                     EquipBest:FireServer()
                 end)
