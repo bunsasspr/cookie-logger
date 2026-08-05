@@ -33,9 +33,9 @@ local potions = {
     {Name = "Godly Luck", Arg = "Max"},
 
     -- Egg Luck
-    {Name = "Egg Luck I", Arg = 1},
-    {Name = "Egg Luck II", Arg = 1},
-    {Name = "Godly Egg Luck", Arg = 1},
+    {Name = "Egg Luck I", Arg = "Max"},
+    {Name = "Egg Luck II", Arg = "Max"},
+    {Name = "Godly Egg Luck", Arg = "Max"},
 
     -- Mutation
     {Name = "Mutation I", Arg = "Max"},
