@@ -1,130 +1,114 @@
--- Console Logger → Discord Webhook
--- Place in ServerScriptService as a Script
+-- Console → Discord Webhook (Delta / Executor version)
+-- Execute this with Delta
 
-local HttpService = game:GetService("HttpService")
 local LogService = game:GetService("LogService")
-local RunService = game:GetService("RunService")
+local HttpService = game:GetService("HttpService")
 
--- ================== CONFIG ==================
-local WEBHOOK_URL = "https://discord.com/api/webhooks/1533668016800403456/SCZjSG5Ic509v5WAh1dDIzTkdO6LV08hIoEkLCitpwW9iwbwarr7ibOy0Lez59JZDO0T"  -- Replace this!
+-- ============== CONFIG ==============
+local WEBHOOK_URL = "https://discord.com/api/webhooks/1509743815777587220/W_sKhgd9-SAFexaJz5iJVcKt86Ddl23ouEkqakNRwUp324SwLfhPMfAaJV4r3ntLXQ4i"  -- ← put your webhook here
+local THROTTLE = 0.8          -- seconds between messages (prevent rate limit)
+local MAX_LEN = 1800
+-- ====================================
 
--- Optional proxy (recommended for live games). Leave empty "" to try direct.
--- Popular free options change often. Examples:
--- "https://discord-webhook.com/api/webhook/send"  (needs special payload)
--- Or self-host / use a public proxy like hooks.hyra.io style
-local PROXY_URL = ""  -- e.g. "https://your-proxy.example/api/webhooks/..."
+-- Get the executor's request function (Delta supports this)
+local request = http_request or request or (syn and syn.request) or (http and http.request)
 
-local SEND_EXISTING_HISTORY = true   -- Send previous logs when the script starts
-local MAX_MESSAGE_LENGTH = 1900      -- Discord limit is 2000
-local THROTTLE_SECONDS = 0.6         -- Minimum delay between webhook posts
-local ONLY_IN_STUDIO = false         -- Set true if you only want Studio debugging
--- ============================================
+if not request then
+    warn("[ConsoleLogger] No request function found. Your executor may not support HTTP.")
+    return
+end
 
-local lastSent = 0
 local queue = {}
+local sending = false
 
-local function getTypeName(messageType)
-	if messageType == Enum.MessageType.MessageError then
-		return "ERROR", 0xFF0000
-	elseif messageType == Enum.MessageType.MessageWarning then
-		return "WARN", 0xFFAA00
-	elseif messageType == Enum.MessageType.MessageInfo then
-		return "INFO", 0x00AAFF
-	else
-		return "PRINT", 0xAAAAAA
-	end
+local function getColor(msgType)
+    if msgType == Enum.MessageType.MessageError then
+        return 0xFF0000, "ERROR"
+    elseif msgType == Enum.MessageType.MessageWarning then
+        return 0xFFAA00, "WARN"
+    elseif msgType == Enum.MessageType.MessageInfo then
+        return 0x00AAFF, "INFO"
+    end
+    return 0xAAAAAA, "PRINT"
 end
 
-local function sendToDiscord(content, title, color)
-	if ONLY_IN_STUDIO and not RunService:IsStudio() then
-		return
-	end
+local function send(content, title, color)
+    local payload = {
+        username = "Roblox Console",
+        embeds = {{
+            title = title,
+            description = "```lua\n" .. content .. "\n```",
+            color = color,
+            timestamp = DateTime.now():ToIsoDate()
+        }}
+    }
 
-	local payload = {
-		username = "Roblox Console",
-		embeds = {{
-			title = title or "Console Message",
-			description = content,
-			color = color or 0x5865F2,
-			timestamp = DateTime.now():ToIsoDate(),
-			footer = {
-				text = "PlaceId: " .. tostring(game.PlaceId)
-			}
-		}}
-	}
+    local body = HttpService:JSONEncode(payload)
 
-	local body = HttpService:JSONEncode(payload)
-	local url = WEBHOOK_URL
+    local success, result = pcall(function()
+        return request({
+            Url = WEBHOOK_URL,
+            Method = "POST",
+            Headers = {
+                ["Content-Type"] = "application/json"
+            },
+            Body = body
+        })
+    end)
 
-	-- Simple proxy support (adjust payload if your proxy needs a different format)
-	if PROXY_URL ~= "" then
-		url = PROXY_URL
-		-- Many proxies expect the real webhook URL inside the body
-		-- Uncomment & adjust if needed:
-		-- body = HttpService:JSONEncode({
-		--     webhookUrl = WEBHOOK_URL,
-		--     payload = payload
-		-- })
-	end
-
-	local success, err = pcall(function()
-		HttpService:PostAsync(url, body, Enum.HttpContentType.ApplicationJson)
-	end)
-
-	if not success then
-		warn("[ConsoleLogger] Failed to send webhook:", err)
-	end
+    if not success then
+        warn("[ConsoleLogger] Request failed:", result)
+    end
 end
 
-local function processMessage(message, messageType)
-	if typeof(message) ~= "string" or message == "" then
-		return
-	end
-
-	-- Avoid infinite loop if the webhook itself errors
-	if string.find(message, "ConsoleLogger") or string.find(message, "HttpService") then
-		return
-	end
-
-	local typeName, color = getTypeName(messageType)
-	local truncated = message
-	if #truncated > MAX_MESSAGE_LENGTH then
-		truncated = string.sub(message, 1, MAX_MESSAGE_LENGTH - 20) .. "\n... (truncated)"
-	end
-
-	local now = os.clock()
-	if now - lastSent < THROTTLE_SECONDS then
-		table.insert(queue, {truncated, typeName, color})
-		return
-	end
-
-	lastSent = now
-	sendToDiscord("```lua\n" .. truncated .. "\n```", typeName, color)
-end
-
--- Flush queue periodically
+-- Separate sender loop (never yields inside MessageOut)
 task.spawn(function()
-	while true do
-		task.wait(THROTTLE_SECONDS)
-		if #queue > 0 then
-			local item = table.remove(queue, 1)
-			lastSent = os.clock()
-			sendToDiscord("```lua\n" .. item[1] .. "\n```", item[2], item[3])
-		end
-	end
+    while true do
+        if #queue > 0 and not sending then
+            sending = true
+            local item = table.remove(queue, 1)
+            send(item.content, item.title, item.color)
+            task.wait(THROTTLE)
+            sending = false
+        end
+        task.wait(0.1)
+    end
 end)
 
--- Listen for new messages
+-- Safe listener (does NOT yield)
 LogService.MessageOut:Connect(function(message, messageType)
-	processMessage(message, messageType)
+    if typeof(message) ~= "string" or message == "" then return end
+    if string.find(message, "ConsoleLogger") then return end  -- prevent loop
+
+    local color, title = getColor(messageType)
+    local text = message
+    if #text > MAX_LEN then
+        text = string.sub(text, 1, MAX_LEN) .. "\n... (truncated)"
+    end
+
+    table.insert(queue, {
+        content = text,
+        title = title,
+        color = color
+    })
 end)
 
--- Optionally send existing history on start
-if SEND_EXISTING_HISTORY then
-	local history = LogService:GetLogHistory()
-	for _, entry in ipairs(history) do
-		processMessage(entry.message, entry.messageType)
-	end
-end
+-- Also send existing history
+task.spawn(function()
+    task.wait(1)
+    local history = LogService:GetLogHistory()
+    for _, entry in ipairs(history) do
+        local color, title = getColor(entry.messageType)
+        local text = entry.message or ""
+        if #text > MAX_LEN then
+            text = string.sub(text, 1, MAX_LEN) .. "\n... (truncated)"
+        end
+        table.insert(queue, {
+            content = text,
+            title = title,
+            color = color
+        })
+    end
+end)
 
-print("[ConsoleLogger] Started – sending console output to Discord webhook")
+print("[ConsoleLogger] Running on Delta – console messages will be sent to Discord")
