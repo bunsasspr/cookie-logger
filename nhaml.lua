@@ -1,4 +1,4 @@
--- Auto Buy + Return to Plot + EquipBest
+-- Auto Buy + Use Potions + EquipBest + Return to Plot
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
 local UIS = game:GetService("UserInputService")
@@ -9,12 +9,49 @@ local remotes = RS:WaitForChild("Remotes")
 local BuyDice = remotes:WaitForChild("BuyDice")
 local BuyPotion = remotes:WaitForChild("BuyPotion")
 local EquipBest = remotes:WaitForChild("EquipBest")
+local UsePotion = remotes:WaitForChild("UsePotion")
 
+-- Shop positions
 local DICE_SHOP = CFrame.new(179.709259, 4.53835154, -144.103485, 0.909164608, -2.76407324e-08, -0.41643694, -1.1623088e-09, 1, -6.8911902e-08, 0.41643694, 6.31362909e-08, 0.909164608)
 local POTION_SHOP = CFrame.new(153.449585, 4.03330231, -138.129669, 0.814049244, 6.003647e-08, 0.580795884, -6.18439913e-08, 1, -1.66881726e-08, -0.580795884, -2.23337384e-08, 0.814049244)
 
 local enabled = false
 local WAIT_AFTER_BUY = 120 -- 2 minutes
+
+-- Potion list (cleaner format)
+local potions = {
+    -- Cash
+    {Name = "Cash I", Arg = "Max"},
+    {Name = "Cash II", Arg = "Max"},
+    {Name = "Cash III", Arg = "Max"},
+    {Name = "Godly Cash", Arg = "Max"},
+
+    -- Luck
+    {Name = "Luck I", Arg = "Max"},
+    {Name = "Luck II", Arg = "Max"},
+    {Name = "Luck III", Arg = "Max"},
+    {Name = "Godly Luck", Arg = "Max"},
+
+    -- Egg Luck
+    {Name = "Egg Luck I", Arg = 1},
+    {Name = "Egg Luck II", Arg = 1},
+    {Name = "Godly Egg Luck", Arg = 1},
+
+    -- Mutation
+    {Name = "Mutation I", Arg = "Max"},
+    {Name = "Mutation II", Arg = "Max"},
+    {Name = "Mutation III", Arg = "Max"},
+    {Name = "Godly Mutation", Arg = "Max"},
+
+    -- Dice Consumption
+    {Name = "Dice Consumption I", Arg = "Max"},
+    {Name = "Dice Consumption II", Arg = "Max"},
+    {Name = "Godly Dice Consumption", Arg = "Max"},
+
+    -- Others
+    {Name = "Rainbow Godly", Arg = "Max"},
+    {Name = "Rainbow Potion", Arg = "Max"},
+}
 
 local function getHRP()
     local char = player.Character or player.CharacterAdded:Wait()
@@ -40,6 +77,16 @@ local function getMyPlotCFrame()
     return nil
 end
 
+local function useAllPotions()
+    for _, potion in ipairs(potions) do
+        pcall(function()
+            UsePotion:FireServer("Use", potion.Name, potion.Arg)
+        end)
+        task.wait(0.12)
+    end
+    print("Used all potions")
+end
+
 local function tryBuy()
     local hrp = getHRP()
 
@@ -63,10 +110,14 @@ local function tryBuy()
     local plotCF = getMyPlotCFrame()
     if plotCF then
         hrp.CFrame = plotCF
-        print("Returned to plot. Waiting 2 minutes + EquipBest...")
+        print("Returned to plot")
     else
         warn("Could not find your plot!")
     end
+
+    -- Use all potions after returning
+    task.wait(0.5)
+    useAllPotions()
 end
 
 task.spawn(function()
@@ -97,4 +148,4 @@ UIS.InputBegan:Connect(function(input, gpe)
     end
 end)
 
-print("Script loaded. Press B to toggle Auto Buy")
+print("Full script loaded. Press B to toggle Auto Buy")
