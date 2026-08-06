@@ -1,4 +1,4 @@
--- ===== Auto Dice + Auto Potion (separate restock timers) + EquipBest + Auto Sell + Auto Rebirth =====
+-- ===== Auto Dice + Auto Potion + EquipBest + Auto Sell + Auto Rebirth + FoodCart + Merchant =====
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
 local UIS = game:GetService("UserInputService")
@@ -12,6 +12,8 @@ local EquipBest = remotes:WaitForChild("EquipBest")
 local UsePotion = remotes:WaitForChild("UsePotion")
 local Dialogue = remotes:WaitForChild("Dialogue")
 local RebirthRemote = remotes:WaitForChild("Rebirth")
+local FoodCartRemote = remotes:WaitForChild("FoodCart")
+local MerchantRemote = remotes:WaitForChild("Merchant")
 
 -- Shop / sell positions
 local DICE_SHOP = CFrame.new(179.709259, 4.53835154, -144.103485, 0.909164608, -2.76407324e-08, -0.41643694, -1.1623088e-09, 1, -6.8911902e-08, 0.41643694, 6.31362909e-08, 0.909164608)
@@ -26,6 +28,15 @@ local SELL_CHECK_INTERVAL = 5 -- seconds
 local EQUIP_INTERVAL = 5 -- seconds
 local REBIRTH_CHECK_INTERVAL = 2 -- seconds
 local REBIRTH_COOLDOWN = 5 -- seconds, let GUI/state settle after rebirthing
+local NPC_CHECK_INTERVAL = 3 -- seconds, for FoodCart/Merchant existence polling
+
+local FOODCART_ITEMS = {
+    "Apple",
+    "Potato",
+    "Loaf",
+    "Fish",
+    "Steak",
+}
 
 -- Potion list (cleaner format)
 local potions = {
@@ -63,8 +74,8 @@ local potions = {
 }
 
 -- ===== Movement lock =====
--- Dice/potion/sell/rebirth all teleport the character. Only one action may move
--- the player at a time, or loops will fight over CFrame and break each other.
+-- Dice/potion/sell/rebirth/foodcart/merchant all teleport the character.
+-- Only one action may move the player at a time, or loops will fight over CFrame.
 local actionLock = false
 local function withLock(fn)
     while actionLock do
@@ -139,9 +150,9 @@ local function buyDice()
     withLock(function()
         local hrp = getHRP()
         hrp.CFrame = DICE_SHOP
-        task.wait(1.0)
+        task.wait(0.35)
         BuyDice:FireServer("BuyBestAvailable")
-        task.wait(1.0)
+        task.wait(0.3)
         returnToPlot(hrp)
         print("Bought dice")
     end)
@@ -177,9 +188,9 @@ local function buyPotion()
     withLock(function()
         local hrp = getHRP()
         hrp.CFrame = POTION_SHOP
-        task.wait(1.0)
+        task.wait(0.35)
         BuyPotion:FireServer("BuyBestAvailable")
-        task.wait(1.0)
+        task.wait(0.3)
         returnToPlot(hrp)
         task.wait(0.5)
         useAllPotions()
@@ -239,10 +250,8 @@ local function sellInventory()
         local hrp = getHRP()
         hrp.CFrame = SELL_CFRAME
         task.wait(0.4)
-        -- Preview first
         Dialogue:InvokeServer("SellNpc", 1, "I want to sell my inventory", "preview")
-        task.wait(1.5) -- small delay between preview and commit
-        -- Then commit
+        task.wait(1.5)
         Dialogue:InvokeServer("SellNpc", 1, "I want to sell my inventory", "commit")
         print("Sold inventory")
         task.wait(0.3)
@@ -296,6 +305,158 @@ task.spawn(function()
     end
 end)
 
+-- ===== Auto FoodCart =====
+local function getFoodCartModel()
+    local mapShop = workspace.Map:FindFirstChild("MapShop")
+    if not mapShop then return nil end
+    return mapShop:FindFirstChild("FoodCart")
+end
+
+local function buyFoodCart()
+    withLock(function()
+        local cart = getFoodCartModel()
+        if not cart then
+            warn("FoodCart not found (probably despawned)")
+            return
+        end
+        local part = cart.PrimaryPart or cart:FindFirstChildWhichIsA("BasePart", true)
+        if not part then
+            warn("No BasePart on FoodCart model")
+            return
+        end
+
+        local hrp = getHRP()
+        hrp.CFrame = part.CFrame
+        task.wait(0.5)
+
+        for _, item in ipairs(FOODCART_ITEMS) do
+            pcall(function()
+                FoodCartRemote:FireServer("BuyAll", item)
+            end)
+            task.wait(0.2)
+        end
+
+        print("Bought all FoodCart items")
+        task.wait(0.3)
+        returnToPlot(hrp)
+    end)
+end
+
+local lastFoodCart = nil
+task.spawn(function()
+    while true do
+        if enabled then
+            local cart = getFoodCartModel()
+            if cart and cart ~= lastFoodCart then
+                lastFoodCart = cart
+                buyFoodCart()
+            elseif not cart then
+                lastFoodCart = nil
+            end
+        end
+        task.wait(NPC_CHECK_INTERVAL)
+    end
+end)
+
+-- ===== Auto Merchant =====
+local function getMerchantModel()
+    local mapShop = workspace.Map:FindFirstChild("MapShop")
+    if not mapShop then return nil end
+    return mapShop:FindFirstChild("Merchant")
+end
+
+local function findProximityPrompt(model)
+    for _, inst in ipairs(model:GetDescendants()) do
+        if inst:IsA("ProximityPrompt") then
+            return inst
+        end
+    end
+    return nil
+end
+
+local function buyAllFromMerchant()
+    withLock(function()
+        local model = getMerchantModel()
+        if not model then
+            warn("Merchant not found (probably despawned)")
+            return
+        end
+
+        local part = model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart", true)
+        if not part then
+            warn("No BasePart on Merchant model")
+            return
+        end
+
+        local hrp = getHRP()
+        hrp.CFrame = part.CFrame
+        task.wait(0.3)
+
+        local prompt = findProximityPrompt(model)
+        if prompt then
+            pcall(function()
+                fireproximityprompt(prompt)
+            end)
+        end
+        task.wait(0.5) -- let the GUI populate
+
+        local holder = player.PlayerGui.Main.Canvas.Merchant.Main.Holder
+        local children = holder:GetChildren()
+        table.sort(children, function(a, b)
+            local aOrder = (pcall(function() return a.LayoutOrder end)) and a.LayoutOrder or 0
+            local bOrder = (pcall(function() return b.LayoutOrder end)) and b.LayoutOrder or 0
+            return aOrder < bOrder
+        end)
+
+        local currentCategory = nil
+        local bought = 0
+
+        for _, entry in ipairs(children) do
+            local nameLabel = entry:FindFirstChild("NameLabel")
+            if entry.Name == "TextPlaceHolder" and nameLabel then
+                currentCategory = nameLabel.Text
+            elseif entry.Name:find("Template") then
+                -- skip clone-source templates, never real stock
+            elseif entry:IsA("Frame") or entry:IsA("ImageButton") or entry:IsA("TextButton") or entry:IsA("CanvasGroup") then
+                local itemNameLabel = entry:FindFirstChild("DiceName") or entry:FindFirstChild("FoodName")
+                local stockLabel = entry:FindFirstChild("Stock")
+
+                if itemNameLabel and currentCategory then
+                    local stockText = stockLabel and stockLabel.Text or ""
+                    if stockText ~= "Sold out" and stockText ~= "" then
+                        local itemName = itemNameLabel.Text
+                        pcall(function()
+                            MerchantRemote:FireServer("BuyAll", currentCategory, itemName)
+                        end)
+                        print(("Bought %s (%s)"):format(itemName, currentCategory))
+                        bought += 1
+                        task.wait(0.2)
+                    end
+                end
+            end
+        end
+
+        print(("Done — bought %d item(s) from Merchant"):format(bought))
+        returnToPlot(hrp)
+    end)
+end
+
+local lastMerchant = nil
+task.spawn(function()
+    while true do
+        if enabled then
+            local merchant = getMerchantModel()
+            if merchant and merchant ~= lastMerchant then
+                lastMerchant = merchant
+                buyAllFromMerchant()
+            elseif not merchant then
+                lastMerchant = nil
+            end
+        end
+        task.wait(NPC_CHECK_INTERVAL)
+    end
+end)
+
 UIS.InputBegan:Connect(function(input, gpe)
     if gpe then return end
     if input.KeyCode == Enum.KeyCode.B then
@@ -304,4 +465,4 @@ UIS.InputBegan:Connect(function(input, gpe)
     end
 end)
 
-print("Full script loaded. Press B to toggle Auto Farm (dice + potions + equip + sell + rebirth)")
+print("Full script loaded. Press B to toggle Auto Farm (dice + potions + equip + sell + rebirth + foodcart + merchant)")
