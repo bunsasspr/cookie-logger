@@ -1,4 +1,4 @@
--- ===== Auto Dice + Auto Potion + EquipBest + Auto Sell + Auto Rebirth + FoodCart + Merchant =====
+-- ===== Auto Dice + Auto Potion + Auto Sell + Auto Rebirth + FoodCart + Merchant + Egg Spam =====
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
 local UIS = game:GetService("UserInputService")
@@ -14,21 +14,29 @@ local Dialogue = remotes:WaitForChild("Dialogue")
 local RebirthRemote = remotes:WaitForChild("Rebirth")
 local FoodCartRemote = remotes:WaitForChild("FoodCart")
 local MerchantRemote = remotes:WaitForChild("Merchant")
+local EggInfo = remotes:WaitForChild("EggInfo") -- RemoteFunction
 
--- Shop / sell positions
+-- Shop / sell / egg positions
 local DICE_SHOP = CFrame.new(179.709259, 4.53835154, -144.103485, 0.909164608, -2.76407324e-08, -0.41643694, -1.1623088e-09, 1, -6.8911902e-08, 0.41643694, 6.31362909e-08, 0.909164608)
 local POTION_SHOP = CFrame.new(153.449585, 4.03330231, -138.129669, 0.814049244, 6.003647e-08, 0.580795884, -6.18439913e-08, 1, -1.66881726e-08, -0.580795884, -2.23337384e-08, 0.814049244)
 local SELL_CFRAME = CFrame.new(185.339233, 3.67208314, -117.684746, 0.0844980627, 5.13176062e-08, -0.996423662, -1.29543869e-08, 1, 5.04032442e-08, 0.996423662, 8.64908056e-09, 0.0844980627)
+local EGG_SPOT = CFrame.new(-198.375092, 3.67208314, 168.48439, -0.455900133, 5.02545072e-09, 0.890030921, 1.24778738e-08, 1, 7.45158324e-10, -0.890030921, 1.14454117e-08, -0.455900133)
 
 local enabled = false
-local WAIT_AFTER_BUY = 120 -- fallback if a timer label can't be read
+local WAIT_AFTER_BUY = 120 -- fallback if a restock timer label can't be read
 local RESTOCK_BUFFER = 2 -- extra seconds after "0:00" to make sure server has actually restocked
 local SELL_THRESHOLD = 30
 local SELL_CHECK_INTERVAL = 5 -- seconds
-local EQUIP_INTERVAL = 5 -- seconds
+local PLOT_EQUIP_INTERVAL = 300 -- 5 minutes
 local REBIRTH_CHECK_INTERVAL = 2 -- seconds
 local REBIRTH_COOLDOWN = 5 -- seconds, let GUI/state settle after rebirthing
 local NPC_CHECK_INTERVAL = 3 -- seconds, for FoodCart/Merchant existence polling
+local WALK_TIMEOUT = 15 -- seconds, max time to wait for a walk to finish before giving up
+
+-- Egg spam settings (not specified exactly how long/how many — adjust as needed)
+local EGG_SPAM_SECONDS = 10
+local EGG_SPAM_INTERVAL = 0.15
+local EGG_BUY_ARGS = {"Buy", "Frozen", 3}
 
 local FOODCART_ITEMS = {
     "Apple",
@@ -40,42 +48,31 @@ local FOODCART_ITEMS = {
 
 -- Potion list (cleaner format)
 local potions = {
-    -- Cash
     {Name = "Cash I", Arg = "Max"},
     {Name = "Cash II", Arg = "Max"},
     {Name = "Cash III", Arg = "Max"},
     {Name = "Godly Cash", Arg = "Max"},
-
-    -- Luck
     {Name = "Luck I", Arg = "Max"},
     {Name = "Luck II", Arg = "Max"},
     {Name = "Luck III", Arg = "Max"},
     {Name = "Godly Luck", Arg = "Max"},
-
-    -- Egg Luck
     {Name = "Egg Luck I", Arg = "Max"},
     {Name = "Egg Luck II", Arg = "Max"},
     {Name = "Godly Egg Luck", Arg = "Max"},
-
-    -- Mutation
     {Name = "Mutation I", Arg = "Max"},
     {Name = "Mutation II", Arg = "Max"},
     {Name = "Mutation III", Arg = "Max"},
     {Name = "Godly Mutation", Arg = "Max"},
-
-    -- Dice Consumption
     {Name = "Dice Consumption I", Arg = "Max"},
     {Name = "Dice Consumption II", Arg = "Max"},
     {Name = "Godly Dice Consumption", Arg = "Max"},
-
-    -- Others
     {Name = "Rainbow Godly", Arg = "Max"},
     {Name = "Rainbow Potion", Arg = "Max"},
 }
 
 -- ===== Movement lock =====
--- Dice/potion/sell/rebirth/foodcart/merchant all teleport the character.
--- Only one action may move the player at a time, or loops will fight over CFrame.
+-- Every action below moves the character. Only one may move it at a time,
+-- or loops will fight over pathing and break each other.
 local actionLock = false
 local function withLock(fn)
     while actionLock do
@@ -92,6 +89,39 @@ end
 local function getHRP()
     local char = player.Character or player.CharacterAdded:Wait()
     return char:WaitForChild("HumanoidRootPart")
+end
+
+local function getHumanoid()
+    local char = player.Character or player.CharacterAdded:Wait()
+    return char:WaitForChild("Humanoid")
+end
+
+-- Walks to a target CFrame instead of teleporting. Falls back to an instant
+-- teleport only if no Humanoid can be found at all.
+local function walkTo(cframe)
+    local humanoid = getHumanoid()
+    if not humanoid then
+        getHRP().CFrame = cframe
+        return
+    end
+
+    local finished = false
+    local conn
+    conn = humanoid.MoveToFinished:Connect(function()
+        finished = true
+    end)
+
+    humanoid:MoveTo(cframe.Position)
+
+    local elapsed = 0
+    while not finished and elapsed < WALK_TIMEOUT do
+        task.wait(0.25)
+        elapsed += 0.25
+    end
+
+    if conn then
+        conn:Disconnect()
+    end
 end
 
 local function getMyPlotCFrame()
@@ -111,15 +141,6 @@ local function getMyPlotCFrame()
         end
     end
     return nil
-end
-
-local function returnToPlot(hrp)
-    local plotCF = getMyPlotCFrame()
-    if plotCF then
-        hrp.CFrame = plotCF
-    else
-        warn("Could not find your plot!")
-    end
 end
 
 -- shopName: "Main" (dice shop) or "Potion"
@@ -145,16 +166,33 @@ local function useAllPotions()
     print("Used all potions")
 end
 
+-- Walks to the egg spot and spams the frozen egg buy for EGG_SPAM_SECONDS.
+-- Replaces the old "return to plot" step after buying dice/potion/foodcart/merchant.
+local function spamFrozenEggs()
+    walkTo(EGG_SPOT)
+    task.wait(0.3)
+
+    local elapsed = 0
+    while elapsed < EGG_SPAM_SECONDS do
+        pcall(function()
+            EggInfo:InvokeServer(unpack(EGG_BUY_ARGS))
+        end)
+        task.wait(EGG_SPAM_INTERVAL)
+        elapsed += EGG_SPAM_INTERVAL
+    end
+
+    print("Done spamming frozen eggs")
+end
+
 -- ===== Auto Dice =====
 local function buyDice()
     withLock(function()
-        local hrp = getHRP()
-        hrp.CFrame = DICE_SHOP
+        walkTo(DICE_SHOP)
         task.wait(0.35)
         BuyDice:FireServer("BuyBestAvailable")
         task.wait(0.3)
-        returnToPlot(hrp)
         print("Bought dice")
+        spamFrozenEggs()
     end)
 end
 
@@ -186,15 +224,13 @@ end)
 -- ===== Auto Potion =====
 local function buyPotion()
     withLock(function()
-        local hrp = getHRP()
-        hrp.CFrame = POTION_SHOP
+        walkTo(POTION_SHOP)
         task.wait(0.35)
         BuyPotion:FireServer("BuyBestAvailable")
         task.wait(0.3)
-        returnToPlot(hrp)
-        task.wait(0.5)
         useAllPotions()
         print("Bought potion")
+        spamFrozenEggs()
     end)
 end
 
@@ -223,15 +259,33 @@ task.spawn(function()
     end
 end)
 
--- ===== Auto Equip (independent, no movement needed) =====
+-- ===== Periodic plot visit + equip (every 5 minutes, replaces the old 5s loop) =====
 task.spawn(function()
     while true do
         if enabled then
-            pcall(function()
-                EquipBest:FireServer()
+            withLock(function()
+                local plotCF = getMyPlotCFrame()
+                if plotCF then
+                    walkTo(plotCF)
+                    task.wait(0.3)
+                    pcall(function()
+                        EquipBest:FireServer()
+                    end)
+                    print("[PlotEquip] Walked to plot and equipped best")
+                else
+                    warn("Could not find your plot!")
+                end
             end)
         end
-        task.wait(EQUIP_INTERVAL)
+
+        local waited = 0
+        while waited < PLOT_EQUIP_INTERVAL and enabled do
+            task.wait(1)
+            waited += 1
+        end
+        if not enabled then
+            task.wait(1)
+        end
     end
 end)
 
@@ -247,15 +301,23 @@ end
 
 local function sellInventory()
     withLock(function()
-        local hrp = getHRP()
-        hrp.CFrame = SELL_CFRAME
+        -- visit plot and equip best once before selling, per request
+        local plotCF = getMyPlotCFrame()
+        if plotCF then
+            walkTo(plotCF)
+            task.wait(0.3)
+            pcall(function()
+                EquipBest:FireServer()
+            end)
+            print("[Sell] Equipped best before selling")
+        end
+
+        walkTo(SELL_CFRAME)
         task.wait(0.4)
         Dialogue:InvokeServer("SellNpc", 1, "I want to sell my inventory", "preview")
         task.wait(1.5)
         Dialogue:InvokeServer("SellNpc", 1, "I want to sell my inventory", "commit")
         print("Sold inventory")
-        task.wait(0.3)
-        returnToPlot(hrp)
     end)
 end
 
@@ -325,8 +387,7 @@ local function buyFoodCart()
             return
         end
 
-        local hrp = getHRP()
-        hrp.CFrame = part.CFrame
+        walkTo(part.CFrame)
         task.wait(0.5)
 
         for _, item in ipairs(FOODCART_ITEMS) do
@@ -337,8 +398,7 @@ local function buyFoodCart()
         end
 
         print("Bought all FoodCart items")
-        task.wait(0.3)
-        returnToPlot(hrp)
+        spamFrozenEggs()
     end)
 end
 
@@ -388,8 +448,7 @@ local function buyAllFromMerchant()
             return
         end
 
-        local hrp = getHRP()
-        hrp.CFrame = part.CFrame
+        walkTo(part.CFrame)
         task.wait(0.3)
 
         local prompt = findProximityPrompt(model)
@@ -437,7 +496,7 @@ local function buyAllFromMerchant()
         end
 
         print(("Done — bought %d item(s) from Merchant"):format(bought))
-        returnToPlot(hrp)
+        spamFrozenEggs()
     end)
 end
 
@@ -465,4 +524,12 @@ UIS.InputBegan:Connect(function(input, gpe)
     end
 end)
 
-print("Full script loaded. Press B to toggle Auto Farm (dice + potions + equip + sell + rebirth + foodcart + merchant)")
+-- ===== Anti AFK =====
+local VirtualUser = game:GetService("VirtualUser")
+Players.LocalPlayer.Idled:Connect(function()
+    VirtualUser:CaptureController()
+    VirtualUser:ClickButton2(Vector2.new())
+    print("[AntiAFK] Idle detected, sent input to avoid kick")
+end)
+
+print("Full script loaded. Press B to toggle Auto Farm (dice + potions + sell + rebirth + foodcart + merchant + egg spam)")
