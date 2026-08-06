@@ -61,23 +61,37 @@ local function buyAllFromMerchant()
     if not openMerchantWindow() then return end
 
     local holder = player.PlayerGui.Main.Canvas.Merchant.Main.Holder
+
+    -- collect + sort by LayoutOrder so category headers and their items
+    -- are processed in true visual order, not raw insertion order
+    local children = holder:GetChildren()
+    table.sort(children, function(a, b)
+        local aOrder = pcall(function() return a.LayoutOrder end) and a.LayoutOrder or 0
+        local bOrder = pcall(function() return b.LayoutOrder end) and b.LayoutOrder or 0
+        return aOrder < bOrder
+    end)
+
     local currentCategory = nil
     local bought = 0
 
-    for _, entry in ipairs(holder:GetChildren()) do
+    for _, entry in ipairs(children) do
         -- category headers
         local nameLabel = entry:FindFirstChild("NameLabel")
         if entry.Name == "TextPlaceHolder" and nameLabel then
             currentCategory = nameLabel.Text
 
-        -- item entries (skip layout objects)
-        elseif entry:IsA("Frame") or entry:IsA("ImageButton") or entry:IsA("TextButton") then
+        -- skip clone-source templates entirely — never real stock
+        elseif entry.Name:find("Template") then
+            -- ignore
+
+        -- real item entries (skip layout objects)
+        elseif entry:IsA("Frame") or entry:IsA("ImageButton") or entry:IsA("TextButton") or entry:IsA("CanvasGroup") then
             local itemNameLabel = entry:FindFirstChild("DiceName") or entry:FindFirstChild("FoodName")
             local stockLabel = entry:FindFirstChild("Stock")
 
             if itemNameLabel and currentCategory then
                 local stockText = stockLabel and stockLabel.Text or ""
-                if stockText ~= "Sold out" then
+                if stockText ~= "Sold out" and stockText ~= "" then
                     local itemName = itemNameLabel.Text
                     pcall(function()
                         MerchantRemote:FireServer("BuyAll", currentCategory, itemName)
