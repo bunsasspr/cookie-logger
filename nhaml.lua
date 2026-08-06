@@ -1,4 +1,4 @@
--- ===== Auto Dice + Auto Potion + EquipBest + Auto Sell + Auto Rebirth + FoodCart + Merchant =====
+-- ===== Auto Dice + Auto Potion + EquipBest + Auto Sell + Auto Rebirth + FoodCart + Merchant + Auto Eggs =====
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
 local UIS = game:GetService("UserInputService")
@@ -14,21 +14,27 @@ local Dialogue = remotes:WaitForChild("Dialogue")
 local RebirthRemote = remotes:WaitForChild("Rebirth")
 local FoodCartRemote = remotes:WaitForChild("FoodCart")
 local MerchantRemote = remotes:WaitForChild("Merchant")
+local EggInfo = remotes:WaitForChild("EggInfo")
 
--- Shop / sell positions
+-- Shop / sell / egg positions
 local DICE_SHOP = CFrame.new(179.709259, 4.53835154, -144.103485, 0.909164608, -2.76407324e-08, -0.41643694, -1.1623088e-09, 1, -6.8911902e-08, 0.41643694, 6.31362909e-08, 0.909164608)
 local POTION_SHOP = CFrame.new(153.449585, 4.03330231, -138.129669, 0.814049244, 6.003647e-08, 0.580795884, -6.18439913e-08, 1, -1.66881726e-08, -0.580795884, -2.23337384e-08, 0.814049244)
 local SELL_CFRAME = CFrame.new(185.339233, 3.67208314, -117.684746, 0.0844980627, 5.13176062e-08, -0.996423662, -1.29543869e-08, 1, 5.04032442e-08, 0.996423662, 8.64908056e-09, 0.0844980627)
+local EGG_CFRAME = CFrame.new(-198.375092, 3.67208314, 168.48439, -0.455900133, 5.02545072e-09, 0.890030921, 1.24778738e-08, 1, 7.45158324e-10, -0.890030921, 1.14454117e-08, -0.455900133)
 
 local enabled = false
 local WAIT_AFTER_BUY = 120 -- fallback if a timer label can't be read
 local RESTOCK_BUFFER = 2 -- extra seconds after "0:00" to make sure server has actually restocked
 local SELL_THRESHOLD = 30
 local SELL_CHECK_INTERVAL = 5 -- seconds
-local EQUIP_INTERVAL = 5 -- seconds
+local EQUIP_INTERVAL = 300 -- 5 minutes between equip sessions
+local EQUIP_SESSION_DURATION = 20 -- stay at plot for this many seconds
+local EQUIP_SPAM_DELAY = 5 -- equip best every N seconds while at plot
+local EQUIP_BEFORE_SELL_COUNT = 3 -- how many times to equip before selling
 local REBIRTH_CHECK_INTERVAL = 2 -- seconds
 local REBIRTH_COOLDOWN = 5 -- seconds, let GUI/state settle after rebirthing
 local NPC_CHECK_INTERVAL = 3 -- seconds, for FoodCart/Merchant existence polling
+local EGG_SPAM_DELAY = 0.15 -- delay between egg opens
 
 local FOODCART_ITEMS = {
     "Apple",
@@ -74,7 +80,7 @@ local potions = {
 }
 
 -- ===== Movement lock =====
--- Dice/potion/sell/rebirth/foodcart/merchant all teleport the character.
+-- Dice/potion/sell/rebirth/foodcart/merchant/equip all teleport the character.
 -- Only one action may move the player at a time, or loops will fight over CFrame.
 local actionLock = false
 local function withLock(fn)
@@ -113,6 +119,10 @@ local function getMyPlotCFrame()
     return nil
 end
 
+local function goToEggs(hrp)
+    hrp.CFrame = EGG_CFRAME
+end
+
 local function returnToPlot(hrp)
     local plotCF = getMyPlotCFrame()
     if plotCF then
@@ -145,6 +155,18 @@ local function useAllPotions()
     print("Used all potions")
 end
 
+-- ===== Auto Eggs (spam while idle at egg location) =====
+task.spawn(function()
+    while true do
+        if enabled and not actionLock then
+            pcall(function()
+                EggInfo:InvokeServer("Buy", "Frozen", 3)
+            end)
+        end
+        task.wait(EGG_SPAM_DELAY)
+    end
+end)
+
 -- ===== Auto Dice =====
 local function buyDice()
     withLock(function()
@@ -153,8 +175,8 @@ local function buyDice()
         task.wait(0.35)
         BuyDice:FireServer("BuyBestAvailable")
         task.wait(0.3)
-        returnToPlot(hrp)
-        print("Bought dice")
+        goToEggs(hrp)
+        print("Bought dice → eggs")
     end)
 end
 
@@ -191,10 +213,10 @@ local function buyPotion()
         task.wait(0.35)
         BuyPotion:FireServer("BuyBestAvailable")
         task.wait(0.3)
-        returnToPlot(hrp)
+        goToEggs(hrp)
         task.wait(0.5)
         useAllPotions()
-        print("Bought potion")
+        print("Bought potion → eggs")
     end)
 end
 
@@ -223,12 +245,34 @@ task.spawn(function()
     end
 end)
 
--- ===== Auto Equip (independent, no movement needed) =====
+-- Spam EquipBest at plot for a duration (every EQUIP_SPAM_DELAY seconds)
+local function equipAtPlot(duration)
+    local hrp = getHRP()
+    returnToPlot(hrp)
+    task.wait(0.4)
+
+    local elapsed = 0
+    local count = 0
+    while elapsed < duration and enabled do
+        pcall(function()
+            EquipBest:FireServer()
+        end)
+        count += 1
+        print(("Equipped best (%d)"):format(count))
+        task.wait(EQUIP_SPAM_DELAY)
+        elapsed += EQUIP_SPAM_DELAY
+    end
+end
+
+-- ===== Auto Equip (every 5 min — stay at plot 20s, equip every 5s, then back to eggs) =====
 task.spawn(function()
     while true do
         if enabled then
-            pcall(function()
-                EquipBest:FireServer()
+            withLock(function()
+                equipAtPlot(EQUIP_SESSION_DURATION)
+                local hrp = getHRP()
+                goToEggs(hrp)
+                print("Equip session done → eggs")
             end)
         end
         task.wait(EQUIP_INTERVAL)
@@ -248,14 +292,27 @@ end
 local function sellInventory()
     withLock(function()
         local hrp = getHRP()
+
+        -- Equip a few times at plot first
+        returnToPlot(hrp)
+        task.wait(0.4)
+        for i = 1, EQUIP_BEFORE_SELL_COUNT do
+            pcall(function()
+                EquipBest:FireServer()
+            end)
+            print(("Pre-sell equip %d/%d"):format(i, EQUIP_BEFORE_SELL_COUNT))
+            task.wait(EQUIP_SPAM_DELAY)
+        end
+
+        -- Then go sell
         hrp.CFrame = SELL_CFRAME
         task.wait(0.4)
         Dialogue:InvokeServer("SellNpc", 1, "I want to sell my inventory", "preview")
         task.wait(1.5)
         Dialogue:InvokeServer("SellNpc", 1, "I want to sell my inventory", "commit")
-        print("Sold inventory")
+        print("Sold inventory → eggs")
         task.wait(0.3)
-        returnToPlot(hrp)
+        goToEggs(hrp)
     end)
 end
 
@@ -298,6 +355,9 @@ task.spawn(function()
                     print("[AutoRebirth] Requirements met — firing rebirth")
                     RebirthRemote:FireServer()
                     task.wait(REBIRTH_COOLDOWN)
+                    -- after rebirth, go back to eggs
+                    local hrp = getHRP()
+                    goToEggs(hrp)
                 end)
             end
         end
@@ -336,9 +396,9 @@ local function buyFoodCart()
             task.wait(0.2)
         end
 
-        print("Bought all FoodCart items")
+        print("Bought all FoodCart items → eggs")
         task.wait(0.3)
-        returnToPlot(hrp)
+        goToEggs(hrp)
     end)
 end
 
@@ -436,8 +496,8 @@ local function buyAllFromMerchant()
             end
         end
 
-        print(("Done — bought %d item(s) from Merchant"):format(bought))
-        returnToPlot(hrp)
+        print(("Done — bought %d item(s) from Merchant → eggs"):format(bought))
+        goToEggs(hrp)
     end)
 end
 
@@ -461,8 +521,18 @@ UIS.InputBegan:Connect(function(input, gpe)
     if gpe then return end
     if input.KeyCode == Enum.KeyCode.B then
         enabled = not enabled
-        print(enabled and "✅ Auto Farm: ON" or "❌ Auto Farm: OFF")
+        if enabled then
+            -- on enable, go straight to eggs
+            task.spawn(function()
+                withLock(function()
+                    local hrp = getHRP()
+                    goToEggs(hrp)
+                end)
+            end)
+        end
+        print(enabled and "✅ Auto Farm: ON (eggs + shops)" or "❌ Auto Farm: OFF")
     end
 end)
 
-print("Full script loaded. Press B to toggle Auto Farm (dice + potions + equip + sell + rebirth + foodcart + merchant)")
+print("Full script loaded. Press B to toggle Auto Farm")
+print("Eggs spam | Equip session every 5 min (20s at plot, equip every 5s) | Pre-sell equip x3 at plot")
