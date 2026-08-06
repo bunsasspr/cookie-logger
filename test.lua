@@ -96,32 +96,9 @@ local function getHumanoid()
     return char:WaitForChild("Humanoid")
 end
 
--- Walks to a target CFrame instead of teleporting. Falls back to an instant
--- teleport only if no Humanoid can be found at all.
+-- Teleports to the target CFrame.
 local function walkTo(cframe)
-    local humanoid = getHumanoid()
-    if not humanoid then
-        getHRP().CFrame = cframe
-        return
-    end
-
-    local finished = false
-    local conn
-    conn = humanoid.MoveToFinished:Connect(function()
-        finished = true
-    end)
-
-    humanoid:MoveTo(cframe.Position)
-
-    local elapsed = 0
-    while not finished and elapsed < WALK_TIMEOUT do
-        task.wait(0.25)
-        elapsed += 0.25
-    end
-
-    if conn then
-        conn:Disconnect()
-    end
+    getHRP().CFrame = cframe
 end
 
 local function getMyPlotCFrame()
