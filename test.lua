@@ -27,7 +27,10 @@ local WAIT_AFTER_BUY = 120 -- fallback if a timer label can't be read
 local RESTOCK_BUFFER = 2 -- extra seconds after "0:00" to make sure server has actually restocked
 local SELL_THRESHOLD = 30
 local SELL_CHECK_INTERVAL = 5 -- seconds
-local EQUIP_INTERVAL = 300 -- 5 minutes
+local EQUIP_INTERVAL = 300 -- 5 minutes between equip sessions
+local EQUIP_SESSION_DURATION = 20 -- stay at plot for this many seconds
+local EQUIP_SPAM_DELAY = 5 -- equip best every N seconds while at plot
+local EQUIP_BEFORE_SELL_COUNT = 3 -- how many times to equip before selling
 local REBIRTH_CHECK_INTERVAL = 2 -- seconds
 local REBIRTH_COOLDOWN = 5 -- seconds, let GUI/state settle after rebirthing
 local NPC_CHECK_INTERVAL = 3 -- seconds, for FoodCart/Merchant existence polling
@@ -242,20 +245,34 @@ task.spawn(function()
     end
 end)
 
--- ===== Auto Equip (every 5 min — TP to plot, equip, then back to eggs) =====
+-- Spam EquipBest at plot for a duration (every EQUIP_SPAM_DELAY seconds)
+local function equipAtPlot(duration)
+    local hrp = getHRP()
+    returnToPlot(hrp)
+    task.wait(0.4)
+
+    local elapsed = 0
+    local count = 0
+    while elapsed < duration and enabled do
+        pcall(function()
+            EquipBest:FireServer()
+        end)
+        count += 1
+        print(("Equipped best (%d)"):format(count))
+        task.wait(EQUIP_SPAM_DELAY)
+        elapsed += EQUIP_SPAM_DELAY
+    end
+end
+
+-- ===== Auto Equip (every 5 min — stay at plot 20s, equip every 5s, then back to eggs) =====
 task.spawn(function()
     while true do
         if enabled then
             withLock(function()
+                equipAtPlot(EQUIP_SESSION_DURATION)
                 local hrp = getHRP()
-                returnToPlot(hrp)
-                task.wait(0.4)
-                pcall(function()
-                    EquipBest:FireServer()
-                end)
-                print("Equipped best")
-                task.wait(0.3)
                 goToEggs(hrp)
+                print("Equip session done → eggs")
             end)
         end
         task.wait(EQUIP_INTERVAL)
@@ -275,6 +292,19 @@ end
 local function sellInventory()
     withLock(function()
         local hrp = getHRP()
+
+        -- Equip a few times at plot first
+        returnToPlot(hrp)
+        task.wait(0.4)
+        for i = 1, EQUIP_BEFORE_SELL_COUNT do
+            pcall(function()
+                EquipBest:FireServer()
+            end)
+            print(("Pre-sell equip %d/%d"):format(i, EQUIP_BEFORE_SELL_COUNT))
+            task.wait(EQUIP_SPAM_DELAY)
+        end
+
+        -- Then go sell
         hrp.CFrame = SELL_CFRAME
         task.wait(0.4)
         Dialogue:InvokeServer("SellNpc", 1, "I want to sell my inventory", "preview")
@@ -505,4 +535,4 @@ UIS.InputBegan:Connect(function(input, gpe)
 end)
 
 print("Full script loaded. Press B to toggle Auto Farm")
-print("After buys → stay at eggs & spam Frozen x3 | EquipBest every 5 min (plot TP)")
+print("Eggs spam | Equip session every 5 min (20s at plot, equip every 5s) | Pre-sell equip x3 at plot")
