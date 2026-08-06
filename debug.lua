@@ -1,61 +1,110 @@
--- ===== Locate restock countdown label + any backing timestamp source =====
+-- ===== Auto Merchant =====
 local Players = game:GetService("Players")
-local player = Players.LocalPlayer
-
-local function findLabelsContaining(root, substring)
-    local found = {}
-    local function scan(instance)
-        local ok, text = pcall(function() return instance.Text end)
-        if ok and text and text:find(substring) then
-            table.insert(found, instance)
-        end
-        for _, child in ipairs(instance:GetChildren()) do
-            scan(child)
-        end
-    end
-    scan(root)
-    return found
-end
-
-local matches = findLabelsContaining(player.PlayerGui, "New items")
-if #matches == 0 then
-    warn("No label found containing 'New items' — text might be split across multiple labels, or built with string.format at runtime. Try searching for 'items in' or just ':' instead.")
-else
-    for _, label in ipairs(matches) do
-        print("FOUND LABEL:", label:GetFullName())
-        print("  Text:", label.Text)
-
-        -- dump attributes on the label itself and its ancestors up to PlayerGui,
-        -- looking for a timestamp-like NumberValue/IntValue or attribute
-        local inst = label
-        while inst and inst ~= player.PlayerGui.Parent do
-            local attrs = inst:GetAttributes()
-            if next(attrs) then
-                print("  Attributes on", inst:GetFullName(), ":")
-                for k, v in pairs(attrs) do
-                    print("    ", k, "=", v)
-                end
-            end
-            for _, child in ipairs(inst:GetChildren()) do
-                if child:IsA("NumberValue") or child:IsA("IntValue") then
-                    print("  Value object:", child:GetFullName(), "=", child.Value)
-                end
-            end
-            inst = inst.Parent
-        end
-    end
-end
-
--- also check if a LocalScript is driving it (won't give us source, but confirms client-side calc)
-print("=== Also checking ReplicatedStorage for a shop data folder ===")
 local RS = game:GetService("ReplicatedStorage")
-local function scanNames(instance, depth, maxDepth)
-    if depth > maxDepth then return end
-    for _, child in ipairs(instance:GetChildren()) do
-        if child.Name:lower():find("shop") or child.Name:lower():find("restock") or child.Name:lower():find("dice") or child.Name:lower():find("potion") then
-            print(string.rep("  ", depth) .. child:GetFullName() .. " [" .. child.ClassName .. "]")
-        end
-        scanNames(child, depth + 1, maxDepth)
-    end
+
+local player = Players.LocalPlayer
+local MerchantRemote = RS:WaitForChild("Remotes"):WaitForChild("Merchant")
+
+local function getHRP()
+    local char = player.Character or player.CharacterAdded:Wait()
+    return char:WaitForChild("HumanoidRootPart")
 end
-scanNames(RS, 0, 4)
+
+local function getMerchantModel()
+    local mapShop = workspace.Map:FindFirstChild("MapShop")
+    if not mapShop then return nil end
+    return mapShop:FindFirstChild("Merchant")
+end
+
+local function findProximityPrompt(model)
+    for _, inst in ipairs(model:GetDescendants()) do
+        if inst:IsA("ProximityPrompt") then
+            return inst
+        end
+    end
+    return nil
+end
+
+local function openMerchantWindow()
+    local model = getMerchantModel()
+    if not model then
+        warn("Merchant not found (probably despawned)")
+        return false
+    end
+
+    local part = model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart", true)
+    if not part then
+        warn("No BasePart on Merchant model")
+        return false
+    end
+
+    local hrp = getHRP()
+    hrp.CFrame = part.CFrame
+    task.wait(0.3)
+
+    local prompt = findProximityPrompt(model)
+    if prompt then
+        -- fireproximityprompt is an executor-provided function
+        local ok = pcall(function()
+            fireproximityprompt(prompt)
+        end)
+        if not ok then
+            warn("fireproximityprompt not available on this executor — open the window manually then re-run")
+        end
+    end
+
+    task.wait(0.5) -- let the GUI populate
+    return true
+end
+
+local function buyAllFromMerchant()
+    if not openMerchantWindow() then return end
+
+    local holder = player.PlayerGui.Main.Canvas.Merchant.Main.Holder
+
+    -- collect + sort by LayoutOrder so category headers and their items
+    -- are processed in true visual order, not raw insertion order
+    local children = holder:GetChildren()
+    table.sort(children, function(a, b)
+        local aOrder = pcall(function() return a.LayoutOrder end) and a.LayoutOrder or 0
+        local bOrder = pcall(function() return b.LayoutOrder end) and b.LayoutOrder or 0
+        return aOrder < bOrder
+    end)
+
+    local currentCategory = nil
+    local bought = 0
+
+    for _, entry in ipairs(children) do
+        -- category headers
+        local nameLabel = entry:FindFirstChild("NameLabel")
+        if entry.Name == "TextPlaceHolder" and nameLabel then
+            currentCategory = nameLabel.Text
+
+        -- skip clone-source templates entirely — never real stock
+        elseif entry.Name:find("Template") then
+            -- ignore
+
+        -- real item entries (skip layout objects)
+        elseif entry:IsA("Frame") or entry:IsA("ImageButton") or entry:IsA("TextButton") or entry:IsA("CanvasGroup") then
+            local itemNameLabel = entry:FindFirstChild("DiceName") or entry:FindFirstChild("FoodName")
+            local stockLabel = entry:FindFirstChild("Stock")
+
+            if itemNameLabel and currentCategory then
+                local stockText = stockLabel and stockLabel.Text or ""
+                if stockText ~= "Sold out" and stockText ~= "" then
+                    local itemName = itemNameLabel.Text
+                    pcall(function()
+                        MerchantRemote:FireServer("BuyAll", currentCategory, itemName)
+                    end)
+                    print(("Bought %s (%s)"):format(itemName, currentCategory))
+                    bought += 1
+                    task.wait(0.2)
+                end
+            end
+        end
+    end
+
+    print(("Done — bought %d item(s) from Merchant"):format(bought))
+end
+
+buyAllFromMerchant()
