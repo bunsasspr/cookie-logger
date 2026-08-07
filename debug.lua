@@ -1,183 +1,119 @@
--- ===== Full Game Dumper (almost everything) =====
--- Saves hierarchy + scripts + values + basic properties
+-- ============================================================
+--  AUTO COLLECT MONEY — Standalone v2
+--  Teleports to the Collector, fires the touch, teleports back
+--  Works because the server checks character position
+-- ============================================================
 
-local ServicesToDump = {
-    "ReplicatedStorage",
-    "Workspace",
-    "Players",
-    "Lighting",
-    "StarterGui",
-    "StarterPlayer",
-    "SoundService",
-    "Chat",
-    "Teams",
-    "MaterialService",
-}
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local VirtualUser = game:GetService("VirtualUser")
 
-local MAX_DEPTH = 15
-local OUTPUT_ROOT = "/sdcard/Pictures/FullGameDump_" .. os.date("%Y-%m-%d_%H-%M-%S")
+local player = Players.LocalPlayer
 
--- ========== Helpers ==========
-local function safeMakeFolder(path)
-    pcall(function()
-        if not isfolder(path) then
-            makefolder(path)
-        end
-    end)
-end
+-- ===== Anti AFK =====
+player.Idled:Connect(function()
+    VirtualUser:CaptureController()
+    VirtualUser:ClickButton2(Vector2.new())
+end)
 
-local function safeWriteFile(path, content)
-    pcall(function()
-        writefile(path, content)
-    end)
-end
+-- ===== Config =====
+local COLLECT_INTERVAL = 2.0   -- seconds between collect attempts
+local TOUCH_DURATION = 0.3     -- how long to "touch" the collector
 
-local function sanitize(name)
-    if type(name) ~= "string" then name = tostring(name) end
-    name = name:gsub("[\r\n\t]", " ")
-    name = name:gsub("[<>:\"/\\|?*]", "_")
-    name = name:gsub("%s+", " ")
-    name = name:match("^%s*(.-)%s*$") or "unnamed"
-    if #name == 0 then name = "unnamed" end
-    if #name > 60 then name = name:sub(1, 60) end
-    return name
-end
-
-local function getDecompiled(script)
-    local ok, source = pcall(function()
-        return decompile(script)
-    end)
-    if ok and type(source) == "string" and #source > 10 then
-        return source
-    end
-    return "-- [Could not decompile]\n"
-end
-
-local function getAttributes(inst)
-    local attrs = {}
-    local ok, list = pcall(function()
-        return inst:GetAttributes()
-    end)
-    if ok and type(list) == "table" then
-        for k, v in pairs(list) do
-            attrs[tostring(k)] = tostring(v)
+-- ===== Find your plot =====
+local function getMyPlot()
+    local plotsFolder = workspace:FindFirstChild("Map") and workspace.Map:FindFirstChild("Plots")
+    if not plotsFolder then return nil end
+    for _, plot in ipairs(plotsFolder:GetChildren()) do
+        local owner = plot:GetAttribute("Owner") or plot:GetAttribute("owner")
+        if owner == player.UserId or tostring(owner) == tostring(player.UserId) then
+            return plot
         end
     end
-    return attrs
+    return nil
 end
 
-local function getBasicProperties(inst)
-    local props = {}
-    local interesting = {
-        "ClassName", "Name", "Parent",
-        "Value", "Text", "Image", "Texture", "MeshId", "SoundId",
-        "BrickColor", "Color", "Material", "Transparency", "Reflectance",
-        "Size", "Position", "CFrame", "Anchored", "CanCollide",
-        "Health", "MaxHealth", "WalkSpeed", "JumpPower",
-    }
+-- ===== Find the Collector part (exact path from game dump) =====
+local function getCollectorPart()
+    local plot = getMyPlot()
+    if not plot then return nil end
 
-    for _, prop in ipairs(interesting) do
-        local ok, val = pcall(function()
-            return inst[prop]
-        end)
-        if ok and val ~= nil then
-            props[prop] = tostring(val)
-        end
-    end
-    return props
-end
-
-local dumpedScripts = 0
-local dumpedOthers = 0
-
-local function dumpInstance(inst, currentPath, depth)
-    if depth > MAX_DEPTH then return end
-    if not inst or not inst.Parent and depth > 0 then return end
-
-    local name = sanitize(inst.Name)
-    local fullPath = currentPath .. "/" .. name
-
-    -- Create folder for containers
-    if inst:IsA("Folder") or inst:IsA("Model") or inst:IsA("Configuration") 
-        or inst:IsA("Player") or inst:IsA("Backpack") or inst:IsA("PlayerGui") then
-        safeMakeFolder(fullPath)
-    end
-
-    -- Scripts → save decompiled source
-    if inst:IsA("ModuleScript") or inst:IsA("LocalScript") or inst:IsA("Script") then
-        local source = getDecompiled(inst)
-        local header = string.format(
-            "-- Path: %s\n-- Class: %s\n\n",
-            inst:GetFullName(), inst.ClassName
-        )
-        safeWriteFile(fullPath .. ".lua", header .. source)
-        dumpedScripts += 1
-        print("Script:", inst:GetFullName())
-
-    -- Value objects
-    elseif inst:IsA("StringValue") or inst:IsA("NumberValue") or inst:IsA("IntValue")
-        or inst:IsA("BoolValue") or inst:IsA("ObjectValue") or inst:IsA("CFrameValue")
-        or inst:IsA("Vector3Value") or inst:IsA("Color3Value") then
-        local content = tostring(inst.Value)
-        safeWriteFile(fullPath .. ".txt", content)
-        dumpedOthers += 1
-
-    -- Everything else → save a small info file
-    else
-        local info = {
-            "ClassName: " .. inst.ClassName,
-            "FullName: " .. inst:GetFullName(),
-        }
-
-        local props = getBasicProperties(inst)
-        for k, v in pairs(props) do
-            table.insert(info, k .. ": " .. v)
-        end
-
-        local attrs = getAttributes(inst)
-        if next(attrs) then
-            table.insert(info, "\n--- Attributes ---")
-            for k, v in pairs(attrs) do
-                table.insert(info, k .. " = " .. v)
+    -- Exact path: plot.Floor1.Holders.ItemHolder1.Collector
+    local floor1 = plot:FindFirstChild("Floor1")
+    if floor1 then
+        local holders = floor1:FindFirstChild("Holders")
+        if holders then
+            local itemHolder = holders:FindFirstChild("ItemHolder1")
+            if itemHolder then
+                local collector = itemHolder:FindFirstChild("Collector")
+                if collector and collector:IsA("BasePart") then
+                    return collector
+                end
             end
         end
-
-        safeWriteFile(fullPath .. ".info.txt", table.concat(info, "\n"))
-        dumpedOthers += 1
     end
 
-    -- Recurse children
-    local ok, children = pcall(function()
-        return inst:GetChildren()
+    -- Fallback: search whole plot for a part named Collector
+    for _, part in ipairs(plot:GetDescendants()) do
+        if part:IsA("BasePart") and part.Name == "Collector" then
+            return part
+        end
+    end
+
+    -- Last resort: any part with TouchTransmitter
+    for _, part in ipairs(plot:GetDescendants()) do
+        if part:IsA("BasePart") and part:FindFirstChildOfClass("TouchTransmitter") then
+            return part
+        end
+    end
+
+    return nil
+end
+
+-- ===== Teleport to collector, fire touch, teleport back =====
+local function collectMoney()
+    local collector = getCollectorPart()
+    if not collector then return false end
+
+    local char = player.Character
+    if not char then return false end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return false end
+
+    -- Save current position
+    local originalCF = hrp.CFrame
+
+    -- Teleport to the collector
+    hrp.CFrame = collector.CFrame * CFrame.new(0, 2, 0)
+    hrp.AssemblyLinearVelocity = Vector3.zero
+    hrp.AssemblyAngularVelocity = Vector3.zero
+    task.wait(0.1)
+
+    -- Fire the touch event
+    local ok = pcall(function()
+        firetouchinterest(collector, hrp, 0)  -- touch start
+        task.wait(TOUCH_DURATION)
+        firetouchinterest(collector, hrp, 1)  -- touch end
     end)
-    if ok then
-        for _, child in ipairs(children) do
-            dumpInstance(child, fullPath, depth + 1)
-        end
-    end
+
+    -- Teleport back
+    task.wait(0.1)
+    hrp.CFrame = originalCF
+    hrp.AssemblyLinearVelocity = Vector3.zero
+    hrp.AssemblyAngularVelocity = Vector3.zero
+
+    return ok
 end
 
--- ========== Start ==========
-print("Starting FULL dump...")
-print("Output:", OUTPUT_ROOT)
-safeMakeFolder(OUTPUT_ROOT)
-
-for _, serviceName in ipairs(ServicesToDump) do
-    local service = game:FindService(serviceName) or game:GetService(serviceName)
-    if service then
-        local servicePath = OUTPUT_ROOT .. "/" .. serviceName
-        safeMakeFolder(servicePath)
-        print("\n=== Dumping", serviceName, "===")
-
-        for _, child in ipairs(service:GetChildren()) do
-            dumpInstance(child, servicePath, 1)
+-- ===== Main loop =====
+task.spawn(function()
+    while true do
+        local ok = pcall(collectMoney)
+        if not ok then
+            -- collector not found yet, keep trying
         end
+        task.wait(COLLECT_INTERVAL)
     end
-end
+end)
 
-print("\n========================================")
-print("FULL DUMP FINISHED")
-print("Scripts dumped :", dumpedScripts)
-print("Other instances:", dumpedOthers)
-print("Saved to       :", OUTPUT_ROOT)
-print("========================================")
+print("✅ Auto Collect v2 loaded! Teleporting to collector every " .. COLLECT_INTERVAL .. "s")
