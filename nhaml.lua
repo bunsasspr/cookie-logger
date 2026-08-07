@@ -2,9 +2,16 @@
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
 local UIS = game:GetService("UserInputService")
+local VirtualUser = game:GetService("VirtualUser")
 
 local player = Players.LocalPlayer
 local remotes = RS:WaitForChild("Remotes")
+
+-- ===== Anti AFK =====
+player.Idled:Connect(function()
+    VirtualUser:CaptureController()
+    VirtualUser:ClickButton2(Vector2.new())
+end)
 
 local BuyDice = remotes:WaitForChild("BuyDice")
 local BuyPotion = remotes:WaitForChild("BuyPotion")
