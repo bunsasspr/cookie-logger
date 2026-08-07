@@ -1,14 +1,44 @@
--- ===== Standalone: pin Merchant + buy everything =====
+-- ===== Standalone: simulate AutoFarm's exact Merchant flow, including return to eggs =====
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 
 local player = Players.LocalPlayer
-local MerchantRemote = RS:WaitForChild("Remotes"):WaitForChild("Merchant")
+local remotes = RS:WaitForChild("Remotes")
+local MerchantRemote = remotes:WaitForChild("Merchant")
+
+local EGG_CFRAME = CFrame.new(-198.375092, 3.67208314, 168.48439, -0.455900133, 5.02545072e-09, 0.890030921, 1.24778738e-08, 1, 7.45158324e-10, -0.890030921, 1.14454117e-08, -0.455900133)
+
+local ACTION_SETTLE_DELAY = 0.6
+local TELEPORT_SETTLE_DELAY = 0.5
+local PIN_DURATION = 5
 
 local function getHRP()
     local char = player.Character or player.CharacterAdded:Wait()
     return char:WaitForChild("HumanoidRootPart")
+end
+
+local function teleportTo(hrp, cframe, backOffset)
+    backOffset = backOffset or 4
+    hrp.CFrame = cframe * CFrame.new(0, 0, backOffset)
+    hrp.AssemblyLinearVelocity = Vector3.zero
+    hrp.AssemblyAngularVelocity = Vector3.zero
+end
+
+local function startPin(hrp, cframe)
+    local pinning = true
+    local conn
+    conn = RunService.Heartbeat:Connect(function()
+        if pinning then
+            hrp.CFrame = cframe
+            hrp.AssemblyLinearVelocity = Vector3.zero
+            hrp.AssemblyAngularVelocity = Vector3.zero
+        end
+    end)
+    return function()
+        pinning = false
+        conn:Disconnect()
+    end
 end
 
 local function getMerchantModel()
@@ -26,6 +56,18 @@ local function findProximityPrompt(model)
     return nil
 end
 
+local function getMerchantHolder()
+    local ok, holder = pcall(function()
+        return player.PlayerGui.Main.Canvas.Merchant.Main.Holder
+    end)
+    if ok then return holder end
+    return nil
+end
+
+-- ===== Simulated withLock settle delay =====
+print("[Step] Acquired 'lock' — settling")
+task.wait(ACTION_SETTLE_DELAY)
+
 local model = getMerchantModel()
 if not model then
     warn("Merchant not found — make sure it's currently spawned")
@@ -39,37 +81,33 @@ if not part then
 end
 
 local hrp = getHRP()
-local targetCFrame = part.CFrame -- NO offset this time, land exactly on it
+print("[Step] Teleporting (zero offset)")
+teleportTo(hrp, part.CFrame, 0)
+task.wait(TELEPORT_SETTLE_DELAY)
 
--- Teleport once first
-hrp.CFrame = targetCFrame
-hrp.AssemblyLinearVelocity = Vector3.zero
-hrp.AssemblyAngularVelocity = Vector3.zero
-task.wait(0.3)
-
--- Start pinning (every frame, no offset, counters any push-out)
-local pinning = true
-local pinConn = RunService.Heartbeat:Connect(function()
-    if pinning then
-        hrp.CFrame = targetCFrame
-        hrp.AssemblyLinearVelocity = Vector3.zero
-        hrp.AssemblyAngularVelocity = Vector3.zero
-    end
-end)
+model = getMerchantModel()
+if not model then
+    warn("Merchant despawned right before buying")
+    return
+end
 
 local prompt = findProximityPrompt(model)
 if prompt then
-    print("MaxActivationDistance:", prompt.MaxActivationDistance)
+    print("[Step] MaxActivationDistance:", prompt.MaxActivationDistance)
     pcall(function()
         fireproximityprompt(prompt)
     end)
 else
-    warn("No ProximityPrompt found")
+    warn("[Step] No ProximityPrompt found")
+end
+task.wait(0.5)
+
+local holder = getMerchantHolder()
+if not holder then
+    warn("[Step] Merchant Holder GUI not found — window probably didn't open")
+    return
 end
 
-task.wait(0.8) -- let the GUI populate while pinned
-
-local holder = player.PlayerGui.Main.Canvas.Merchant.Main.Holder
 local children = holder:GetChildren()
 table.sort(children, function(a, b)
     local aOrder = (pcall(function() return a.LayoutOrder end)) and a.LayoutOrder or 0
@@ -97,18 +135,34 @@ for _, entry in ipairs(children) do
     end
 end
 
-print(("Found %d purchasable item(s)"):format(#toBuy))
+print(("[Step] Found %d purchasable item(s)"):format(#toBuy))
+if #toBuy == 0 then
+    warn("[Step] Nothing to buy — GUI may not have populated, or genuinely no stock")
+end
+
+print("[Step] Pinning + firing")
+local stopPin = startPin(hrp, part.CFrame)
+local pinStart = tick()
 
 for _, item in ipairs(toBuy) do
     pcall(function()
         MerchantRemote:FireServer("BuyAll", item.category, item.itemName)
     end)
-    print(("Fired: %s (%s)"):format(item.itemName, item.category))
-    task.wait(0.2)
+    print(("[Step] Fired: %s (%s)"):format(item.itemName, item.category))
+    task.wait(0.15)
 end
 
-task.wait(1) -- hold pin a bit after firing
+local remaining = PIN_DURATION - (tick() - pinStart)
+if remaining > 0 then
+    print(("[Step] Holding pin for %.1f more seconds"):format(remaining))
+    task.wait(remaining)
+end
 
-pinning = false
-pinConn:Disconnect()
-print("Done")
+stopPin()
+print("[Step] Stopped pin")
+
+print("[Step] Teleporting to eggs")
+teleportTo(hrp, EGG_CFRAME, 4)
+task.wait(TELEPORT_SETTLE_DELAY)
+
+print("[Step] Done — check your inventory/stock now")
