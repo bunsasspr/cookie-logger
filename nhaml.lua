@@ -44,6 +44,8 @@ local NPC_CHECK_INTERVAL = 3 -- seconds, for FoodCart/Merchant existence polling
 local EGG_SPAM_DELAY = 0.15 -- delay between egg opens
 local ACTION_SETTLE_DELAY = 0.6 -- pause right after acquiring the lock, before doing anything
 local TELEPORT_SETTLE_DELAY = 0.5 -- pause after every teleport before firing a remote
+local BUY_STAND_DURATION = 2 -- seconds to stand and spam-fire buy remotes
+local BUY_FIRE_INTERVAL = 0.5 -- seconds between each spam-fire
 
 local FOODCART_ITEMS = {
     "Apple",
@@ -110,9 +112,39 @@ local function withLock(fn)
     end
 end
 
+-- Pins the character to a CFrame every frame (countering the physics push-out
+-- glitch) until stopped. Returns a function to call when done pinning.
+local RunService = game:GetService("RunService")
+local function startPin(hrp, cframe)
+    local pinning = true
+    local conn
+    conn = RunService.Heartbeat:Connect(function()
+        if pinning then
+            hrp.CFrame = cframe
+            hrp.AssemblyLinearVelocity = Vector3.zero
+            hrp.AssemblyAngularVelocity = Vector3.zero
+        end
+    end)
+    return function()
+        pinning = false
+        conn:Disconnect()
+    end
+end
+
 local function getHRP()
     local char = player.Character or player.CharacterAdded:Wait()
     return char:WaitForChild("HumanoidRootPart")
+end
+
+-- Teleports the character to a CFrame, offset slightly backward so it doesn't
+-- land inside the target's collision geometry (which causes Roblox to shove
+-- the character back out, sometimes well outside interaction range), and
+-- zeroes velocity afterward so no leftover momentum carries into that push.
+local function teleportTo(hrp, cframe, backOffset)
+    backOffset = backOffset or 4
+    hrp.CFrame = cframe * CFrame.new(0, 0, backOffset)
+    hrp.AssemblyLinearVelocity = Vector3.zero
+    hrp.AssemblyAngularVelocity = Vector3.zero
 end
 
 local function getMyPlotCFrame()
@@ -135,14 +167,14 @@ local function getMyPlotCFrame()
 end
 
 local function goToEggs(hrp)
-    hrp.CFrame = EGG_CFRAME
+    teleportTo(hrp, EGG_CFRAME)
     task.wait(TELEPORT_SETTLE_DELAY)
 end
 
 local function returnToPlot(hrp)
     local plotCF = getMyPlotCFrame()
     if plotCF then
-        hrp.CFrame = plotCF
+        teleportTo(hrp, plotCF)
         task.wait(TELEPORT_SETTLE_DELAY)
     else
         warn("Could not find your plot!")
@@ -188,10 +220,18 @@ end)
 local function buyDice()
     withLock(function()
         local hrp = getHRP()
-        hrp.CFrame = DICE_SHOP
+        teleportTo(hrp, DICE_SHOP)
         task.wait(TELEPORT_SETTLE_DELAY)
-        BuyDice:FireServer("BuyBestAvailable")
-        task.wait(0.3)
+
+        local elapsed = 0
+        while elapsed < BUY_STAND_DURATION do
+            pcall(function()
+                BuyDice:FireServer("BuyBestAvailable")
+            end)
+            task.wait(BUY_FIRE_INTERVAL)
+            elapsed += BUY_FIRE_INTERVAL
+        end
+
         goToEggs(hrp)
         print("Bought dice → eggs")
     end)
@@ -226,10 +266,18 @@ end)
 local function buyPotion()
     withLock(function()
         local hrp = getHRP()
-        hrp.CFrame = POTION_SHOP
+        teleportTo(hrp, POTION_SHOP)
         task.wait(TELEPORT_SETTLE_DELAY)
-        BuyPotion:FireServer("BuyBestAvailable")
-        task.wait(0.3)
+
+        local elapsed = 0
+        while elapsed < BUY_STAND_DURATION do
+            pcall(function()
+                BuyPotion:FireServer("BuyBestAvailable")
+            end)
+            task.wait(BUY_FIRE_INTERVAL)
+            elapsed += BUY_FIRE_INTERVAL
+        end
+
         goToEggs(hrp)
         task.wait(0.5)
         useAllPotions()
@@ -320,7 +368,7 @@ local function sellInventory()
         end
 
         -- Then go sell
-        hrp.CFrame = SELL_CFRAME
+        teleportTo(hrp, SELL_CFRAME)
         task.wait(TELEPORT_SETTLE_DELAY)
         Dialogue:InvokeServer("SellNpc", 1, "I want to sell my inventory", "preview")
         task.wait(1.5)
@@ -400,7 +448,7 @@ local function buyFoodCart()
         end
 
         local hrp = getHRP()
-        hrp.CFrame = part.CFrame
+        teleportTo(hrp, part.CFrame)
         task.wait(TELEPORT_SETTLE_DELAY)
 
         -- re-check it's still there after settling, in case it despawned
@@ -411,14 +459,23 @@ local function buyFoodCart()
             return
         end
 
-        for _, item in ipairs(FOODCART_ITEMS) do
-            pcall(function()
-                FoodCartRemote:FireServer("BuyAll", item)
-            end)
-            task.wait(0.25)
+        -- pin position for the whole buying sequence so nothing pushes us out,
+        -- and spam every item's buy remote for BUY_STAND_DURATION
+        local stopPin = startPin(hrp, part.CFrame)
+
+        local elapsed = 0
+        while elapsed < BUY_STAND_DURATION do
+            for _, item in ipairs(FOODCART_ITEMS) do
+                pcall(function()
+                    FoodCartRemote:FireServer("BuyAll", item)
+                end)
+            end
+            task.wait(BUY_FIRE_INTERVAL)
+            elapsed += BUY_FIRE_INTERVAL
         end
 
-        print("Bought all FoodCart items → eggs")
+        stopPin()
+        print("Done with FoodCart → eggs")
         goToEggs(hrp)
     end)
 end
@@ -455,6 +512,14 @@ local function findProximityPrompt(model)
     return nil
 end
 
+local function getMerchantHolder()
+    local ok, holder = pcall(function()
+        return player.PlayerGui.Main.Canvas.Merchant.Main.Holder
+    end)
+    if ok then return holder end
+    return nil
+end
+
 local function buyAllFromMerchant()
     withLock(function()
         local model = getMerchantModel()
@@ -470,7 +535,7 @@ local function buyAllFromMerchant()
         end
 
         local hrp = getHRP()
-        hrp.CFrame = part.CFrame
+        teleportTo(hrp, part.CFrame)
         task.wait(TELEPORT_SETTLE_DELAY)
 
         -- re-check it's still there after settling
@@ -489,7 +554,10 @@ local function buyAllFromMerchant()
         end
         task.wait(0.5) -- let the GUI populate
 
-        local holder = player.PlayerGui.Main.Canvas.Merchant.Main.Holder
+        -- pin position for the whole buying sequence
+        local stopPin = startPin(hrp, part.CFrame)
+
+        local holder = getMerchantHolder()
         local children = holder:GetChildren()
         table.sort(children, function(a, b)
             local aOrder = (pcall(function() return a.LayoutOrder end)) and a.LayoutOrder or 0
@@ -497,9 +565,9 @@ local function buyAllFromMerchant()
             return aOrder < bOrder
         end)
 
+        -- figure out what's actually in stock (category + item name pairs)
+        local toBuy = {}
         local currentCategory = nil
-        local bought = 0
-
         for _, entry in ipairs(children) do
             local nameLabel = entry:FindFirstChild("NameLabel")
             if entry.Name == "TextPlaceHolder" and nameLabel then
@@ -509,23 +577,29 @@ local function buyAllFromMerchant()
             elseif entry:IsA("Frame") or entry:IsA("ImageButton") or entry:IsA("TextButton") or entry:IsA("CanvasGroup") then
                 local itemNameLabel = entry:FindFirstChild("DiceName") or entry:FindFirstChild("FoodName")
                 local stockLabel = entry:FindFirstChild("Stock")
-
                 if itemNameLabel and currentCategory then
                     local stockText = stockLabel and stockLabel.Text or ""
                     if stockText ~= "Sold out" and stockText ~= "" then
-                        local itemName = itemNameLabel.Text
-                        pcall(function()
-                            MerchantRemote:FireServer("BuyAll", currentCategory, itemName)
-                        end)
-                        print(("Bought %s (%s)"):format(itemName, currentCategory))
-                        bought += 1
-                        task.wait(0.25)
+                        table.insert(toBuy, {category = currentCategory, itemName = itemNameLabel.Text})
                     end
                 end
             end
         end
 
-        print(("Done — bought %d item(s) from Merchant → eggs"):format(bought))
+        -- spam-fire every in-stock item for BUY_STAND_DURATION
+        local elapsed = 0
+        while elapsed < BUY_STAND_DURATION do
+            for _, item in ipairs(toBuy) do
+                pcall(function()
+                    MerchantRemote:FireServer("BuyAll", item.category, item.itemName)
+                end)
+            end
+            task.wait(BUY_FIRE_INTERVAL)
+            elapsed += BUY_FIRE_INTERVAL
+        end
+
+        stopPin()
+        print(("Done with Merchant (%d item(s) targeted) → eggs"):format(#toBuy))
         goToEggs(hrp)
     end)
 end
