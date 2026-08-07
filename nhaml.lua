@@ -44,8 +44,9 @@ local NPC_CHECK_INTERVAL = 3 -- seconds, for FoodCart/Merchant existence polling
 local EGG_SPAM_DELAY = 0.15 -- delay between egg opens
 local ACTION_SETTLE_DELAY = 0.6 -- pause right after acquiring the lock, before doing anything
 local TELEPORT_SETTLE_DELAY = 0.5 -- pause after every teleport before firing a remote
-local BUY_STAND_DURATION = 2 -- seconds to stand and spam-fire buy remotes
-local BUY_FIRE_INTERVAL = 0.5 -- seconds between each spam-fire
+local BUY_STAND_DURATION = 2 -- seconds to stand and spam-fire buy remotes (dice/potion)
+local BUY_FIRE_INTERVAL = 0.5 -- seconds between each spam-fire (dice/potion)
+local PIN_DURATION = 2 -- seconds to hold the pin for foodcart/merchant while buying
 
 local FOODCART_ITEMS = {
     "Apple",
@@ -459,19 +460,23 @@ local function buyFoodCart()
             return
         end
 
-        -- pin position for the whole buying sequence so nothing pushes us out,
-        -- and spam every item's buy remote for BUY_STAND_DURATION
+        -- pin position for the whole buying sequence so nothing pushes us out.
+        -- Fire each item's buy remote once (staggered so they don't all land
+        -- in the same frame and get dropped), then hold the pin for the
+        -- remaining time so the pin lasts PIN_DURATION total.
         local stopPin = startPin(hrp, part.CFrame)
+        local pinStart = tick()
 
-        local elapsed = 0
-        while elapsed < BUY_STAND_DURATION do
-            for _, item in ipairs(FOODCART_ITEMS) do
-                pcall(function()
-                    FoodCartRemote:FireServer("BuyAll", item)
-                end)
-            end
-            task.wait(BUY_FIRE_INTERVAL)
-            elapsed += BUY_FIRE_INTERVAL
+        for _, item in ipairs(FOODCART_ITEMS) do
+            pcall(function()
+                FoodCartRemote:FireServer("BuyAll", item)
+            end)
+            task.wait(0.15)
+        end
+
+        local remaining = PIN_DURATION - (tick() - pinStart)
+        if remaining > 0 then
+            task.wait(remaining)
         end
 
         stopPin()
@@ -554,9 +559,6 @@ local function buyAllFromMerchant()
         end
         task.wait(0.5) -- let the GUI populate
 
-        -- pin position for the whole buying sequence
-        local stopPin = startPin(hrp, part.CFrame)
-
         local holder = getMerchantHolder()
         local children = holder:GetChildren()
         table.sort(children, function(a, b)
@@ -586,16 +588,22 @@ local function buyAllFromMerchant()
             end
         end
 
-        -- spam-fire every in-stock item for BUY_STAND_DURATION
-        local elapsed = 0
-        while elapsed < BUY_STAND_DURATION do
-            for _, item in ipairs(toBuy) do
-                pcall(function()
-                    MerchantRemote:FireServer("BuyAll", item.category, item.itemName)
-                end)
-            end
-            task.wait(BUY_FIRE_INTERVAL)
-            elapsed += BUY_FIRE_INTERVAL
+        -- pin position for the whole buying sequence, fire each in-stock item
+        -- once (staggered), then hold the pin for the remaining time so the
+        -- pin lasts PIN_DURATION total
+        local stopPin = startPin(hrp, part.CFrame)
+        local pinStart = tick()
+
+        for _, item in ipairs(toBuy) do
+            pcall(function()
+                MerchantRemote:FireServer("BuyAll", item.category, item.itemName)
+            end)
+            task.wait(0.15)
+        end
+
+        local remaining = PIN_DURATION - (tick() - pinStart)
+        if remaining > 0 then
+            task.wait(remaining)
         end
 
         stopPin()
