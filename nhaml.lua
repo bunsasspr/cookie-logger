@@ -547,7 +547,32 @@ local function buyAllFromMerchant()
         else
             warn("No ProximityPrompt found on Merchant model")
         end
-        task.wait(0.5) -- let the GUI populate
+
+        -- Poll for real (non-template) entries to actually appear instead of
+        -- guessing a fixed delay is enough — the GUI can take longer than
+        -- 0.5s to populate with real stock data after opening.
+        local GUI_POPULATE_TIMEOUT = 3
+        local deadline = tick() + GUI_POPULATE_TIMEOUT
+        local sawRealEntry = false
+        while tick() < deadline do
+            local holder = getMerchantHolder()
+            if holder then
+                for _, entry in ipairs(holder:GetChildren()) do
+                    if entry.Name ~= "TextPlaceHolder"
+                        and not entry.Name:find("Template")
+                        and (entry:FindFirstChild("DiceName") or entry:FindFirstChild("FoodName")) then
+                        sawRealEntry = true
+                        break
+                    end
+                end
+            end
+            if sawRealEntry then break end
+            task.wait(0.2)
+        end
+
+        if not sawRealEntry then
+            print("No real stock entries appeared within timeout (likely genuinely empty this cycle)")
+        end
 
         local holder = getMerchantHolder()
         local children = holder:GetChildren()
