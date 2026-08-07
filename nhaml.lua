@@ -527,107 +527,91 @@ local function buyAllFromMerchant()
         end
 
         local hrp = getHRP()
-        teleportTo(hrp, part.CFrame, 0) -- zero offset — must land exactly on it for the prompt to activate
-        task.wait(TELEPORT_SETTLE_DELAY)
+        local targetCFrame = part.CFrame
 
-        -- re-check it's still there after settling
-        model = getMerchantModel()
-        if not model then
-            warn("Merchant despawned right before buying")
-            goToEggs(hrp)
-            return
-        end
+        -- Initial teleport + kill velocity
+        hrp.CFrame = targetCFrame
+        hrp.AssemblyLinearVelocity = Vector3.zero
+        hrp.AssemblyAngularVelocity = Vector3.zero
+        task.wait(0.25)
 
+        -- Hard pin every frame
+        local pinning = true
+        local pinConn = RunService.Heartbeat:Connect(function()
+            if not pinning or not hrp or not hrp.Parent then return end
+            hrp.CFrame = targetCFrame
+            hrp.AssemblyLinearVelocity = Vector3.zero
+            hrp.AssemblyAngularVelocity = Vector3.zero
+        end)
+
+        -- Open the merchant GUI
         local prompt = findProximityPrompt(model)
         if prompt then
-            print("Merchant prompt MaxActivationDistance:", prompt.MaxActivationDistance)
             pcall(function()
                 fireproximityprompt(prompt)
             end)
         else
-            warn("No ProximityPrompt found on Merchant model")
+            warn("No ProximityPrompt found on Merchant")
         end
+        task.wait(0.8)
 
-        -- Poll for real (non-template) entries to actually appear instead of
-        -- guessing a fixed delay is enough — the GUI can take longer than
-        -- 0.5s to populate with real stock data after opening.
-        local GUI_POPULATE_TIMEOUT = 3
-        local deadline = tick() + GUI_POPULATE_TIMEOUT
-        local sawRealEntry = false
-        while tick() < deadline do
-            local holder = getMerchantHolder()
-            if holder then
-                for _, entry in ipairs(holder:GetChildren()) do
-                    if entry.Name ~= "TextPlaceHolder"
-                        and not entry.Name:find("Template")
-                        and (entry:FindFirstChild("DiceName") or entry:FindFirstChild("FoodName")) then
-                        sawRealEntry = true
-                        break
-                    end
-                end
-            end
-            if sawRealEntry then break end
-            task.wait(0.2)
-        end
+        -- ===== Hardcoded lists =====
+        local DICE_ORDER = {
+            "Basic", "Bronze", "Iron", "Silver", "Gold", "Sapphire", "Emerald", "Ruby",
+            "Obsidian", "Crystal", "Nebula", "Void", "Celestial", "Abyssal", "Infernal",
+            "Ethereal", "Galactic", "Quantum", "Eldritch", "Sovereign", "Arcane",
+            "Paradox", "Oblivion", "Singularity", "Transcendent", "Omnipotent",
+            "Seraphic", "Valentine"
+        }
 
-        if not sawRealEntry then
-            print("No real stock entries appeared within timeout (likely genuinely empty this cycle)")
-        end
+        local POTION_ORDER = {
+            "Luck I", "Cash I", "Luck II", "Cash II", "Mutation I", "Dice Consumption I",
+            "Luck III", "Cash III", "Mutation II", "Godly Cash", "Godly Luck", "Egg Luck I",
+            "Dice Consumption II", "Egg Luck II", "Godly Mutation", "Godly Dice Consumption", "Godly Egg Luck"
+        }
 
-        local holder = getMerchantHolder()
-        local children = holder:GetChildren()
-        table.sort(children, function(a, b)
-            local aOrder = (pcall(function() return a.LayoutOrder end)) and a.LayoutOrder or 0
-            local bOrder = (pcall(function() return b.LayoutOrder end)) and b.LayoutOrder or 0
-            return aOrder < bOrder
-        end)
+        local FOOD_ORDER = {
+            "Apple", "Potato", "Carrot", "Loaf", "Fish", "Steak"
+        }
 
-        -- figure out what's actually in stock (category + item name pairs)
-        local toBuy = {}
-        local currentCategory = nil
-        for _, entry in ipairs(children) do
-            local nameLabel = entry:FindFirstChild("NameLabel")
-            if entry.Name == "TextPlaceHolder" and nameLabel then
-                currentCategory = nameLabel.Text
-            elseif entry.Name:find("Template") then
-                -- skip clone-source templates, never real stock
-            elseif entry:IsA("Frame") or entry:IsA("ImageButton") or entry:IsA("TextButton") or entry:IsA("CanvasGroup") then
-                local itemNameLabel = entry:FindFirstChild("DiceName") or entry:FindFirstChild("FoodName")
-                local stockLabel = entry:FindFirstChild("Stock")
-                if itemNameLabel and currentCategory then
-                    local stockText = stockLabel and stockLabel.Text or ""
-                    if stockText ~= "Sold out" and stockText ~= "" then
-                        table.insert(toBuy, {category = currentCategory, itemName = itemNameLabel.Text})
-                    end
-                end
+        local EXCLUSIVE_ORDER = {
+            "Holy Token", "Rainbow Godly"
+        }
+
+        local categories = {
+            {name = "Dices", items = DICE_ORDER},
+            {name = "Potions", items = POTION_ORDER},
+            {name = "Foods", items = FOOD_ORDER},
+            {name = "Exclusives", items = EXCLUSIVE_ORDER},
+        }
+
+        local bought = 0
+
+        for _, cat in ipairs(categories) do
+            for _, itemName in ipairs(cat.items) do
+                pcall(function()
+                    MerchantRemote:FireServer("BuyAll", cat.name, itemName)
+                end)
+                print(("Bought %s (%s)"):format(itemName, cat.name))
+                bought += 1
+                task.wait(0.12)
             end
         end
 
-        if #toBuy == 0 then
-            warn("No purchasable items found — GUI may not have opened in time, or genuinely no stock")
-        end
+        -- Hold pin a bit after buys
+        task.wait(0.8)
+        pinning = false
+        task.wait(0.1)
+        pinConn:Disconnect()
 
-        -- pin position for the whole buying sequence, fire each in-stock item
-        -- once (staggered), then hold the pin for the remaining time so the
-        -- pin lasts PIN_DURATION total
-        local stopPin = startPin(hrp, part.CFrame)
-        local pinStart = tick()
+        print(("Done — fired %d BuyAll(s) from Merchant"):format(bought))
 
-        for _, item in ipairs(toBuy) do
-            pcall(function()
-                MerchantRemote:FireServer("BuyAll", item.category, item.itemName)
-            end)
-            task.wait(0.15)
-        end
+        -- 5 second delay before continuing other tasks
+        task.wait(5)
 
-        local remaining = PIN_DURATION - (tick() - pinStart)
-        if remaining > 0 then
-            task.wait(remaining)
-        end
-
-        stopPin()
-        print(("Done with Merchant (%d item(s) targeted) → eggs"):format(#toBuy))
-        goToEggs(hrp)
+        local hrp2 = getHRP()
+        goToEggs(hrp2)
+        print("Merchant finished → eggs")
     end)
 end
 
