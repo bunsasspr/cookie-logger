@@ -1,14 +1,3 @@
-local Players = game:GetService("Players")
-local RS = game:GetService("ReplicatedStorage")
-local RunService = game:GetService("RunService")
-local player = Players.LocalPlayer
-local MerchantRemote = RS:WaitForChild("Remotes"):WaitForChild("Merchant")
-
-MerchantRemote.OnClientEvent:Connect(function(...)
-    print("[Merchant OnClientEvent]", os.date("%X"), ...)
-end)
-print("Listening on Merchant.OnClientEvent...")
-
 local mapShop = workspace.Map:FindFirstChild("MapShop")
 local model = mapShop and mapShop:FindFirstChild("Merchant")
 
@@ -17,50 +6,39 @@ if not model then
     return
 end
 
-local part = model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart", true)
-if not part then
-    warn("No BasePart on Merchant model")
+local prompt
+for _, inst in ipairs(model:GetDescendants()) do
+    if inst:IsA("ProximityPrompt") then
+        prompt = inst
+        break
+    end
+end
+
+if not prompt then
+    warn("No ProximityPrompt found on Merchant")
     return
 end
 
-local char = player.Character or player.CharacterAdded:Wait()
-local hrp = char:WaitForChild("HumanoidRootPart")
-local target = part.CFrame
+print("Prompt path:", prompt:GetFullName())
+print("ActionText:", prompt.ActionText)
+print("ObjectText:", prompt.ObjectText)
+print("HoldDuration:", prompt.HoldDuration)
+print("MaxActivationDistance:", prompt.MaxActivationDistance)
+print("RequiresLineOfSight:", prompt.RequiresLineOfSight)
+print("Enabled:", prompt.Enabled)
+print("Style:", prompt.Style)
+print("KeyboardKeyCode:", prompt.KeyboardKeyCode)
+print("UIOffset:", prompt.UIOffset)
 
-hrp.CFrame = target
-hrp.AssemblyLinearVelocity = Vector3.zero
-hrp.AssemblyAngularVelocity = Vector3.zero
-
-local pinning = true
-local pinConn = RunService.Heartbeat:Connect(function()
-    if pinning then
-        hrp.CFrame = target
-        hrp.AssemblyLinearVelocity = Vector3.zero
-        hrp.AssemblyAngularVelocity = Vector3.zero
-    end
+-- also watch if the Merchant GUI's visibility ever changes, in case it opens
+-- but somewhere off-screen or the Visible property just isn't flipping
+local ok, mainFrame = pcall(function()
+    return game.Players.LocalPlayer.PlayerGui.Main.Canvas.Merchant.Main
 end)
-
-print("Pinned at Merchant (no prompt fired) — polling Holder for 6s...")
-
-local deadline = tick() + 6
-while tick() < deadline do
-    local ok, holder = pcall(function()
-        return player.PlayerGui.Main.Canvas.Merchant.Main.Holder
+if ok and mainFrame then
+    print("Merchant.Main currently Visible:", mainFrame.Visible)
+    mainFrame:GetPropertyChangedSignal("Visible"):Connect(function()
+        print("[Merchant.Main.Visible changed to]", mainFrame.Visible, os.date("%X"))
     end)
-    if ok and holder then
-        for _, entry in ipairs(holder:GetChildren()) do
-            if entry.Name ~= "TextPlaceHolder" and not entry.Name:find("Template") then
-                local diceName = entry:FindFirstChild("DiceName")
-                local foodName = entry:FindFirstChild("FoodName")
-                if diceName or foodName then
-                    print(("[Holder, pinned, no prompt] Real entry: %s"):format(entry.Name))
-                end
-            end
-        end
-    end
-    task.wait(0.5)
+    print("Watching for Visible changes... now try fireproximityprompt or interact manually")
 end
-
-pinning = false
-pinConn:Disconnect()
-print("Done polling.")
