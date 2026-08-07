@@ -42,6 +42,8 @@ local REBIRTH_CHECK_INTERVAL = 2 -- seconds
 local REBIRTH_COOLDOWN = 5 -- seconds, let GUI/state settle after rebirthing
 local NPC_CHECK_INTERVAL = 3 -- seconds, for FoodCart/Merchant existence polling
 local EGG_SPAM_DELAY = 0.15 -- delay between egg opens
+local ACTION_SETTLE_DELAY = 0.6 -- pause right after acquiring the lock, before doing anything
+local TELEPORT_SETTLE_DELAY = 0.5 -- pause after every teleport before firing a remote
 
 local FOODCART_ITEMS = {
     "Apple",
@@ -89,12 +91,18 @@ local potions = {
 -- ===== Movement lock =====
 -- Dice/potion/sell/rebirth/foodcart/merchant/equip all teleport the character.
 -- Only one action may move the player at a time, or loops will fight over CFrame.
+-- A small settle delay runs right after the lock is acquired so the server has
+-- time to register the previous action's final position/state before the next
+-- one starts moving and firing remotes — this is what was causing actions to
+-- teleport without their remote actually registering when several NPCs/timers
+-- became ready back-to-back.
 local actionLock = false
 local function withLock(fn)
     while actionLock do
         task.wait(0.2)
     end
     actionLock = true
+    task.wait(ACTION_SETTLE_DELAY)
     local ok, err = pcall(fn)
     actionLock = false
     if not ok then
@@ -128,12 +136,14 @@ end
 
 local function goToEggs(hrp)
     hrp.CFrame = EGG_CFRAME
+    task.wait(TELEPORT_SETTLE_DELAY)
 end
 
 local function returnToPlot(hrp)
     local plotCF = getMyPlotCFrame()
     if plotCF then
         hrp.CFrame = plotCF
+        task.wait(TELEPORT_SETTLE_DELAY)
     else
         warn("Could not find your plot!")
     end
@@ -179,7 +189,7 @@ local function buyDice()
     withLock(function()
         local hrp = getHRP()
         hrp.CFrame = DICE_SHOP
-        task.wait(0.35)
+        task.wait(TELEPORT_SETTLE_DELAY)
         BuyDice:FireServer("BuyBestAvailable")
         task.wait(0.3)
         goToEggs(hrp)
@@ -217,7 +227,7 @@ local function buyPotion()
     withLock(function()
         local hrp = getHRP()
         hrp.CFrame = POTION_SHOP
-        task.wait(0.35)
+        task.wait(TELEPORT_SETTLE_DELAY)
         BuyPotion:FireServer("BuyBestAvailable")
         task.wait(0.3)
         goToEggs(hrp)
@@ -256,7 +266,6 @@ end)
 local function equipAtPlot(duration)
     local hrp = getHRP()
     returnToPlot(hrp)
-    task.wait(0.4)
 
     local elapsed = 0
     local count = 0
@@ -302,7 +311,6 @@ local function sellInventory()
 
         -- Equip a few times at plot first
         returnToPlot(hrp)
-        task.wait(0.4)
         for i = 1, EQUIP_BEFORE_SELL_COUNT do
             pcall(function()
                 EquipBest:FireServer()
@@ -313,12 +321,11 @@ local function sellInventory()
 
         -- Then go sell
         hrp.CFrame = SELL_CFRAME
-        task.wait(0.4)
+        task.wait(TELEPORT_SETTLE_DELAY)
         Dialogue:InvokeServer("SellNpc", 1, "I want to sell my inventory", "preview")
         task.wait(1.5)
         Dialogue:InvokeServer("SellNpc", 1, "I want to sell my inventory", "commit")
         print("Sold inventory → eggs")
-        task.wait(0.3)
         goToEggs(hrp)
     end)
 end
@@ -394,17 +401,24 @@ local function buyFoodCart()
 
         local hrp = getHRP()
         hrp.CFrame = part.CFrame
-        task.wait(0.5)
+        task.wait(TELEPORT_SETTLE_DELAY)
+
+        -- re-check it's still there after settling, in case it despawned
+        -- while we were waiting on the lock or settling
+        if not getFoodCartModel() then
+            warn("FoodCart despawned right before buying")
+            goToEggs(hrp)
+            return
+        end
 
         for _, item in ipairs(FOODCART_ITEMS) do
             pcall(function()
                 FoodCartRemote:FireServer("BuyAll", item)
             end)
-            task.wait(0.2)
+            task.wait(0.25)
         end
 
         print("Bought all FoodCart items → eggs")
-        task.wait(0.3)
         goToEggs(hrp)
     end)
 end
@@ -457,7 +471,15 @@ local function buyAllFromMerchant()
 
         local hrp = getHRP()
         hrp.CFrame = part.CFrame
-        task.wait(0.3)
+        task.wait(TELEPORT_SETTLE_DELAY)
+
+        -- re-check it's still there after settling
+        model = getMerchantModel()
+        if not model then
+            warn("Merchant despawned right before buying")
+            goToEggs(hrp)
+            return
+        end
 
         local prompt = findProximityPrompt(model)
         if prompt then
@@ -497,7 +519,7 @@ local function buyAllFromMerchant()
                         end)
                         print(("Bought %s (%s)"):format(itemName, currentCategory))
                         bought += 1
-                        task.wait(0.2)
+                        task.wait(0.25)
                     end
                 end
             end
