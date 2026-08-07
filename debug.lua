@@ -1,6 +1,4 @@
--- ===== Game Dumper (Client-side readable content) =====
--- Creates a folder structure and saves decompiled scripts + hierarchy
-
+-- ===== Game Dumper → /sdcard/Pictures =====
 local ServicesToDump = {
     "ReplicatedStorage",
     "Workspace",
@@ -13,9 +11,8 @@ local ServicesToDump = {
 }
 
 local MAX_DEPTH = 12
-local OUTPUT_ROOT = "GameDump_" .. os.date("%Y-%m-%d_%H-%M-%S")
+local OUTPUT_ROOT = "/sdcard/Pictures/GameDump_" .. os.date("%Y-%m-%d_%H-%M-%S")
 
--- Executor file functions (most modern executors support these)
 local function safeMakeFolder(path)
     pcall(function()
         if not isfolder(path) then
@@ -32,7 +29,7 @@ end
 
 local function getDecompiled(script)
     local ok, source = pcall(function()
-        return decompile(script) -- most executors have this
+        return decompile(script)
     end)
     if ok and type(source) == "string" and #source > 0 then
         return source
@@ -55,7 +52,6 @@ local function dumpInstance(inst, currentPath, depth)
     if inst:IsA("Folder") or inst:IsA("Configuration") or inst:IsA("Model") then
         safeMakeFolder(fullPath)
     elseif inst:IsA("ModuleScript") or inst:IsA("LocalScript") or inst:IsA("Script") then
-        -- Save the decompiled source
         local source = getDecompiled(inst)
         local fileName = fullPath .. ".lua"
         safeWriteFile(fileName, "-- Path: " .. inst:GetFullName() .. "\n-- Class: " .. inst.ClassName .. "\n\n" .. source)
@@ -66,14 +62,12 @@ local function dumpInstance(inst, currentPath, depth)
         safeWriteFile(fullPath .. ".txt", content)
     end
 
-    -- Recurse children
     for _, child in ipairs(inst:GetChildren()) do
         dumpInstance(child, fullPath, depth + 1)
     end
 end
 
--- Start
-print("Starting dump...")
+print("Starting dump to /sdcard/Pictures/ ...")
 safeMakeFolder(OUTPUT_ROOT)
 
 for _, serviceName in ipairs(ServicesToDump) do
@@ -92,6 +86,6 @@ end
 print("========================================")
 print("Dump finished!")
 print("Scripts dumped:", dumped)
-print("Folder created:", OUTPUT_ROOT)
-print("Check your executor's workspace folder.")
+print("Saved to:", OUTPUT_ROOT)
+print("Check your Gallery / Files app → Pictures")
 print("========================================")
