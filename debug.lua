@@ -1,4 +1,4 @@
--- ===== Spam-pin TP to Merchant + buy everything =====
+-- ===== Standalone: pin Merchant + buy everything =====
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
@@ -39,9 +39,15 @@ if not part then
 end
 
 local hrp = getHRP()
-local targetCFrame = part.CFrame
+local targetCFrame = part.CFrame -- NO offset this time, land exactly on it
 
--- Pin the character to the target every frame, countering any physics push-out
+-- Teleport once first
+hrp.CFrame = targetCFrame
+hrp.AssemblyLinearVelocity = Vector3.zero
+hrp.AssemblyAngularVelocity = Vector3.zero
+task.wait(0.3)
+
+-- Start pinning (every frame, no offset, counters any push-out)
 local pinning = true
 local pinConn = RunService.Heartbeat:Connect(function()
     if pinning then
@@ -51,16 +57,17 @@ local pinConn = RunService.Heartbeat:Connect(function()
     end
 end)
 
-task.wait(0.5) -- let the pin take hold before interacting
-
 local prompt = findProximityPrompt(model)
 if prompt then
+    print("MaxActivationDistance:", prompt.MaxActivationDistance)
     pcall(function()
         fireproximityprompt(prompt)
     end)
+else
+    warn("No ProximityPrompt found")
 end
 
-task.wait(0.8) -- let the GUI populate while still pinned
+task.wait(0.8) -- let the GUI populate while pinned
 
 local holder = player.PlayerGui.Main.Canvas.Merchant.Main.Holder
 local children = holder:GetChildren()
@@ -70,36 +77,38 @@ table.sort(children, function(a, b)
     return aOrder < bOrder
 end)
 
+local toBuy = {}
 local currentCategory = nil
-local bought = 0
-
 for _, entry in ipairs(children) do
     local nameLabel = entry:FindFirstChild("NameLabel")
     if entry.Name == "TextPlaceHolder" and nameLabel then
         currentCategory = nameLabel.Text
     elseif entry.Name:find("Template") then
-        -- skip clone-source templates
+        -- skip
     elseif entry:IsA("Frame") or entry:IsA("ImageButton") or entry:IsA("TextButton") or entry:IsA("CanvasGroup") then
         local itemNameLabel = entry:FindFirstChild("DiceName") or entry:FindFirstChild("FoodName")
         local stockLabel = entry:FindFirstChild("Stock")
-
         if itemNameLabel and currentCategory then
             local stockText = stockLabel and stockLabel.Text or ""
             if stockText ~= "Sold out" and stockText ~= "" then
-                local itemName = itemNameLabel.Text
-                pcall(function()
-                    MerchantRemote:FireServer("BuyAll", currentCategory, itemName)
-                end)
-                print(("Bought %s (%s)"):format(itemName, currentCategory))
-                bought += 1
-                task.wait(0.25) -- still pinned during this wait
+                table.insert(toBuy, {category = currentCategory, itemName = itemNameLabel.Text})
             end
         end
     end
 end
 
-print(("Done — bought %d item(s) from Merchant"):format(bought))
+print(("Found %d purchasable item(s)"):format(#toBuy))
 
--- stop pinning
+for _, item in ipairs(toBuy) do
+    pcall(function()
+        MerchantRemote:FireServer("BuyAll", item.category, item.itemName)
+    end)
+    print(("Fired: %s (%s)"):format(item.itemName, item.category))
+    task.wait(0.2)
+end
+
+task.wait(1) -- hold pin a bit after firing
+
 pinning = false
 pinConn:Disconnect()
+print("Done")
