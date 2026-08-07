@@ -3,7 +3,6 @@ local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
 local UIS = game:GetService("UserInputService")
 local VirtualUser = game:GetService("VirtualUser")
-local RunService = game:GetService("RunService")
 
 local player = Players.LocalPlayer
 local remotes = RS:WaitForChild("Remotes")
@@ -33,7 +32,7 @@ local EGG_CFRAME = CFrame.new(-198.375092, 3.67208314, 168.48439, -0.455900133, 
 local enabled = false
 local WAIT_AFTER_BUY = 120 -- fallback if a timer label can't be read
 local RESTOCK_BUFFER = 2 -- extra seconds after "0:00" to make sure server has actually restocked
-local SELL_THRESHOLD = 145
+local SELL_THRESHOLD = 30
 local SELL_CHECK_INTERVAL = 5 -- seconds
 local EQUIP_INTERVAL = 300 -- 5 minutes between equip sessions
 local EQUIP_SESSION_DURATION = 20 -- stay at plot for this many seconds
@@ -43,6 +42,11 @@ local REBIRTH_CHECK_INTERVAL = 2 -- seconds
 local REBIRTH_COOLDOWN = 5 -- seconds, let GUI/state settle after rebirthing
 local NPC_CHECK_INTERVAL = 3 -- seconds, for FoodCart/Merchant existence polling
 local EGG_SPAM_DELAY = 0.15 -- delay between egg opens
+local ACTION_SETTLE_DELAY = 0.6 -- pause right after acquiring the lock, before doing anything
+local TELEPORT_SETTLE_DELAY = 0.5 -- pause after every teleport before firing a remote
+local BUY_STAND_DURATION = 2 -- seconds to stand and spam-fire buy remotes (dice/potion)
+local BUY_FIRE_INTERVAL = 0.5 -- seconds between each spam-fire (dice/potion)
+local PIN_DURATION = 5 -- seconds to hold the pin for merchant while buying, before heading back to eggs
 
 local FOODCART_ITEMS = {
     "Apple",
@@ -90,12 +94,18 @@ local potions = {
 -- ===== Movement lock =====
 -- Dice/potion/sell/rebirth/foodcart/merchant/equip all teleport the character.
 -- Only one action may move the player at a time, or loops will fight over CFrame.
+-- A small settle delay runs right after the lock is acquired so the server has
+-- time to register the previous action's final position/state before the next
+-- one starts moving and firing remotes — this is what was causing actions to
+-- teleport without their remote actually registering when several NPCs/timers
+-- became ready back-to-back.
 local actionLock = false
 local function withLock(fn)
     while actionLock do
         task.wait(0.2)
     end
     actionLock = true
+    task.wait(ACTION_SETTLE_DELAY)
     local ok, err = pcall(fn)
     actionLock = false
     if not ok then
@@ -103,9 +113,39 @@ local function withLock(fn)
     end
 end
 
+-- Pins the character to a CFrame every frame (countering the physics push-out
+-- glitch) until stopped. Returns a function to call when done pinning.
+local RunService = game:GetService("RunService")
+local function startPin(hrp, cframe)
+    local pinning = true
+    local conn
+    conn = RunService.Heartbeat:Connect(function()
+        if pinning then
+            hrp.CFrame = cframe
+            hrp.AssemblyLinearVelocity = Vector3.zero
+            hrp.AssemblyAngularVelocity = Vector3.zero
+        end
+    end)
+    return function()
+        pinning = false
+        conn:Disconnect()
+    end
+end
+
 local function getHRP()
     local char = player.Character or player.CharacterAdded:Wait()
     return char:WaitForChild("HumanoidRootPart")
+end
+
+-- Teleports the character to a CFrame, offset slightly backward so it doesn't
+-- land inside the target's collision geometry (which causes Roblox to shove
+-- the character back out, sometimes well outside interaction range), and
+-- zeroes velocity afterward so no leftover momentum carries into that push.
+local function teleportTo(hrp, cframe, backOffset)
+    backOffset = backOffset or 4
+    hrp.CFrame = cframe * CFrame.new(0, 0, backOffset)
+    hrp.AssemblyLinearVelocity = Vector3.zero
+    hrp.AssemblyAngularVelocity = Vector3.zero
 end
 
 local function getMyPlotCFrame()
@@ -128,13 +168,15 @@ local function getMyPlotCFrame()
 end
 
 local function goToEggs(hrp)
-    hrp.CFrame = EGG_CFRAME
+    teleportTo(hrp, EGG_CFRAME)
+    task.wait(TELEPORT_SETTLE_DELAY)
 end
 
 local function returnToPlot(hrp)
     local plotCF = getMyPlotCFrame()
     if plotCF then
-        hrp.CFrame = plotCF
+        teleportTo(hrp, plotCF)
+        task.wait(TELEPORT_SETTLE_DELAY)
     else
         warn("Could not find your plot!")
     end
@@ -179,10 +221,18 @@ end)
 local function buyDice()
     withLock(function()
         local hrp = getHRP()
-        hrp.CFrame = DICE_SHOP
-        task.wait(0.35)
-        BuyDice:FireServer("BuyBestAvailable")
-        task.wait(0.3)
+        teleportTo(hrp, DICE_SHOP)
+        task.wait(TELEPORT_SETTLE_DELAY)
+
+        local elapsed = 0
+        while elapsed < BUY_STAND_DURATION do
+            pcall(function()
+                BuyDice:FireServer("BuyBestAvailable")
+            end)
+            task.wait(BUY_FIRE_INTERVAL)
+            elapsed += BUY_FIRE_INTERVAL
+        end
+
         goToEggs(hrp)
         print("Bought dice → eggs")
     end)
@@ -217,10 +267,18 @@ end)
 local function buyPotion()
     withLock(function()
         local hrp = getHRP()
-        hrp.CFrame = POTION_SHOP
-        task.wait(0.35)
-        BuyPotion:FireServer("BuyBestAvailable")
-        task.wait(0.3)
+        teleportTo(hrp, POTION_SHOP)
+        task.wait(TELEPORT_SETTLE_DELAY)
+
+        local elapsed = 0
+        while elapsed < BUY_STAND_DURATION do
+            pcall(function()
+                BuyPotion:FireServer("BuyBestAvailable")
+            end)
+            task.wait(BUY_FIRE_INTERVAL)
+            elapsed += BUY_FIRE_INTERVAL
+        end
+
         goToEggs(hrp)
         task.wait(0.5)
         useAllPotions()
@@ -257,7 +315,6 @@ end)
 local function equipAtPlot(duration)
     local hrp = getHRP()
     returnToPlot(hrp)
-    task.wait(0.4)
 
     local elapsed = 0
     local count = 0
@@ -303,7 +360,6 @@ local function sellInventory()
 
         -- Equip a few times at plot first
         returnToPlot(hrp)
-        task.wait(0.4)
         for i = 1, EQUIP_BEFORE_SELL_COUNT do
             pcall(function()
                 EquipBest:FireServer()
@@ -313,13 +369,12 @@ local function sellInventory()
         end
 
         -- Then go sell
-        hrp.CFrame = SELL_CFRAME
-        task.wait(0.4)
+        teleportTo(hrp, SELL_CFRAME)
+        task.wait(TELEPORT_SETTLE_DELAY)
         Dialogue:InvokeServer("SellNpc", 1, "I want to sell my inventory", "preview")
         task.wait(1.5)
         Dialogue:InvokeServer("SellNpc", 1, "I want to sell my inventory", "commit")
         print("Sold inventory → eggs")
-        task.wait(0.3)
         goToEggs(hrp)
     end)
 end
@@ -394,18 +449,25 @@ local function buyFoodCart()
         end
 
         local hrp = getHRP()
-        hrp.CFrame = part.CFrame
-        task.wait(0.5)
+        teleportTo(hrp, part.CFrame, 0)
+        task.wait(TELEPORT_SETTLE_DELAY)
+
+        -- re-check it's still there after settling, in case it despawned
+        -- while we were waiting on the lock or settling
+        if not getFoodCartModel() then
+            warn("FoodCart despawned right before buying")
+            goToEggs(hrp)
+            return
+        end
 
         for _, item in ipairs(FOODCART_ITEMS) do
             pcall(function()
                 FoodCartRemote:FireServer("BuyAll", item)
             end)
-            task.wait(0.2)
+            task.wait(0.15)
         end
 
-        print("Bought all FoodCart items → eggs")
-        task.wait(0.3)
+        print("Done with FoodCart → eggs")
         goToEggs(hrp)
     end)
 end
@@ -442,6 +504,14 @@ local function findProximityPrompt(model)
     return nil
 end
 
+local function getMerchantHolder()
+    local ok, holder = pcall(function()
+        return player.PlayerGui.Main.Canvas.Merchant.Main.Holder
+    end)
+    if ok then return holder end
+    return nil
+end
+
 local function buyAllFromMerchant()
     withLock(function()
         local model = getMerchantModel()
@@ -457,36 +527,29 @@ local function buyAllFromMerchant()
         end
 
         local hrp = getHRP()
-        local targetCFrame = part.CFrame -- exact position, no offset
+        teleportTo(hrp, part.CFrame, 0) -- zero offset — must land exactly on it for the prompt to activate
+        task.wait(TELEPORT_SETTLE_DELAY)
 
-        -- Initial teleport + kill velocity
-        hrp.CFrame = targetCFrame
-        hrp.AssemblyLinearVelocity = Vector3.zero
-        hrp.AssemblyAngularVelocity = Vector3.zero
-        task.wait(0.25)
+        -- re-check it's still there after settling
+        model = getMerchantModel()
+        if not model then
+            warn("Merchant despawned right before buying")
+            goToEggs(hrp)
+            return
+        end
 
-        -- Hard pin every frame while we interact
-        local pinning = true
-        local pinConn = RunService.Heartbeat:Connect(function()
-            if not pinning or not hrp or not hrp.Parent then return end
-            hrp.CFrame = targetCFrame
-            hrp.AssemblyLinearVelocity = Vector3.zero
-            hrp.AssemblyAngularVelocity = Vector3.zero
-        end)
-
-        -- Open the merchant GUI
         local prompt = findProximityPrompt(model)
         if prompt then
+            print("Merchant prompt MaxActivationDistance:", prompt.MaxActivationDistance)
             pcall(function()
                 fireproximityprompt(prompt)
             end)
         else
-            warn("No ProximityPrompt found on Merchant")
+            warn("No ProximityPrompt found on Merchant model")
         end
-        task.wait(0.8) -- let GUI populate while pinned
+        task.wait(0.5) -- let the GUI populate
 
-        -- Collect all buyable items first
-        local holder = player.PlayerGui.Main.Canvas.Merchant.Main.Holder
+        local holder = getMerchantHolder()
         local children = holder:GetChildren()
         table.sort(children, function(a, b)
             local aOrder = (pcall(function() return a.LayoutOrder end)) and a.LayoutOrder or 0
@@ -494,57 +557,52 @@ local function buyAllFromMerchant()
             return aOrder < bOrder
         end)
 
+        -- figure out what's actually in stock (category + item name pairs)
         local toBuy = {}
         local currentCategory = nil
-
         for _, entry in ipairs(children) do
             local nameLabel = entry:FindFirstChild("NameLabel")
             if entry.Name == "TextPlaceHolder" and nameLabel then
                 currentCategory = nameLabel.Text
             elseif entry.Name:find("Template") then
-                -- skip templates
+                -- skip clone-source templates, never real stock
             elseif entry:IsA("Frame") or entry:IsA("ImageButton") or entry:IsA("TextButton") or entry:IsA("CanvasGroup") then
                 local itemNameLabel = entry:FindFirstChild("DiceName") or entry:FindFirstChild("FoodName")
                 local stockLabel = entry:FindFirstChild("Stock")
-
                 if itemNameLabel and currentCategory then
                     local stockText = stockLabel and stockLabel.Text or ""
                     if stockText ~= "Sold out" and stockText ~= "" then
-                        table.insert(toBuy, {
-                            category = currentCategory,
-                            itemName = itemNameLabel.Text
-                        })
+                        table.insert(toBuy, {category = currentCategory, itemName = itemNameLabel.Text})
                     end
                 end
             end
         end
 
-        print(("Found %d purchasable item(s) from Merchant"):format(#toBuy))
+        if #toBuy == 0 then
+            warn("No purchasable items found — GUI may not have opened in time, or genuinely no stock")
+        end
 
-        -- Fire buys while still pinned
+        -- pin position for the whole buying sequence, fire each in-stock item
+        -- once (staggered), then hold the pin for the remaining time so the
+        -- pin lasts PIN_DURATION total
+        local stopPin = startPin(hrp, part.CFrame)
+        local pinStart = tick()
+
         for _, item in ipairs(toBuy) do
             pcall(function()
                 MerchantRemote:FireServer("BuyAll", item.category, item.itemName)
             end)
-            print(("Bought %s (%s)"):format(item.itemName, item.category))
-            task.wait(0.2)
+            task.wait(0.15)
         end
 
-        -- Hold pin a moment after last buy, then soft release
-        task.wait(0.8)
-        pinning = false
-        task.wait(0.1)
-        pinConn:Disconnect()
+        local remaining = PIN_DURATION - (tick() - pinStart)
+        if remaining > 0 then
+            task.wait(remaining)
+        end
 
-        print(("Done — bought %d item(s) from Merchant"):format(#toBuy))
-
-        -- 5 second delay before continuing other tasks
-        task.wait(5)
-
-        -- Return to eggs
-        local hrp2 = getHRP()
-        goToEggs(hrp2)
-        print("Merchant finished → eggs")
+        stopPin()
+        print(("Done with Merchant (%d item(s) targeted) → eggs"):format(#toBuy))
+        goToEggs(hrp)
     end)
 end
 
