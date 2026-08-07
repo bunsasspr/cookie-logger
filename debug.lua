@@ -1,97 +1,109 @@
--- ===== Game Dumper (Client-side readable content) =====
--- Creates a folder structure and saves decompiled scripts + hierarchy
+-- ============================================================
+--  AUTO COLLECT MONEY — Standalone
+--  Triggers the plot's money collector from anywhere
+--  Uses firetouchinterest() to fire the Touched event
+-- ============================================================
 
-local ServicesToDump = {
-    "ReplicatedStorage",
-    "Workspace",
-    "Players",
-    "Lighting",
-    "StarterGui",
-    "StarterPlayer",
-    "SoundService",
-    "Chat",
-}
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local VirtualUser = game:GetService("VirtualUser")
 
-local MAX_DEPTH = 12
-local OUTPUT_ROOT = "GameDump_" .. os.date("%Y-%m-%d_%H-%M-%S")
+local player = Players.LocalPlayer
 
--- Executor file functions (most modern executors support these)
-local function safeMakeFolder(path)
-    pcall(function()
-        if not isfolder(path) then
-            makefolder(path)
-        end
-    end)
-end
+-- ===== Anti AFK =====
+player.Idled:Connect(function()
+    VirtualUser:CaptureController()
+    VirtualUser:ClickButton2(Vector2.new())
+end)
 
-local function safeWriteFile(path, content)
-    pcall(function()
-        writefile(path, content)
-    end)
-end
+-- ===== Config =====
+local COLLECT_INTERVAL = 1.5  -- seconds between collect attempts
+local TOUCH_DURATION = 0.3    -- how long to "touch" the collector
 
-local function getDecompiled(script)
-    local ok, source = pcall(function()
-        return decompile(script) -- most executors have this
-    end)
-    if ok and type(source) == "string" and #source > 0 then
-        return source
-    end
-    return "-- [Could not decompile]\n"
-end
-
-local function sanitizeName(name)
-    return name:gsub("[<>:\"/\\|?*]", "_")
-end
-
-local dumped = 0
-
-local function dumpInstance(inst, currentPath, depth)
-    if depth > MAX_DEPTH then return end
-
-    local name = sanitizeName(inst.Name)
-    local fullPath = currentPath .. "/" .. name
-
-    if inst:IsA("Folder") or inst:IsA("Configuration") or inst:IsA("Model") then
-        safeMakeFolder(fullPath)
-    elseif inst:IsA("ModuleScript") or inst:IsA("LocalScript") or inst:IsA("Script") then
-        -- Save the decompiled source
-        local source = getDecompiled(inst)
-        local fileName = fullPath .. ".lua"
-        safeWriteFile(fileName, "-- Path: " .. inst:GetFullName() .. "\n-- Class: " .. inst.ClassName .. "\n\n" .. source)
-        dumped += 1
-        print("Dumped:", inst:GetFullName())
-    elseif inst:IsA("StringValue") or inst:IsA("NumberValue") or inst:IsA("BoolValue") or inst:IsA("ObjectValue") then
-        local content = tostring(inst.Value)
-        safeWriteFile(fullPath .. ".txt", content)
-    end
-
-    -- Recurse children
-    for _, child in ipairs(inst:GetChildren()) do
-        dumpInstance(child, fullPath, depth + 1)
-    end
-end
-
--- Start
-print("Starting dump...")
-safeMakeFolder(OUTPUT_ROOT)
-
-for _, serviceName in ipairs(ServicesToDump) do
-    local service = game:FindService(serviceName) or game:GetService(serviceName)
-    if service then
-        local servicePath = OUTPUT_ROOT .. "/" .. serviceName
-        safeMakeFolder(servicePath)
-        print("Dumping service:", serviceName)
-
-        for _, child in ipairs(service:GetChildren()) do
-            dumpInstance(child, servicePath, 1)
+-- ===== Find your plot =====
+local function getMyPlot()
+    local plotsFolder = workspace:FindFirstChild("Map") and workspace.Map:FindFirstChild("Plots")
+    if not plotsFolder then return nil end
+    for _, plot in ipairs(plotsFolder:GetChildren()) do
+        local owner = plot:GetAttribute("Owner") or plot:GetAttribute("owner")
+        if owner == player.UserId or tostring(owner) == tostring(player.UserId) then
+            return plot
         end
     end
+    return nil
 end
 
-print("========================================")
-print("Dump finished!")
-print("Scripts dumped:", dumped)
-print("Folder created:", OUTPUT_ROOT)
-print("Check your executor's workspace folder.")
-print("========================================")
+-- ===== Find the collector part (the money button you step on) =====
+local function getCollectorPart()
+    local plot = getMyPlot()
+    if not plot then return nil end
+
+    -- Search for any part with a TouchInterest (the "step on" collector)
+    for _, part in ipairs(plot:GetDescendants()) do
+        if part:IsA("BasePart") and part:FindFirstChildOfClass("TouchTransmitter") then
+            -- Prefer parts named Collector/Collect/Button/Money
+            local name = part.Name:lower()
+            if name:find("collect") or name:find("money") or name:find("button") or name:find("cash") then
+                return part
+            end
+        end
+    end
+
+    -- Fallback: any part with TouchTransmitter on the plot
+    for _, part in ipairs(plot:GetDescendants()) do
+        if part:IsA("BasePart") and part:FindFirstChildOfClass("TouchTransmitter") then
+            return part
+        end
+    end
+
+    -- Last resort: check ItemHolder1 specifically
+    local floor1 = plot:FindFirstChild("Floor1")
+    if floor1 then
+        local holders = floor1:FindFirstChild("Holders")
+        if holders then
+            local itemHolder = holders:FindFirstChild("ItemHolder1")
+            if itemHolder then
+                for _, part in ipairs(itemHolder:GetDescendants()) do
+                    if part:IsA("BasePart") and part:FindFirstChildOfClass("TouchTransmitter") then
+                        return part
+                    end
+                end
+            end
+        end
+    end
+
+    return nil
+end
+
+-- ===== Fire the touch event from anywhere =====
+local function collectMoney()
+    local collector = getCollectorPart()
+    if not collector then return false end
+
+    local char = player.Character
+    if not char then return false end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return false end
+
+    -- firetouchinterest triggers the Touched event without being there
+    local ok = pcall(function()
+        firetouchinterest(collector, hrp, 0)  -- 0 = touch start
+        task.wait(TOUCH_DURATION)
+        firetouchinterest(collector, hrp, 1)  -- 1 = touch end
+    end)
+
+    return ok
+end
+
+-- ===== Main loop =====
+task.spawn(function()
+    while true do
+        local ok = pcall(collectMoney)
+        if not ok then
+            -- collector not found yet, keep trying
+        end
+        task.wait(COLLECT_INTERVAL)
+    end
+end)
+
+print("✅ Auto Collect loaded! Collecting money every " .. COLLECT_INTERVAL .. "s")
