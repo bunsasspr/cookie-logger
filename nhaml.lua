@@ -456,21 +456,22 @@ local function buyAllFromMerchant()
         end
 
         local hrp = getHRP()
+        local merchantCF = part.CFrame
 
-        -- Pin to merchant for 2 seconds so we stay in range even if physics glitches
-        local pinDuration = 2
-        local pinStart = tick()
-        while tick() - pinStart < pinDuration do
-            if not model or not model.Parent then
-                warn("Merchant despawned while pinning")
-                return
+        -- Pin the character to the merchant for the whole interaction so it
+        -- never drifts out of range of the remote.
+        local pinning = true
+        task.spawn(function()
+            while pinning do
+                pcall(function()
+                    hrp.CFrame = merchantCF
+                end)
+                task.wait(0.1)
             end
-            part = model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart", true)
-            if part then
-                hrp.CFrame = part.CFrame
-            end
-            task.wait(0.05)
-        end
+        end)
+
+        -- Give the pin a moment to take hold
+        task.wait(0.3)
 
         local prompt = findProximityPrompt(model)
         if prompt then
@@ -516,6 +517,8 @@ local function buyAllFromMerchant()
             end
         end
 
+        -- Stop pinning, then go back to eggs
+        pinning = false
         print(("Done — bought %d item(s) from Merchant → eggs"):format(bought))
         goToEggs(hrp)
     end)
