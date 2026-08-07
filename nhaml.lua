@@ -540,7 +540,7 @@ local function buyAllFromMerchant()
         end
 
         local hrp = getHRP()
-        teleportTo(hrp, part.CFrame)
+        teleportTo(hrp, part.CFrame, 2) -- smaller offset than default — must stay within prompt activation range
         task.wait(TELEPORT_SETTLE_DELAY)
 
         -- re-check it's still there after settling
@@ -553,9 +553,12 @@ local function buyAllFromMerchant()
 
         local prompt = findProximityPrompt(model)
         if prompt then
+            print("Merchant prompt MaxActivationDistance:", prompt.MaxActivationDistance)
             pcall(function()
                 fireproximityprompt(prompt)
             end)
+        else
+            warn("No ProximityPrompt found on Merchant model")
         end
         task.wait(0.5) -- let the GUI populate
 
@@ -586,6 +589,10 @@ local function buyAllFromMerchant()
                     end
                 end
             end
+        end
+
+        if #toBuy == 0 then
+            warn("No purchasable items found — GUI may not have opened in time, or genuinely no stock")
         end
 
         -- pin position for the whole buying sequence, fire each in-stock item
