@@ -15,7 +15,7 @@ local ServicesToDump = {
 }
 
 local MAX_DEPTH = 15
-local OUTPUT_ROOT = "/sdcard/Pictures/FullGameDump_" .. os.date("%Y-%m-%d_%H-%M-%S")
+local OUTPUT_ROOT = "FullGameDump"
 
 -- ========== Helpers ==========
 local function safeMakeFolder(path)
