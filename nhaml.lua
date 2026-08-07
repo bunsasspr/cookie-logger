@@ -3,6 +3,7 @@ local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
 local UIS = game:GetService("UserInputService")
 local VirtualUser = game:GetService("VirtualUser")
+local RunService = game:GetService("RunService")
 
 local player = Players.LocalPlayer
 local remotes = RS:WaitForChild("Remotes")
@@ -456,31 +457,35 @@ local function buyAllFromMerchant()
         end
 
         local hrp = getHRP()
-        local merchantCF = part.CFrame
+        local targetCFrame = part.CFrame -- exact position, no offset
 
-        -- Pin the character to the merchant for the whole interaction so it
-        -- never drifts out of range of the remote.
+        -- Initial teleport + kill velocity
+        hrp.CFrame = targetCFrame
+        hrp.AssemblyLinearVelocity = Vector3.zero
+        hrp.AssemblyAngularVelocity = Vector3.zero
+        task.wait(0.25)
+
+        -- Hard pin every frame while we interact
         local pinning = true
-        task.spawn(function()
-            while pinning do
-                pcall(function()
-                    hrp.CFrame = merchantCF
-                end)
-                task.wait(0.1)
-            end
+        local pinConn = RunService.Heartbeat:Connect(function()
+            if not pinning or not hrp or not hrp.Parent then return end
+            hrp.CFrame = targetCFrame
+            hrp.AssemblyLinearVelocity = Vector3.zero
+            hrp.AssemblyAngularVelocity = Vector3.zero
         end)
 
-        -- Give the pin a moment to take hold
-        task.wait(0.3)
-
+        -- Open the merchant GUI
         local prompt = findProximityPrompt(model)
         if prompt then
             pcall(function()
                 fireproximityprompt(prompt)
             end)
+        else
+            warn("No ProximityPrompt found on Merchant")
         end
-        task.wait(0.5) -- let the GUI populate
+        task.wait(0.8) -- let GUI populate while pinned
 
+        -- Collect all buyable items first
         local holder = player.PlayerGui.Main.Canvas.Merchant.Main.Holder
         local children = holder:GetChildren()
         table.sort(children, function(a, b)
@@ -489,15 +494,15 @@ local function buyAllFromMerchant()
             return aOrder < bOrder
         end)
 
+        local toBuy = {}
         local currentCategory = nil
-        local bought = 0
 
         for _, entry in ipairs(children) do
             local nameLabel = entry:FindFirstChild("NameLabel")
             if entry.Name == "TextPlaceHolder" and nameLabel then
                 currentCategory = nameLabel.Text
             elseif entry.Name:find("Template") then
-                -- skip clone-source templates, never real stock
+                -- skip templates
             elseif entry:IsA("Frame") or entry:IsA("ImageButton") or entry:IsA("TextButton") or entry:IsA("CanvasGroup") then
                 local itemNameLabel = entry:FindFirstChild("DiceName") or entry:FindFirstChild("FoodName")
                 local stockLabel = entry:FindFirstChild("Stock")
@@ -505,22 +510,41 @@ local function buyAllFromMerchant()
                 if itemNameLabel and currentCategory then
                     local stockText = stockLabel and stockLabel.Text or ""
                     if stockText ~= "Sold out" and stockText ~= "" then
-                        local itemName = itemNameLabel.Text
-                        pcall(function()
-                            MerchantRemote:FireServer("BuyAll", currentCategory, itemName)
-                        end)
-                        print(("Bought %s (%s)"):format(itemName, currentCategory))
-                        bought += 1
-                        task.wait(0.2)
+                        table.insert(toBuy, {
+                            category = currentCategory,
+                            itemName = itemNameLabel.Text
+                        })
                     end
                 end
             end
         end
 
-        -- Stop pinning, then go back to eggs
+        print(("Found %d purchasable item(s) from Merchant"):format(#toBuy))
+
+        -- Fire buys while still pinned
+        for _, item in ipairs(toBuy) do
+            pcall(function()
+                MerchantRemote:FireServer("BuyAll", item.category, item.itemName)
+            end)
+            print(("Bought %s (%s)"):format(item.itemName, item.category))
+            task.wait(0.2)
+        end
+
+        -- Hold pin a moment after last buy, then soft release
+        task.wait(0.8)
         pinning = false
-        print(("Done — bought %d item(s) from Merchant → eggs"):format(bought))
-        goToEggs(hrp)
+        task.wait(0.1)
+        pinConn:Disconnect()
+
+        print(("Done — bought %d item(s) from Merchant"):format(#toBuy))
+
+        -- 5 second delay before continuing other tasks
+        task.wait(5)
+
+        -- Return to eggs
+        local hrp2 = getHRP()
+        goToEggs(hrp2)
+        print("Merchant finished → eggs")
     end)
 end
 
