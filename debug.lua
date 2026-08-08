@@ -1,223 +1,120 @@
---// Auto-Collect Observer
---// Run this FIRST, then start the other auto-collect script.
+print("========== COLLECTOR FUNCTION SCAN ==========")
 
-local Players = game:GetService("Players")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local CollectionService = game:GetService("CollectionService")
+local keywords = {
+    "collect",
+    "collector",
+    "claim",
+    "money",
+    "cash",
+    "income",
+    "drop",
+    "pickup",
+    "itemholder",
+    "itemholder1",
+}
 
-local player = Players.LocalPlayer
-local collector =
-    workspace.Map.Plots.Plot.Floor1.Holders.ItemHolder1.Collector
+local function interesting(text)
+    if type(text) ~= "string" then
+        return false
+    end
 
-local function log(...)
-    print("[COLLECT-SPY]", ...)
-end
+    text = text:lower()
 
-log("====================================")
-log("COLLECTION SPY STARTED")
-log("Collector:", collector:GetFullName())
-log("====================================")
-
---==================================================
--- 1. ALL RemoteEvent / RemoteFunction calls
---==================================================
-
-local mt = getrawmetatable(game)
-local oldNamecall = mt.__namecall
-
-setreadonly(mt, false)
-
-mt.__namecall = newcclosure(function(self, ...)
-    local method = getnamecallmethod()
-
-    if method == "FireServer"
-        or method == "InvokeServer"
-        or method == "Fire"
-        or method == "Invoke" then
-
-        local name = tostring(self:GetFullName()):lower()
-
-        if name:find("collect")
-            or name:find("cash")
-            or name:find("money")
-            or name:find("income")
-            or name:find("claim")
-            or name:find("pickup")
-            or name:find("harvest")
-            or name:find("orb") then
-
-            log("NETWORK:", method, self:GetFullName(), ...)
+    for _, keyword in ipairs(keywords) do
+        if text:find(keyword, 1, true) then
+            return true
         end
     end
 
-    return oldNamecall(self, ...)
-end)
-
-setreadonly(mt, true)
-
---==================================================
--- 2. Monitor Collector attributes
---==================================================
-
-for name, value in pairs(collector:GetAttributes()) do
-    log("ATTRIBUTE:", name, "=", value)
+    return false
 end
 
-collector.AttributeChanged:Connect(function(name)
-    log(
-        "ATTRIBUTE CHANGED:",
-        name,
-        "=",
-        collector:GetAttribute(name)
-    )
-end)
+local found = {}
+local count = 0
 
---==================================================
--- 3. Monitor Collector descendants
---==================================================
+for _, fn in ipairs(getgc(true)) do
+    if type(fn) == "function" then
 
-collector.DescendantAdded:Connect(function(obj)
-    log(
-        "DESCENDANT ADDED:",
-        obj:GetFullName(),
-        obj.ClassName
-    )
-end)
+        local okInfo, info = pcall(debug.getinfo, fn)
 
-collector.DescendantRemoving:Connect(function(obj)
-    log(
-        "DESCENDANT REMOVED:",
-        obj:GetFullName(),
-        obj.ClassName
-    )
-end)
+        if okInfo and info then
 
---==================================================
--- 4. Monitor GUI amount
---==================================================
+            local matched = false
+            local reasons = {}
 
-local amount =
-    collector:FindFirstChild("FrameTag", true)
-    and collector.FrameTag.Frame:FindFirstChild("Amount")
+            -- Function name/source
+            if interesting(info.name) then
+                matched = true
+                table.insert(reasons, "name=" .. tostring(info.name))
+            end
 
-if amount then
-    log("INITIAL AMOUNT:", amount.Text)
+            if interesting(info.source) then
+                matched = true
+                table.insert(reasons, "source=" .. tostring(info.source))
+            end
 
-    amount:GetPropertyChangedSignal("Text"):Connect(function()
-        log("AMOUNT CHANGED:", amount.Text)
-    end)
-end
+            -- Constants
+            if debug.getconstants then
+                local okConstants, constants =
+                    pcall(debug.getconstants, fn)
 
---==================================================
--- 5. Monitor ValueBases inside collector
---==================================================
+                if okConstants and type(constants) == "table" then
+                    for index, constant in pairs(constants) do
+                        if interesting(constant) then
+                            matched = true
 
-for _, obj in ipairs(collector:GetDescendants()) do
+                            table.insert(
+                                reasons,
+                                "constant[" ..
+                                tostring(index) ..
+                                "]=" ..
+                                tostring(constant)
+                            )
+                        end
+                    end
+                end
+            end
 
-    if obj:IsA("ValueBase") then
+            if matched and not found[fn] then
+                found[fn] = true
+                count += 1
 
-        log(
-            "VALUE:",
-            obj:GetFullName(),
-            "=",
-            obj.Value
-        )
+                print("")
+                print("----- MATCH #" .. count .. " -----")
+                print("Function:", tostring(fn))
+                print("Name:", tostring(info.name))
+                print("Source:", tostring(info.source))
+                print("Line:", tostring(info.currentline))
 
-        obj.Changed:Connect(function(value)
-            log(
-                "VALUE CHANGED:",
-                obj:GetFullName(),
-                "=",
-                value
-            )
-        end)
-
-    end
-
-end
-
---==================================================
--- 6. CollectionService tags
---==================================================
-
-for _, tag in ipairs(CollectionService:GetTags(collector)) do
-    log("COLLECTOR TAG:", tag)
-end
-
---==================================================
--- 7. Watch ALL instances for collect-related names
---==================================================
-
-for _, obj in ipairs(game:GetDescendants()) do
-
-    local n = obj.Name:lower()
-
-    if n:find("collect")
-        or n:find("cash")
-        or n:find("money")
-        or n:find("income")
-        or n:find("claim")
-        or n:find("pickup")
-        or n:find("harvest") then
-
-        log(
-            "RELATED INSTANCE:",
-            obj:GetFullName(),
-            obj.ClassName
-        )
-
-    end
-
-end
-
---==================================================
--- 8. Inspect currently loaded Lua functions
---==================================================
-
-if getgc and debug and debug.getinfo then
-
-    log("Scanning GC functions...")
-
-    local count = 0
-
-    for _, obj in ipairs(getgc(true)) do
-
-        if type(obj) == "function" then
-
-            local ok, info = pcall(debug.getinfo, obj)
-
-            if ok and info then
-
-                local source = tostring(info.source or "")
-                local name = tostring(info.name or "")
-
-                local text =
-                    (source .. " " .. name):lower()
-
-                if text:find("collect")
-                    or text:find("cash")
-                    or text:find("money")
-                    or text:find("income")
-                    or text:find("claim")
-                    or text:find("pickup")
-                    or text:find("harvest") then
-
-                    count += 1
-
-                    log(
-                        "FUNCTION:",
-                        "name=" .. name,
-                        "source=" .. source
-                    )
+                for _, reason in ipairs(reasons) do
+                    print("MATCH:", reason)
                 end
 
+                -- Upvalues
+                if debug.getupvalues then
+                    local okUpvalues, upvalues =
+                        pcall(debug.getupvalues, fn)
+
+                    if okUpvalues and type(upvalues) == "table" then
+                        for k, v in pairs(upvalues) do
+                            local valueText = tostring(v)
+
+                            if interesting(valueText) then
+                                print(
+                                    "UPVALUE:",
+                                    tostring(k),
+                                    valueText
+                                )
+                            end
+                        end
+                    end
+                end
             end
         end
     end
-
-    log("Matching functions:", count)
 end
 
-log("====================================")
-log("NOW START THE OTHER AUTO-COLLECT SCRIPT")
-log("====================================")
+print("")
+print("==============================================")
+print("MATCHING FUNCTIONS:", count)
+print("==============================================")
