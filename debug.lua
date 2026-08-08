@@ -1,11 +1,11 @@
--- Improved Auto Collect (no teleport)
+-- Better Auto Collect (no teleport)
 local Players = game:GetService("Players")
 local player = Players.LocalPlayer
 
-local DELAY_BETWEEN_HOLDERS = 0.08   -- small delay between each collector
-local LOOP_DELAY = 1.2               -- full cycle delay
-
 getgenv().AutoCollect = true
+
+local BETWEEN_HOLDER = 0.12   -- delay between each collector
+local FULL_LOOP = 1.8         -- delay after finishing all holders
 
 local function getHRP()
     local char = player.Character or player.CharacterAdded:Wait()
@@ -50,18 +50,24 @@ task.spawn(function()
         local hrp = getHRP()
         local collectors = getCollectors()
 
-        for _, collector in ipairs(collectors) do
+        for i, collector in ipairs(collectors) do
             if not getgenv().AutoCollect then break end
-            pcall(function()
-                firetouchinterest(collector, hrp, 0)
+
+            -- Fire touch multiple times for better reliability
+            for _ = 1, 3 do
+                pcall(function()
+                    firetouchinterest(collector, hrp, 0)
+                    task.wait(0.02)
+                    firetouchinterest(collector, hrp, 1)
+                end)
                 task.wait(0.03)
-                firetouchinterest(collector, hrp, 1)
-            end)
-            task.wait(DELAY_BETWEEN_HOLDERS)
+            end
+
+            task.wait(BETWEEN_HOLDER)
         end
 
-        task.wait(LOOP_DELAY)
+        task.wait(FULL_LOOP)
     end
 end)
 
-print("✅ Improved Auto Collect (no teleport) started")
+print("✅ Improved Auto Collect started (no teleport)")
