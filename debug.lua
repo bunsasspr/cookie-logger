@@ -1,5 +1,5 @@
--- ================= Fusion Standalone Script (v6) =================
--- Opens the machine first (makes pet appear) → then claims
+-- ================= Fusion Standalone Script (v7) =================
+-- Fully remote: Fuse → wait → ClaimFusion
 
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
@@ -13,18 +13,13 @@ local TELEPORT_SETTLE_DELAY = 0.6
 local FUSION_CHECK_INTERVAL = 3
 local FUSION_WAIT_INTERVAL = 1
 local FUSION_MAX_WAIT = 300
-local AFTER_CLAIM_COOLDOWN = 3.5
+local AFTER_CLAIM_COOLDOWN = 3
 
 local FUSE_MACHINE_CFRAME = CFrame.new(-104.240242, 1.77263951 + 5, 198.388123)
-local CLAIM_CFRAME = CFrame.new(
-    -116.513695, 5.76566458, 199.923004,
-    0.133674741, -1.7736415e-08, 0.991025269,
-    6.08319839e-09, 1, 1.7076502e-08,
-    -0.991025269, 3.74590625e-09, 0.133674741
-)
 
 local pinned = false
 local pinTarget = nil
+local lastClaimedJobId = nil
 
 local function getHRP()
     local char = player.Character or player.CharacterAdded:Wait()
@@ -51,15 +46,6 @@ RunService.Heartbeat:Connect(function()
         end
     end
 end)
-
-local function setCFrameOnce(cframe)
-    local ok, hrp = pcall(getHRP)
-    if ok and hrp then
-        hrp.CFrame = cframe
-        hrp.AssemblyLinearVelocity = Vector3.zero
-        hrp.AssemblyAngularVelocity = Vector3.zero
-    end
-end
 
 local function getPlayerState()
     local ok, result = pcall(function()
@@ -89,52 +75,35 @@ local function fusePets(petIds, mode)
     return result
 end
 
-local function fireClaimPrompt()
-    local fuseMachine = workspace:FindFirstChild("Map")
-        and workspace.Map:FindFirstChild("Island")
-        and workspace.Map.Island:FindFirstChild("FuseMachine")
-
-    if not fuseMachine then
-        warn("[Fusion] Could not find FuseMachine")
-        return false
+local function claimFusion(jobId)
+    if not jobId then return nil end
+    if jobId == lastClaimedJobId then
+        print("[Fusion] Already claimed this JobId, skipping")
+        return nil
     end
 
-    local openPrompt = fuseMachine:FindFirstChild("Prox") and fuseMachine.Prox:FindFirstChildOfClass("ProximityPrompt")
-    local claimPrompt = fuseMachine:FindFirstChild("Claim") and fuseMachine.Claim:FindFirstChildOfClass("ProximityPrompt")
+    print("[Fusion] Claiming with ClaimFusion | JobId:", jobId)
+    local ok, result = pcall(function()
+        return EggInfo:InvokeServer("ClaimFusion", {
+            JobId = jobId,
+        })
+    end)
 
-    local targetPart = fuseMachine:FindFirstChild("Claim") or fuseMachine:FindFirstChild("Prox")
-    if targetPart then
-        setCFrameOnce(targetPart:GetPivot() + Vector3.new(0, 3, 0))
+    if not ok then
+        warn("[Fusion] ClaimFusion call failed:", result)
+        return nil
+    end
+
+    if type(result) == "table" then
+        print("[Fusion] ClaimFusion → Success:", result.Success, "Reason:", result.Reason)
+        if result.Success then
+            lastClaimedJobId = jobId
+        end
     else
-        setCFrameOnce(CLAIM_CFRAME)
-    end
-    task.wait(0.4)
-
-    -- 1. Open Machine (makes the pet appear)
-    if openPrompt then
-        print("[Fusion] Firing Open Machine prompt...")
-        openPrompt:InputHoldBegin()
-        task.wait(0.15)
-        openPrompt:InputHoldEnd()
-        pcall(function() fireproximityprompt(openPrompt) end)
-        task.wait(0.7)
-    else
-        warn("[Fusion] Open Machine prompt not found")
+        print("[Fusion] ClaimFusion result:", result)
     end
 
-    -- 2. Claim
-    if claimPrompt then
-        print("[Fusion] Firing Claim prompt...")
-        claimPrompt:InputHoldBegin()
-        task.wait(0.15)
-        claimPrompt:InputHoldEnd()
-        pcall(function() fireproximityprompt(claimPrompt) end)
-        print("[Fusion] Claim prompt fired")
-        return true
-    else
-        warn("[Fusion] Claim prompt not found")
-        return false
-    end
+    return result
 end
 
 local function findFusableGroups(state, minCount, variantFilter)
@@ -186,17 +155,25 @@ local function waitForFusionReady()
     while tick() - startTime < FUSION_MAX_WAIT do
         local fs = getFusionState()
         if fs and fs.Fusion then
+            local jobId = fs.Fusion.JobId
+
+            if jobId and jobId == lastClaimedJobId then
+                task.wait(FUSION_WAIT_INTERVAL)
+                continue
+            end
+
             if fs.Fusion.Ready or (fs.Fusion.Remaining and fs.Fusion.Remaining <= 0) then
-                print("[Fusion] Fusion ready! JobId:", fs.Fusion.JobId)
+                print("[Fusion] Fusion ready! JobId:", jobId)
                 return fs.Fusion
             end
+
             if not fs.Fusion.Active then
                 return nil
             end
         end
         task.wait(FUSION_WAIT_INTERVAL)
     end
-    warn("[Fusion] Timed out")
+    warn("[Fusion] Timed out waiting for fusion")
     return nil
 end
 
@@ -214,26 +191,28 @@ local function fuseToGolden()
     print("[Fusion] Found", group.count, "Normal", group.name)
 
     local petIds = {}
-    for i = 1, 6 do table.insert(petIds, group.ids[i]) end
+    for i = 1, 6 do
+        table.insert(petIds, group.ids[i])
+    end
 
     print("[Fusion] Teleporting to FuseMachine...")
     teleportToFuseMachine()
 
-    print("[Fusion] Fusing → Golden...")
+    print("[Fusion] Fusing 6x", group.name, "→ Golden...")
     local fuseResult = fusePets(petIds, "Golden")
     if fuseResult then
         print("[Fusion] Fuse Success:", fuseResult.Success, "Reason:", fuseResult.Reason)
     end
 
     local fusionInfo = waitForFusionReady()
-    if not fusionInfo then
+    if not fusionInfo or not fusionInfo.JobId then
         unpin()
         return false
     end
 
+    -- Fully remote claim
+    claimFusion(fusionInfo.JobId)
     unpin()
-    task.wait(0.3)
-    fireClaimPrompt()
     task.wait(AFTER_CLAIM_COOLDOWN)
     return true
 end
@@ -252,26 +231,27 @@ local function fuseToDiamond()
     print("[Fusion] Found", group.count, "Golden", group.name)
 
     local petIds = {}
-    for i = 1, 6 do table.insert(petIds, group.ids[i]) end
+    for i = 1, 6 do
+        table.insert(petIds, group.ids[i])
+    end
 
     print("[Fusion] Teleporting to FuseMachine...")
     teleportToFuseMachine()
 
-    print("[Fusion] Fusing → Diamond...")
+    print("[Fusion] Fusing 6x Golden", group.name, "→ Diamond...")
     local fuseResult = fusePets(petIds, "Diamond")
     if fuseResult then
         print("[Fusion] Fuse Success:", fuseResult.Success, "Reason:", fuseResult.Reason)
     end
 
     local fusionInfo = waitForFusionReady()
-    if not fusionInfo then
+    if not fusionInfo or not fusionInfo.JobId then
         unpin()
         return false
     end
 
+    claimFusion(fusionInfo.JobId)
     unpin()
-    task.wait(0.3)
-    fireClaimPrompt()
     task.wait(AFTER_CLAIM_COOLDOWN)
     return true
 end
@@ -282,9 +262,11 @@ task.spawn(function()
             if fuseToGolden() then task.wait(1) end
             if fuseToDiamond() then task.wait(1) end
         end)
-        if not ok then warn("[Fusion] Error:", err) end
+        if not ok then
+            warn("[Fusion] Error:", err)
+        end
         task.wait(FUSION_CHECK_INTERVAL)
     end
 end)
 
-print("[Fusion] Standalone fusion script loaded (v6 - Open + Claim).")
+print("[Fusion] Standalone fusion script loaded (v7 - fully remote ClaimFusion).")
