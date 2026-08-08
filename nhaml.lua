@@ -27,10 +27,9 @@ local TELEPORT_SETTLE_DELAY = 0.5
 local SCHEDULER_INTERVAL = 1
 local RESTOCK_BUFFER = 2
 local FALLBACK_RESTOCK_WAIT = 120
-local COLLECT_INTERVAL = 1
-local COLLECT_TOUCH_HOLD = 0.15   -- how long to "stand" on each collector
-local COLLECT_BETWEEN = 0.1       -- pause between collectors
-local COLLECT_SWEEPS = 2          -- how many touch cycles per sweep
+local COLLECT_INTERVAL = 1        -- seconds between full sweeps
+local COLLECT_BETWEEN = 0.3       -- wait between collectors (per-collector cooldown)
+local COLLECT_TELEPORT_OFFSET = 2 -- studs above collector when touching
 local USE_POTIONS_INTERVAL = 10
 local REBIRTH_CHECK_INTERVAL = 2
 local REBIRTH_COOLDOWN = 5
@@ -314,17 +313,32 @@ task.spawn(function()
             local ok, hrp = pcall(getHRP)
             if ok then
                 local parts = getCollectorParts()
+                local originalCF = hrp.CFrame
+
                 for _, c in ipairs(parts) do
                     -- Skip collectors currently on cooldown (server attribute)
                     if c:GetAttribute("on_cooldown") ~= true then
-                        for _ = 1, COLLECT_SWEEPS do
-                            pcall(function() firetouchinterest(c, hrp, 0) end)
-                            task.wait(COLLECT_TOUCH_HOLD)
-                            pcall(function() firetouchinterest(c, hrp, 1) end)
-                            task.wait(COLLECT_BETWEEN)
-                        end
+                        -- Teleport to the collector so the server's distance
+                        -- check passes (that's why only the 2 nearest worked)
+                        hrp.CFrame = c.CFrame * CFrame.new(0, COLLECT_TELEPORT_OFFSET, 0)
+                        hrp.AssemblyLinearVelocity = Vector3.zero
+                        hrp.AssemblyAngularVelocity = Vector3.zero
+                        task.wait(0.05)
+
+                        -- Fire touch quickly — no hold needed
+                        pcall(function() firetouchinterest(c, hrp, 0) end)
+                        task.wait(0.05)
+                        pcall(function() firetouchinterest(c, hrp, 1) end)
+
+                        -- Wait for the per-collector cooldown before moving on
+                        task.wait(COLLECT_BETWEEN)
                     end
                 end
+
+                -- Return to where we started so the player isn't stuck
+                hrp.CFrame = originalCF
+                hrp.AssemblyLinearVelocity = Vector3.zero
+                hrp.AssemblyAngularVelocity = Vector3.zero
             end
         end
         task.wait(COLLECT_INTERVAL)
