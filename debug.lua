@@ -1,112 +1,49 @@
-print("========== COLLECTOR FUNCTION SCAN ==========")
+local TARGET = "=QiUmItaUgqarWtuEiLaRxBKPQ"
 
-local keywords = {
-    "collect",
-    "collector",
-    "claim",
-    "money",
-    "cash",
-    "income",
-    "drop",
-    "pickup",
-    "itemholder",
-    "itemholder1",
-}
+print("========== LUAST TARGET ==========")
 
-local function interesting(text)
-    if type(text) ~= "string" then
-        return false
-    end
-
-    text = text:lower()
-
-    for _, keyword in ipairs(keywords) do
-        if text:find(keyword, 1, true) then
-            return true
-        end
-    end
-
-    return false
-end
-
-local found = {}
 local count = 0
+local seen = {}
 
 for _, fn in ipairs(getgc(true)) do
-    if type(fn) == "function" then
+    if type(fn) == "function" and not seen[fn] then
+        seen[fn] = true
 
-        local okInfo, info = pcall(debug.getinfo, fn)
+        local ok, info = pcall(debug.getinfo, fn)
 
-        if okInfo and info then
+        if ok and info and info.source == TARGET then
+            count += 1
 
-            local matched = false
-            local reasons = {}
+            print("")
+            print("===== FUNCTION #" .. count .. " =====")
+            print("Function:", tostring(fn))
+            print("Name:", tostring(info.name))
+            print("Line:", tostring(info.currentline))
 
-            -- Function name/source
-            if interesting(info.name) then
-                matched = true
-                table.insert(reasons, "name=" .. tostring(info.name))
-            end
+            local okc, constants = pcall(debug.getconstants, fn)
 
-            if interesting(info.source) then
-                matched = true
-                table.insert(reasons, "source=" .. tostring(info.source))
-            end
-
-            -- Constants
-            if debug.getconstants then
-                local okConstants, constants =
-                    pcall(debug.getconstants, fn)
-
-                if okConstants and type(constants) == "table" then
-                    for index, constant in pairs(constants) do
-                        if interesting(constant) then
-                            matched = true
-
-                            table.insert(
-                                reasons,
-                                "constant[" ..
-                                tostring(index) ..
-                                "]=" ..
-                                tostring(constant)
-                            )
-                        end
-                    end
+            if okc and type(constants) == "table" then
+                for i, value in pairs(constants) do
+                    print(
+                        "CONST[" .. tostring(i) .. "]:",
+                        typeof(value),
+                        tostring(value)
+                    )
                 end
             end
 
-            if matched and not found[fn] then
-                found[fn] = true
-                count += 1
+            if debug.getupvalues then
+                local oku, upvalues = pcall(debug.getupvalues, fn)
 
-                print("")
-                print("----- MATCH #" .. count .. " -----")
-                print("Function:", tostring(fn))
-                print("Name:", tostring(info.name))
-                print("Source:", tostring(info.source))
-                print("Line:", tostring(info.currentline))
+                if oku and type(upvalues) == "table" then
+                    print("-- UPVALUES --")
 
-                for _, reason in ipairs(reasons) do
-                    print("MATCH:", reason)
-                end
-
-                -- Upvalues
-                if debug.getupvalues then
-                    local okUpvalues, upvalues =
-                        pcall(debug.getupvalues, fn)
-
-                    if okUpvalues and type(upvalues) == "table" then
-                        for k, v in pairs(upvalues) do
-                            local valueText = tostring(v)
-
-                            if interesting(valueText) then
-                                print(
-                                    "UPVALUE:",
-                                    tostring(k),
-                                    valueText
-                                )
-                            end
-                        end
+                    for i, value in pairs(upvalues) do
+                        print(
+                            "UPVALUE[" .. tostring(i) .. "]:",
+                            typeof(value),
+                            tostring(value)
+                        )
                     end
                 end
             end
@@ -115,6 +52,5 @@ for _, fn in ipairs(getgc(true)) do
 end
 
 print("")
-print("==============================================")
-print("MATCHING FUNCTIONS:", count)
-print("==============================================")
+print("TOTAL:", count)
+print("==================================")
