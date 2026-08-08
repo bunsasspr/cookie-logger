@@ -12,6 +12,7 @@ local remotes = RS:WaitForChild("Remotes")
 local BuyDice = remotes:WaitForChild("BuyDice")
 local BuyPotion = remotes:WaitForChild("BuyPotion")
 local UsePotion = remotes:WaitForChild("UsePotion")
+local EquipBest = remotes:FindFirstChild("EquipBest") or remotes:WaitForChild("EquipBest")
 local RebirthRemote = remotes:WaitForChild("Rebirth")
 local FoodCartRemote = remotes:WaitForChild("FoodCart")
 local MerchantRemote = remotes:WaitForChild("Merchant")
@@ -27,8 +28,8 @@ local TELEPORT_SETTLE_DELAY = 0.5
 local SCHEDULER_INTERVAL = 1
 local RESTOCK_BUFFER = 2
 local FALLBACK_RESTOCK_WAIT = 120
-local COLLECT_INTERVAL = 1        -- seconds between full sweeps
-local COLLECT_BETWEEN = 0.3       -- wait between collectors (per-collector cooldown)
+local EQUIP_BEST_INTERVAL = 30       -- seconds between auto equip-best sweeps
+local EQUIP_BEST_SETTLE = 0.5        -- pause after firing EquipBest (claims money)
 local USE_POTIONS_INTERVAL = 10
 local REBIRTH_CHECK_INTERVAL = 2
 local REBIRTH_COOLDOWN = 5
@@ -66,8 +67,9 @@ local EGG_NAMES = {"Basic", "Forest", "Jungle", "Beach", "Monster", "Desert", "G
 -- ===== Feature state =====
 local state = {
     dice = false, potion = false, merchant = false, foodcart = false,
-    collect = false, usePotions = false, egg = false, eggQuantity = 3,
-    rebirth = false, selectedEgg = "Basic", sell = false, sellThreshold = 30,
+    usePotions = false, egg = false, eggQuantity = 3,
+    rebirth = false, equipBest = false, sell = false, sellThreshold = 30,
+    selectedEgg = "Basic",
 }
 
 -- ===== Helpers =====
@@ -111,6 +113,18 @@ local function getMyPlotModel()
             return plot
         end
     end
+    return nil
+end
+
+-- Teleports to the player's plot center (the "pot") so EquipBest registers
+local function getPlotCFrame()
+    local plot = getMyPlotModel()
+    if not plot then return nil end
+    local part = plot.PrimaryPart or plot:FindFirstChildWhichIsA("BasePart", true)
+    if part then return part.CFrame + Vector3.new(0, 3, 0) end
+    -- fallback: use Spawn part
+    local spawn = plot:FindFirstChild("Spawn")
+    if spawn and spawn:IsA("BasePart") then return spawn.CFrame end
     return nil
 end
 
@@ -243,7 +257,50 @@ local function openEgg()
     end
 end
 
+-- ================= Auto Equip Best (claims placeholder money too) =================
+-- Firing EquipBest while standing on your pot equips your best dice AND claims
+-- all the placeholder money — so this replaces the old firetouchinterest collect.
+local function equipBest()
+    local cf = getPlotCFrame()
+    if not cf then warn("[EquipBest] Could not find your plot"); return end
+    teleportTo(cf, 0)
+    task.wait(TELEPORT_SETTLE_DELAY)
+    pcall(function() EquipBest:FireServer() end)
+    task.wait(EQUIP_BEST_SETTLE)
+end
+
+-- Periodic auto equip-best loop (also collects money every cycle)
+task.spawn(function()
+    while true do
+        if state.equipBest then
+            equipBest()
+        end
+        task.wait(EQUIP_BEST_INTERVAL)
+    end
+end)
+
+-- Auto Use Potions — only fires for potions you actually own
+task.spawn(function()
+    while true do
+        if state.usePotions then
+            local owned = getOwnedPotions()
+            for _, name in ipairs(owned) do
+                pcall(function() UsePotion:FireServer("Use", name, "Max") end)
+                task.wait(0.12)
+            end
+        end
+        task.wait(USE_POTIONS_INTERVAL)
+    end
+end)
+
+-- ================= Auto Sell (equips best first, then sells) =================
 local function sellInventory()
+    -- Step 1: go to plot and equip best (claims money + equips)
+    if state.equipBest then
+        equipBest()
+    end
+
+    -- Step 2: go sell
     local part = getMapShopPart("SellShop")
     if not part then return end
     teleportTo(part.CFrame); task.wait(TELEPORT_SETTLE_DELAY)
@@ -253,6 +310,7 @@ local function sellInventory()
 end
 
 -- ================= Priority scheduler =================
+-- Merchant > Sell (with equip-best first) > FoodCart > Dice > Potion > Eggs.
 local lastMerchant, lastFoodCart = nil, nil
 local nextDiceTime, nextPotionTime = 0, 0
 
@@ -288,64 +346,7 @@ task.spawn(function()
     end
 end)
 
--- ================= Background features =================
-local function getCollectorParts()
-    local plot = getMyPlotModel(); if not plot then return {} end
-    local collectors = {}
-    for _, floor in ipairs(plot:GetChildren()) do
-        if floor.Name:match("^Floor%d+$") then
-            local holders = floor:FindFirstChild("Holders")
-            if holders then
-                for _, holder in ipairs(holders:GetChildren()) do
-                    local c = holder:FindFirstChild("Collector")
-                    if c and c:IsA("BasePart") then table.insert(collectors, c) end
-                end
-            end
-        end
-    end
-    return collectors
-end
-
-task.spawn(function()
-    while true do
-        if state.collect then
-            local ok, hrp = pcall(getHRP)
-            if ok then
-                local parts = getCollectorParts()
-
-                -- Fire each collector one at a time, standing still.
-                -- No teleporting — firetouchinterest works from anywhere.
-                -- The small delay between collectors respects the per-collector
-                -- cooldown so every one registers (firing all at once only
-                -- registered the first 1-2).
-                for _, c in ipairs(parts) do
-                    -- Skip collectors currently on cooldown (server attribute)
-                    if c:GetAttribute("on_cooldown") ~= true then
-                        pcall(function() firetouchinterest(c, hrp, 0) end)
-                        task.wait(0.05)
-                        pcall(function() firetouchinterest(c, hrp, 1) end)
-                        task.wait(COLLECT_BETWEEN)
-                    end
-                end
-            end
-        end
-        task.wait(COLLECT_INTERVAL)
-    end
-end)
-
-task.spawn(function()
-    while true do
-        if state.usePotions then
-            local owned = getOwnedPotions()
-            for _, name in ipairs(owned) do
-                pcall(function() UsePotion:FireServer("Use", name, "Max") end)
-                task.wait(0.12)
-            end
-        end
-        task.wait(USE_POTIONS_INTERVAL)
-    end
-end)
-
+-- Auto Rebirth
 local function isRebirthReady()
     local ok, btn = pcall(function() return player.PlayerGui.Main.Canvas.Rebirth.MainFrame.Rebirth end)
     if not ok or not btn then return false end
@@ -387,33 +388,18 @@ local Window = Fluent:CreateWindow({
 -- ============ Main Tab ============
 local MainTab = Window:AddTab({ Title = "Main", Icon = "solar/home-bold" })
 
-MainTab:AddToggle("AutoMerchant", {
-    Title = "Auto Buy Merchant", Default = false,
-    Callback = function(v) state.merchant = v end,
-})
-MainTab:AddToggle("AutoFoodCart", {
-    Title = "Auto Buy FoodCart", Default = false,
-    Callback = function(v) state.foodcart = v end,
-})
-MainTab:AddToggle("AutoDice", {
-    Title = "Auto Buy Dice", Default = false,
-    Callback = function(v) state.dice = v end,
-})
-MainTab:AddToggle("AutoPotion", {
-    Title = "Auto Buy Potions", Default = false,
-    Callback = function(v) state.potion = v end,
-})
 MainTab:AddToggle("AutoUsePotions", {
     Title = "Auto Use Potions", Default = false,
     Callback = function(v) state.usePotions = v end,
 })
-MainTab:AddToggle("AutoCollect", {
-    Title = "Auto Collect Money", Default = false,
-    Callback = function(v) state.collect = v end,
-})
 MainTab:AddToggle("AutoRebirth", {
     Title = "Auto Rebirth", Default = false,
     Callback = function(v) state.rebirth = v end,
+})
+MainTab:AddToggle("AutoEquipBest", {
+    Title = "Auto Equip Best", Default = false,
+    Description = "Equips best dice & claims placeholder money at your pot",
+    Callback = function(v) state.equipBest = v end,
 })
 MainTab:AddToggle("AutoSell", {
     Title = "Auto Sell", Default = false,
@@ -422,6 +408,26 @@ MainTab:AddToggle("AutoSell", {
 MainTab:AddSlider("SellThreshold", {
     Title = "Sell Threshold", Default = 30, Min = 1, Max = 100, Rounding = 1,
     Callback = function(v) state.sellThreshold = v end,
+})
+
+-- ============ Shop Tab ============
+local ShopTab = Window:AddTab({ Title = "Shop", Icon = "solar/cart-large-2-bold" })
+
+ShopTab:AddToggle("AutoDice", {
+    Title = "Auto Buy Dice", Default = false,
+    Callback = function(v) state.dice = v end,
+})
+ShopTab:AddToggle("AutoPotion", {
+    Title = "Auto Buy Potions", Default = false,
+    Callback = function(v) state.potion = v end,
+})
+ShopTab:AddToggle("AutoMerchant", {
+    Title = "Auto Merchant", Default = false,
+    Callback = function(v) state.merchant = v end,
+})
+ShopTab:AddToggle("AutoFoodCart", {
+    Title = "Auto FoodCart", Default = false,
+    Callback = function(v) state.foodcart = v end,
 })
 
 -- ============ Eggs Tab ============
