@@ -269,16 +269,6 @@ local function equipBest()
     task.wait(EQUIP_BEST_SETTLE)
 end
 
--- Periodic auto equip-best loop (also collects money every cycle)
-task.spawn(function()
-    while true do
-        if state.equipBest then
-            equipBest()
-        end
-        task.wait(EQUIP_BEST_INTERVAL)
-    end
-end)
-
 -- Auto Use Potions — only fires for potions you actually own
 task.spawn(function()
     while true do
@@ -293,14 +283,8 @@ task.spawn(function()
     end
 end)
 
--- ================= Auto Sell (equips best first, then sells) =================
+-- ================= Auto Sell =================
 local function sellInventory()
-    -- Step 1: go to plot and equip best (claims money + equips)
-    if state.equipBest then
-        equipBest()
-    end
-
-    -- Step 2: go sell
     local part = getMapShopPart("SellShop")
     if not part then return end
     teleportTo(part.CFrame); task.wait(TELEPORT_SETTLE_DELAY)
@@ -310,9 +294,11 @@ local function sellInventory()
 end
 
 -- ================= Priority scheduler =================
--- Merchant > Sell (with equip-best first) > FoodCart > Dice > Potion > Eggs.
+-- Merchant > FoodCart > Dice > Potion > Sell > EquipBest > Eggs
+-- (Rebirth & Auto Use Potions run as independent background loops.)
 local lastMerchant, lastFoodCart = nil, nil
 local nextDiceTime, nextPotionTime = 0, 0
+local nextEquipBestTime = 0
 
 task.spawn(function()
     while true do
@@ -323,8 +309,6 @@ task.spawn(function()
 
         if merchant and merchant ~= lastMerchant then
             lastMerchant = merchant; buyMerchant(); didSomething = true
-        elseif sellReady then
-            sellInventory(); task.wait(SELL_COOLDOWN); didSomething = true
         elseif foodcart and foodcart ~= lastFoodCart then
             lastFoodCart = foodcart; buyFoodCart(); didSomething = true
         elseif state.dice and tick() >= nextDiceTime then
@@ -336,6 +320,12 @@ task.spawn(function()
             buyPotion()
             local r = getRestockSeconds("Potion")
             nextPotionTime = tick() + (r and (r + RESTOCK_BUFFER) or FALLBACK_RESTOCK_WAIT)
+            didSomething = true
+        elseif sellReady then
+            sellInventory(); task.wait(SELL_COOLDOWN); didSomething = true
+        elseif state.equipBest and tick() >= nextEquipBestTime then
+            equipBest()
+            nextEquipBestTime = tick() + EQUIP_BEST_INTERVAL
             didSomething = true
         elseif state.egg then
             openEgg(); didSomething = true
@@ -407,7 +397,7 @@ MainTab:AddToggle("AutoSell", {
 })
 MainTab:AddSlider("SellThreshold", {
     Title = "Sell Threshold", Default = 30, Min = 1, Max = 100, Rounding = 1,
-    Callback = function(v) state.sellThreshold = v end,
+    Callback = function(v) state.sellThreshold = tonumber(v) or 30 end,
 })
 
 -- ============ Shop Tab ============
