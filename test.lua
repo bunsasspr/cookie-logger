@@ -1,5 +1,7 @@
--- ================= AutoFarm — Rayfield rework =================
-local Rayfield = loadstring(game:HttpGet("https://sirius.menu/gen2"))()
+-- ================= AutoFarm — Fluent Modded rework =================
+local Fluent = loadstring(game:HttpGet(
+    "https://github.com/StyearX/Fluent-Modded/releases/download/Fluent/FluentPro"
+))()
 
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
@@ -63,7 +65,7 @@ local EGG_HOLDER_INDEX = {
 }
 local EGG_NAMES = {"Basic", "Forest", "Jungle", "Beach", "Monster", "Desert", "Galaxy", "Candy", "Lava", "Frozen"}
 
--- ===== Feature state (driven by the Rayfield elements below) =====
+-- ===== Feature state (driven by the Fluent elements below) =====
 local state = {
     dice = false,
     potion = false,
@@ -224,7 +226,7 @@ local function buyDice()
             BuyDice:FireServer("BuyBestAvailable")
         end)
         task.wait(BUY_FIRE_INTERVAL)
-        elapsed += BUY_FIRE_INTERVAL
+        elapsed = elapsed + BUY_FIRE_INTERVAL
     end
     print("[Dice] Bought")
 end
@@ -244,7 +246,7 @@ local function buyPotion()
             BuyPotion:FireServer("BuyBestAvailable")
         end)
         task.wait(BUY_FIRE_INTERVAL)
-        elapsed += BUY_FIRE_INTERVAL
+        elapsed = elapsed + BUY_FIRE_INTERVAL
     end
     print("[Potion] Bought")
 end
@@ -322,7 +324,7 @@ local function openEgg()
             EggInfo:InvokeServer("Buy", state.selectedEgg, state.eggQuantity)
         end)
         task.wait(BUY_FIRE_INTERVAL)
-        elapsed += BUY_FIRE_INTERVAL
+        elapsed = elapsed + BUY_FIRE_INTERVAL
     end
 end
 
@@ -488,119 +490,131 @@ player.Idled:Connect(function()
     VirtualUser:ClickButton2(Vector2.new())
 end)
 
--- ================= UI =================
-local Window = Rayfield:CreateWindow({
-    name = "Buns hub",
-    subtitle = "Kawaii Anime Rng",
-    configuration = {
-        enabled = true,          -- enable config management
-        writeToFile = true,      -- actually save configs to disk
-        folderName = "BunsHub",  -- config folder name
-        saveOnExit = true,       -- save toggles/sliders when the UI closes
-    },
+-- ================= UI — Fluent Modded =================
+local Window = Fluent:CreateWindow({
+    Title       = "Buns hub",
+    SubTitle    = "Kawaii Anime Rng",
+    TabWidth    = 150,
+    Size        = UDim2.fromOffset(520, 480),
+    Acrylic     = true,
+    Theme       = "AMOLED",
+    MinimizeKey = Enum.KeyCode.LeftControl,
+    Search      = true,
 })
 
--- Load the last saved config if one exists (Rayfield v2)
-pcall(function()
-    Rayfield:LoadConfiguration()
-end)
+-- ============ Main Tab ============
+local MainTab = Window:AddTab({ Title = "Main", Icon = "solar/home-bold" })
 
-local MainTab = Window:CreateTab({ name = "Main", icon = 0 })
-
-MainTab:CreateToggle({
-    Name = "Auto Buy Merchant",
-    CurrentValue = false,
-    Flag = "AutoMerchant",
+MainTab:AddToggle("AutoMerchant", {
+    Title = "Auto Buy Merchant",
+    Default = false,
     Callback = function(v) state.merchant = v end,
 })
 
-MainTab:CreateToggle({
-    Name = "Auto Buy FoodCart",
-    CurrentValue = false,
-    Flag = "AutoFoodCart",
+MainTab:AddToggle("AutoFoodCart", {
+    Title = "Auto Buy FoodCart",
+    Default = false,
     Callback = function(v) state.foodcart = v end,
 })
 
-MainTab:CreateToggle({
-    Name = "Auto Buy Dice",
-    CurrentValue = false,
-    Flag = "AutoDice",
+MainTab:AddToggle("AutoDice", {
+    Title = "Auto Buy Dice",
+    Default = false,
     Callback = function(v) state.dice = v end,
 })
 
-MainTab:CreateToggle({
-    Name = "Auto Buy Potions",
-    CurrentValue = false,
-    Flag = "AutoPotion",
+MainTab:AddToggle("AutoPotion", {
+    Title = "Auto Buy Potions",
+    Default = false,
     Callback = function(v) state.potion = v end,
 })
 
-MainTab:CreateToggle({
-    Name = "Auto Use Potions",
-    CurrentValue = false,
-    Flag = "AutoUsePotions",
+MainTab:AddToggle("AutoUsePotions", {
+    Title = "Auto Use Potions",
+    Default = false,
     Callback = function(v) state.usePotions = v end,
 })
 
-MainTab:CreateToggle({
-    Name = "Auto Collect Money",
-    CurrentValue = false,
-    Flag = "AutoCollect",
+MainTab:AddToggle("AutoCollect", {
+    Title = "Auto Collect Money",
+    Default = false,
     Callback = function(v) state.collect = v end,
 })
 
-MainTab:CreateToggle({
-    Name = "Auto Rebirth",
-    CurrentValue = false,
-    Flag = "AutoRebirth",
+MainTab:AddToggle("AutoRebirth", {
+    Title = "Auto Rebirth",
+    Default = false,
     Callback = function(v) state.rebirth = v end,
 })
 
-MainTab:CreateToggle({
-    Name = "Auto Sell",
-    CurrentValue = false,
-    Flag = "AutoSell",
+MainTab:AddToggle("AutoSell", {
+    Title = "Auto Sell",
+    Default = false,
     Callback = function(v) state.sell = v end,
 })
 
-MainTab:CreateSlider({
-    Name = "Sell Threshold",
-    Range = {1, 100},
-    Increment = 1,
-    Suffix = "items",
-    CurrentValue = 30,
-    Flag = "SellThreshold",
+MainTab:AddSlider("SellThreshold", {
+    Title = "Sell Threshold",
+    Default = 30,
+    Min = 1,
+    Max = 100,
+    Rounding = 1,
     Callback = function(v) state.sellThreshold = v end,
 })
 
-local EggTab = Window:CreateTab({ name = "Eggs", icon = 0 })
+-- ============ Eggs Tab ============
+local EggTab = Window:AddTab({ Title = "Eggs", Icon = "solar/database-bold" })
 
-EggTab:CreateDropdown({
-    Name = "Egg Type",
-    Options = EGG_NAMES,
-    CurrentOption = {"Basic"},
-    MultipleOptions = false,
-    Flag = "EggType",
-    Callback = function(option)
-        state.selectedEgg = type(option) == "table" and option[1] or option
+EggTab:AddDropdown("EggType", {
+    Title = "Egg Type",
+    Values = EGG_NAMES,
+    Default = "Basic",
+    Multi = false,
+    Callback = function(v)
+        state.selectedEgg = v
     end,
 })
 
-EggTab:CreateSlider({
-    Name = "Egg Quantity",
-    Range = {1, 10},
-    Increment = 1,
-    Suffix = "eggs",
-    CurrentValue = 3,
-    Flag = "EggQuantity",
+EggTab:AddSlider("EggQuantity", {
+    Title = "Egg Quantity",
+    Default = 3,
+    Min = 1,
+    Max = 10,
+    Rounding = 1,
     Callback = function(v) state.eggQuantity = v end,
 })
 
-EggTab:CreateToggle({
-    Name = "Auto Egg",
-    CurrentValue = false,
-    Flag = "AutoEgg",
+EggTab:AddToggle("AutoEgg", {
+    Title = "Auto Egg",
+    Default = false,
     Callback = function(v) state.egg = v end,
 })
 
-print("AutoFarm loaded.")
+-- ============ Settings Tab (config save/load) ============
+local SettingsTab = Window:AddTab({ Title = "Settings", Icon = "solar/settings-bold" })
+
+-- Fluent Modded's own SaveManager/InterfaceManager — this is what makes
+-- configs persist to disk. Element ids ("AutoDice", "SellThreshold", etc.)
+-- above are the keys that get saved. BuildConfigSection auto-generates the
+-- Save/Load buttons on the Settings tab.
+local SaveManager = loadstring(game:HttpGet(
+    "https://raw.githubusercontent.com/StyearX/Fluent-modded/main/Addons/SaveManager.lua"
+))()
+
+local InterfaceManager = loadstring(game:HttpGet(
+    "https://raw.githubusercontent.com/StyearX/Fluent-modded/main/Addons/InterfaceManager.lua"
+))()
+
+SaveManager:SetLibrary(Fluent)
+InterfaceManager:SetLibrary(Fluent)
+
+InterfaceManager:SetFolder("BunsHub")
+SaveManager:SetFolder("BunsHub/Config")
+
+InterfaceManager:BuildInterfaceSection(SettingsTab)
+SaveManager:BuildConfigSection(SettingsTab)
+
+SaveManager:IgnoreThemeSettings()
+SaveManager:LoadAutoloadConfig()
+
+print("AutoFarm loaded (Fluent Modded).")
