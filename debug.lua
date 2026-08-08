@@ -1,13 +1,10 @@
--- ================= Fusion Standalone Script (v4) =================
--- Changes:
---   - No continuous pin while claiming (just set CFrame once)
---   - Tracks last claimed JobId so it never reclaims the same one
---   - Longer settle time + cooldown after claim
---   - Better result dumping for debugging
+-- ================= Fusion Standalone Script (v5) =================
+-- Now claims by firing the real ProximityPrompt ("Claim")
 
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
+local ProximityPromptService = game:GetService("ProximityPromptService")
 
 local player = Players.LocalPlayer
 local remotes = RS:WaitForChild("Remotes")
@@ -18,13 +15,12 @@ local TELEPORT_SETTLE_DELAY = 0.6
 local FUSION_CHECK_INTERVAL = 3
 local FUSION_WAIT_INTERVAL = 1
 local FUSION_MAX_WAIT = 300
-local CLAIM_SETTLE_DELAY = 0.8          -- time standing on claim pad before firing
-local AFTER_CLAIM_COOLDOWN = 4          -- wait after successful claim
+local CLAIM_SETTLE_DELAY = 0.7
+local AFTER_CLAIM_COOLDOWN = 3
 
--- FuseMachine location
 local FUSE_MACHINE_CFRAME = CFrame.new(-104.240242, 1.77263951 + 5, 198.388123)
 
--- Claim position (exact CFrame you gave)
+-- Claim CFrame you gave earlier (still good as fallback)
 local CLAIM_CFRAME = CFrame.new(
     -116.513695, 5.76566458, 199.923004,
     0.133674741, -1.7736415e-08, 0.991025269,
@@ -32,7 +28,7 @@ local CLAIM_CFRAME = CFrame.new(
     -0.991025269, 3.74590625e-09, 0.133674741
 )
 
--- ===== Pinning (only used for FuseMachine) =====
+-- ===== Pinning (only for FuseMachine) =====
 local pinned = false
 local pinTarget = nil
 
@@ -62,7 +58,6 @@ RunService.Heartbeat:Connect(function()
     end
 end)
 
--- Just set CFrame once (no continuous pin) – used for claim
 local function setCFrameOnce(cframe)
     local ok, hrp = pcall(getHRP)
     if ok and hrp then
@@ -77,10 +72,7 @@ local function getPlayerState()
     local ok, result = pcall(function()
         return EggInfo:InvokeServer("State")
     end)
-    if not ok or not result then
-        warn("[Fusion] Failed to get player state")
-        return nil
-    end
+    if not ok or not result then return nil end
     return result
 end
 
@@ -88,10 +80,7 @@ local function getFusionState()
     local ok, result = pcall(function()
         return EggInfo:InvokeServer("GetFusionState")
     end)
-    if not ok or not result then
-        warn("[Fusion] Failed to get fusion state")
-        return nil
-    end
+    if not ok or not result then return nil end
     return result
 end
 
@@ -103,48 +92,56 @@ local function fusePets(petIds, mode)
         })
     end)
     if not ok then
-        warn("[Fusion] Fuse call failed:", result)
+        warn("[Fusion] Fuse failed:", result)
         return nil
     end
     return result
 end
 
-local function acknowledgeFusion(jobId)
-    local ok, result = pcall(function()
-        return EggInfo:InvokeServer("AcknowledgeFusion", {
-            JobId = jobId,
-        })
+-- ===== Fire the real Claim prompt =====
+local function fireClaimPrompt()
+    local claimPart = workspace:FindFirstChild("Map")
+        and workspace.Map:FindFirstChild("Island")
+        and workspace.Map.Island:FindFirstChild("FuseMachine")
+        and workspace.Map.Island.FuseMachine:FindFirstChild("Claim")
+
+    if not claimPart then
+        warn("[Fusion] Could not find FuseMachine.Claim")
+        return false
+    end
+
+    local prompt = claimPart:FindFirstChildOfClass("ProximityPrompt")
+    if not prompt then
+        warn("[Fusion] No ProximityPrompt on Claim")
+        return false
+    end
+
+    print("[Fusion] Found Claim prompt → firing...")
+
+    -- Make sure we are close enough
+    setCFrameOnce(claimPart:GetPivot() + Vector3.new(0, 3, 0))
+    task.wait(0.3)
+
+    -- Fire the prompt (HoldDuration is 0 so this is instant)
+    prompt:InputHoldBegin()
+    task.wait(0.15)
+    prompt:InputHoldEnd()
+
+    -- Extra safety: some games need this
+    pcall(function()
+        fireproximityprompt(prompt)
     end)
-    if not ok then
-        warn("[Fusion] AcknowledgeFusion call failed:", result)
-        return nil
-    end
-    return result
-end
 
--- Pretty-print tables for debugging
-local function dump(t, name)
-    if type(t) ~= "table" then
-        print("[Fusion]", name or "value", "=", t)
-        return
-    end
-    print("[Fusion]", name or "table", "{")
-    for k, v in pairs(t) do
-        print("   ", k, "=", v)
-    end
-    print("}")
+    print("[Fusion] Claim prompt fired")
+    return true
 end
 
 -- ===== Pet grouping =====
 local function findFusableGroups(state, minCount, variantFilter)
     minCount = minCount or 6
     local groups = {}
-
     local pets = state and state.Pets
-    if not pets then
-        warn("[Fusion] No Pets table in state")
-        return {}
-    end
+    if not pets then return {} end
 
     for _, pet in pairs(pets) do
         if type(pet) == "table" and pet.Name and pet.Id then
@@ -165,11 +162,7 @@ local function findFusableGroups(state, minCount, variantFilter)
             table.insert(fusable, group)
         end
     end
-
-    table.sort(fusable, function(a, b)
-        return a.count > b.count
-    end)
-
+    table.sort(fusable, function(a, b) return a.count > b.count end)
     return fusable
 end
 
@@ -189,147 +182,90 @@ local function teleportToFuseMachine()
     task.wait(TELEPORT_SETTLE_DELAY)
 end
 
-local function teleportToClaimPosition()
-    -- Important: stop continuous pin so the server sees a normal character
-    unpin()
-    setCFrameOnce(CLAIM_CFRAME)
-    task.wait(CLAIM_SETTLE_DELAY)
-end
-
 -- ===== Wait for fusion ready =====
-local lastClaimedJobId = nil
-
 local function waitForFusionReady()
     local startTime = tick()
     while tick() - startTime < FUSION_MAX_WAIT do
         local fs = getFusionState()
         if fs and fs.Fusion then
-            local jobId = fs.Fusion.JobId
-
-            -- Skip if we already claimed this one
-            if jobId and jobId == lastClaimedJobId then
-                task.wait(FUSION_WAIT_INTERVAL)
-                continue
-            end
-
-            if fs.Fusion.Ready then
-                print("[Fusion] Fusion ready! JobId:", jobId)
-                return fs.Fusion
-            end
-            if fs.Fusion.Remaining and fs.Fusion.Remaining <= 0 then
-                print("[Fusion] Remaining <= 0! JobId:", jobId)
-                return fs.Fusion
-            end
-            if fs.Fusion.ReadyAt and tick() >= fs.Fusion.ReadyAt then
-                print("[Fusion] ReadyAt passed! JobId:", jobId)
+            if fs.Fusion.Ready or (fs.Fusion.Remaining and fs.Fusion.Remaining <= 0) then
+                print("[Fusion] Fusion ready! JobId:", fs.Fusion.JobId)
                 return fs.Fusion
             end
             if not fs.Fusion.Active then
-                -- finished / already claimed
                 return nil
             end
         end
         task.wait(FUSION_WAIT_INTERVAL)
     end
-    warn("[Fusion] Timed out waiting for fusion")
+    warn("[Fusion] Timed out")
     return nil
 end
 
--- ===== Claim =====
-local function claimFusion(fusionInfo)
-    if not fusionInfo or not fusionInfo.JobId then
-        warn("[Fusion] No JobId, cannot claim")
-        return nil
-    end
-
-    if fusionInfo.JobId == lastClaimedJobId then
-        print("[Fusion] Already claimed this JobId, skipping")
-        return nil
-    end
-
-    print("[Fusion] Timer finished → teleporting to claim position...")
-    teleportToClaimPosition()
-
-    print("[Fusion] Firing AcknowledgeFusion with JobId:", fusionInfo.JobId)
-    local result = acknowledgeFusion(fusionInfo.JobId)
-
-    dump(result, "AcknowledgeFusion result")
-
-    if result then
-        lastClaimedJobId = fusionInfo.JobId
-        print("[Fusion] Claim accepted, waiting cooldown...")
-        task.wait(AFTER_CLAIM_COOLDOWN)
-    end
-
-    return result
-end
-
--- ===== Fuse 6 Normal → Golden =====
+-- ===== Main fuse functions =====
 local function fuseToGolden()
     local state = getPlayerState()
     if not state then return false end
 
-    local fusableGroups = findFusableGroups(state, 6, "Normal")
-    if #fusableGroups == 0 then
-        print("[Fusion] No 6+ identical Normal pets found")
+    local groups = findFusableGroups(state, 6, "Normal")
+    if #groups == 0 then
+        print("[Fusion] No 6+ Normal pets")
         return false
     end
 
-    local group = fusableGroups[1]
-    print("[Fusion] Found", group.count, "Normal pets named:", group.name)
+    local group = groups[1]
+    print("[Fusion] Found", group.count, "Normal", group.name)
 
     local petIds = {}
-    for i = 1, 6 do
-        table.insert(petIds, group.ids[i])
-    end
+    for i = 1, 6 do table.insert(petIds, group.ids[i]) end
 
-    -- 1. TP to FuseMachine
     print("[Fusion] Teleporting to FuseMachine...")
     teleportToFuseMachine()
 
-    -- 2. Fuse
-    print("[Fusion] Fusing 6x", group.name, "→ Golden...")
+    print("[Fusion] Fusing → Golden...")
     local fuseResult = fusePets(petIds, "Golden")
-    dump(fuseResult, "Fuse result")
+    if fuseResult then
+        print("[Fusion] Fuse Success:", fuseResult.Success, "Reason:", fuseResult.Reason)
+    end
 
-    -- 3. Wait for timer
     local fusionInfo = waitForFusionReady()
     if not fusionInfo then
         unpin()
         return false
     end
 
-    -- 4 + 5. TP to claim (no pin) → fire claim
-    claimFusion(fusionInfo)
+    -- Stop pinning and claim with the real prompt
     unpin()
+    task.wait(0.2)
+    fireClaimPrompt()
+    task.wait(AFTER_CLAIM_COOLDOWN)
     return true
 end
 
--- ===== Fuse 6 Golden → Diamond =====
 local function fuseToDiamond()
     local state = getPlayerState()
     if not state then return false end
 
-    local fusableGroups = findFusableGroups(state, 6, "Golden")
-    if #fusableGroups == 0 then
-        print("[Fusion] No 6+ identical Golden pets found")
+    local groups = findFusableGroups(state, 6, "Golden")
+    if #groups == 0 then
+        print("[Fusion] No 6+ Golden pets")
         return false
     end
 
-    local group = fusableGroups[1]
-    print("[Fusion] Found", group.count, "Golden pets named:", group.name)
+    local group = groups[1]
+    print("[Fusion] Found", group.count, "Golden", group.name)
 
     local petIds = {}
-    for i = 1, 6 do
-        table.insert(petIds, group.ids[i])
-    end
+    for i = 1, 6 do table.insert(petIds, group.ids[i]) end
 
     print("[Fusion] Teleporting to FuseMachine...")
     teleportToFuseMachine()
 
-    print("[Fusion] Fusing 6x Golden", group.name, "→ Diamond...")
+    print("[Fusion] Fusing → Diamond...")
     local fuseResult = fusePets(petIds, "Diamond")
-    dump(fuseResult, "Fuse result")
+    if fuseResult then
+        print("[Fusion] Fuse Success:", fuseResult.Success, "Reason:", fuseResult.Reason)
+    end
 
     local fusionInfo = waitForFusionReady()
     if not fusionInfo then
@@ -337,8 +273,10 @@ local function fuseToDiamond()
         return false
     end
 
-    claimFusion(fusionInfo)
     unpin()
+    task.wait(0.2)
+    fireClaimPrompt()
+    task.wait(AFTER_CLAIM_COOLDOWN)
     return true
 end
 
@@ -346,21 +284,12 @@ end
 task.spawn(function()
     while true do
         local ok, err = pcall(function()
-            local goldenDone = fuseToGolden()
-            if goldenDone then
-                task.wait(1.5)
-            end
-
-            local diamondDone = fuseToDiamond()
-            if diamondDone then
-                task.wait(1.5)
-            end
+            if fuseToGolden() then task.wait(1) end
+            if fuseToDiamond() then task.wait(1) end
         end)
-        if not ok then
-            warn("[Fusion] Error:", err)
-        end
+        if not ok then warn("[Fusion] Error:", err) end
         task.wait(FUSION_CHECK_INTERVAL)
     end
 end)
 
-print("[Fusion] Standalone fusion script loaded (v4).")
+print("[Fusion] Standalone fusion script loaded (v5 - ProximityPrompt claim).")
