@@ -7,7 +7,7 @@
 --
 -- Changes from v1:
 --   - Claim remote is "AcknowledgeFusion" (not "ClaimFusion")
---   - Teleport to spawn, then back to FuseMachine before claiming
+--   - Claim stays at FuseMachine (no spawn teleport)
 --   - Diamond fusion requires 6 Golden pets (not 1)
 --   - Better claim timer detection using Remaining / ReadyAt / Ready
 
@@ -213,21 +213,15 @@ local function waitForFusionReady()
     return nil
 end
 
--- ===== Claim fusion (teleport to spawn, back to machine, then acknowledge) =====
-local function claimFusionWithTeleport(fusionInfo)
+-- ===== Claim fusion (stay at FuseMachine, then acknowledge) =====
+local function claimFusion(fusionInfo)
     if not fusionInfo.JobId then
         warn("[Fusion] No JobId in fusion info, cannot claim")
         return nil
     end
 
-    -- Teleport to spawn, then back to machine (as described by user)
-    print("[Fusion] Teleporting to spawn for claim...")
-    teleportToSpawn()
-    task.wait(CLAIM_TELEPORT_DELAY)
-    print("[Fusion] Teleporting back to FuseMachine...")
-    teleportToFuseMachine()
-
-    -- Call AcknowledgeFusion
+    -- Stay at the FuseMachine — the spawn teleport was wrong,
+    -- claiming must happen at the machine itself.
     print("[Fusion] Acknowledging fusion with JobId:", fusionInfo.JobId)
     local result = acknowledgeFusion(fusionInfo.JobId)
     if result then
@@ -276,7 +270,7 @@ local function fuseToGolden()
     end
 
     -- Claim the fusion
-    claimFusionWithTeleport(fusionInfo)
+    claimFusion(fusionInfo)
     unpin()
     return true
 end
@@ -321,7 +315,7 @@ local function fuseToDiamond()
     end
 
     -- Claim the fusion
-    claimFusionWithTeleport(fusionInfo)
+    claimFusion(fusionInfo)
     unpin()
     return true
 end
