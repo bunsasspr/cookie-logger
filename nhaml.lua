@@ -1,652 +1,469 @@
--- ===== Auto Dice + Auto Potion + EquipBest + Auto Sell + Auto Rebirth + FoodCart + Merchant + Auto Eggs =====
+-- ================= AutoFarm — Rayfield rework =================
+local Rayfield = loadstring(game:HttpGet("https://sirius.menu/gen2"))()
+
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
-local UIS = game:GetService("UserInputService")
-local VirtualUser = game:GetService("VirtualUser")
 
 local player = Players.LocalPlayer
 local remotes = RS:WaitForChild("Remotes")
 
--- ===== Anti AFK =====
-player.Idled:Connect(function()
-    VirtualUser:CaptureController()
-    VirtualUser:ClickButton2(Vector2.new())
-end)
-
 local BuyDice = remotes:WaitForChild("BuyDice")
 local BuyPotion = remotes:WaitForChild("BuyPotion")
-local EquipBest = remotes:WaitForChild("EquipBest")
 local UsePotion = remotes:WaitForChild("UsePotion")
-local Dialogue = remotes:WaitForChild("Dialogue")
 local RebirthRemote = remotes:WaitForChild("Rebirth")
 local FoodCartRemote = remotes:WaitForChild("FoodCart")
 local MerchantRemote = remotes:WaitForChild("Merchant")
 local EggInfo = remotes:WaitForChild("EggInfo")
 
--- Shop / sell / egg positions
-local DICE_SHOP = CFrame.new(179.709259, 4.53835154, -144.103485, 0.909164608, -2.76407324e-08, -0.41643694, -1.1623088e-09, 1, -6.8911902e-08, 0.41643694, 6.31362909e-08, 0.909164608)
-local POTION_SHOP = CFrame.new(153.449585, 4.03330231, -138.129669, 0.814049244, 6.003647e-08, 0.580795884, -6.18439913e-08, 1, -1.66881726e-08, -0.580795884, -2.23337384e-08, 0.814049244)
-local SELL_CFRAME = CFrame.new(185.339233, 3.67208314, -117.684746, 0.0844980627, 5.13176062e-08, -0.996423662, -1.29543869e-08, 1, 5.04032442e-08, 0.996423662, 8.64908056e-09, 0.0844980627)
-local EGG_CFRAME = CFrame.new(-198.375092, 3.67208314, 168.48439, -0.455900133, 5.02545072e-09, 0.890030921, 1.24778738e-08, 1, 7.45158324e-10, -0.890030921, 1.14454117e-08, -0.455900133)
+-- ===== Config =====
+local BUY_STAND_DURATION = 2       -- seconds to stand + spam-fire (dice/potion/eggs)
+local BUY_FIRE_INTERVAL = 0.5      -- seconds between spam-fires
+local TELEPORT_OFFSET = 4          -- studs back from target, avoids the collision push-out glitch
+local TELEPORT_SETTLE_DELAY = 0.5  -- pause after teleporting before firing
+local SCHEDULER_INTERVAL = 1       -- seconds between priority re-checks
+local RESTOCK_BUFFER = 2           -- extra seconds after a restock timer hits 0
+local FALLBACK_RESTOCK_WAIT = 120  -- used if a restock timer label can't be read
+local COLLECT_INTERVAL = 3         -- seconds between money-collection sweeps
+local USE_POTIONS_INTERVAL = 10    -- seconds between auto-use-potion sweeps
+local REBIRTH_CHECK_INTERVAL = 2   -- seconds
+local REBIRTH_COOLDOWN = 5         -- seconds after firing rebirth
+local EGG_BUY_QUANTITY = 3
 
-local enabled = false
-local WAIT_AFTER_BUY = 120 -- fallback if a timer label can't be read
-local RESTOCK_BUFFER = 2 -- extra seconds after "0:00" to make sure server has actually restocked
-local SELL_THRESHOLD = 30
-local SELL_CHECK_INTERVAL = 5 -- seconds
-local EQUIP_INTERVAL = 300 -- 5 minutes between equip sessions
-local EQUIP_SESSION_DURATION = 20 -- stay at plot for this many seconds
-local EQUIP_SPAM_DELAY = 5 -- equip best every N seconds while at plot
-local EQUIP_BEFORE_SELL_COUNT = 3 -- how many times to equip before selling
-local REBIRTH_CHECK_INTERVAL = 2 -- seconds
-local REBIRTH_COOLDOWN = 5 -- seconds, let GUI/state settle after rebirthing
-local NPC_CHECK_INTERVAL = 3 -- seconds, for FoodCart/Merchant existence polling
-local EGG_SPAM_DELAY = 0.15 -- delay between egg opens
-local ACTION_SETTLE_DELAY = 0.6 -- pause right after acquiring the lock, before doing anything
-local TELEPORT_SETTLE_DELAY = 0.5 -- pause after every teleport before firing a remote
-local BUY_STAND_DURATION = 2 -- seconds to stand and spam-fire buy remotes (dice/potion)
-local BUY_FIRE_INTERVAL = 0.5 -- seconds between each spam-fire (dice/potion)
-local PIN_DURATION = 5 -- seconds to hold the pin for merchant while buying, before heading back to eggs
+-- Full item pools (found via Dark Dex) — fired blind, server rejects anything not
+-- actually in stock, so no GUI reading is needed for Merchant at all.
+local DICE_ORDER = {
+    "Basic", "Bronze", "Iron", "Silver", "Gold", "Sapphire", "Emerald", "Ruby",
+    "Obsidian", "Crystal", "Nebula", "Void", "Celestial", "Abyssal", "Infernal",
+    "Ethereal", "Galactic", "Quantum", "Eldritch", "Sovereign", "Arcane",
+    "Paradox", "Oblivion", "Singularity", "Transcendent", "Omnipotent",
+    "Seraphic", "Valentine",
+}
+local POTION_ORDER = {
+    "Luck I", "Cash I", "Luck II", "Cash II", "Mutation I", "Dice Consumption I",
+    "Luck III", "Cash III", "Mutation II", "Godly Cash", "Godly Luck", "Egg Luck I",
+    "Dice Consumption II", "Egg Luck II", "Godly Mutation", "Godly Dice Consumption",
+    "Godly Egg Luck",
+}
+local FOOD_ORDER = {"Apple", "Potato", "Carrot", "Loaf", "Fish", "Steak"}
+local EXCLUSIVE_ORDER = {"Holy Token", "Rainbow Godly"}
 
-local FOODCART_ITEMS = {
-    "Apple",
-    "Potato",
-    "Loaf",
-    "Fish",
-    "Steak",
+local MERCHANT_CATEGORIES = {
+    {name = "Dices", items = DICE_ORDER},
+    {name = "Potions", items = POTION_ORDER},
+    {name = "Foods", items = FOOD_ORDER},
+    {name = "Exclusive", items = EXCLUSIVE_ORDER},
 }
 
--- Potion list (cleaner format)
-local potions = {
-    -- Cash
-    {Name = "Cash I", Arg = "Max"},
-    {Name = "Cash II", Arg = "Max"},
-    {Name = "Cash III", Arg = "Max"},
-    {Name = "Godly Cash", Arg = "Max"},
+-- workspace.Map.Island.EggHolders.<N> holds a model named after the egg type
+local EGG_HOLDER_INDEX = {
+    Basic = 1, Forest = 2, Jungle = 3, Beach = 4, Monster = 5,
+    Desert = 6, Galaxy = 7, Candy = 8, Lava = 9, Frozen = 10,
+}
+local EGG_NAMES = {"Basic", "Forest", "Jungle", "Beach", "Monster", "Desert", "Galaxy", "Candy", "Lava", "Frozen"}
 
-    -- Luck
-    {Name = "Luck I", Arg = "Max"},
-    {Name = "Luck II", Arg = "Max"},
-    {Name = "Luck III", Arg = "Max"},
-    {Name = "Godly Luck", Arg = "Max"},
-
-    -- Egg Luck
-    {Name = "Egg Luck I", Arg = "Max"},
-    {Name = "Egg Luck II", Arg = "Max"},
-    {Name = "Godly Egg Luck", Arg = "Max"},
-
-    -- Mutation
-    {Name = "Mutation I", Arg = "Max"},
-    {Name = "Mutation II", Arg = "Max"},
-    {Name = "Mutation III", Arg = "Max"},
-    {Name = "Godly Mutation", Arg = "Max"},
-
-    -- Dice Consumption
-    {Name = "Dice Consumption I", Arg = "Max"},
-    {Name = "Dice Consumption II", Arg = "Max"},
-    {Name = "Godly Dice Consumption", Arg = "Max"},
-
-    -- Others
-    {Name = "Rainbow Godly", Arg = "Max"},
-    {Name = "Rainbow Potion", Arg = "Max"},
+-- ===== Feature state (driven by the Rayfield toggles below) =====
+local state = {
+    dice = false,
+    potion = false,
+    merchant = false,
+    foodcart = false,
+    collect = false,
+    usePotions = false,
+    egg = false,
+    rebirth = false,
+    selectedEgg = "Basic",
 }
 
--- ===== Movement lock =====
--- Dice/potion/sell/rebirth/foodcart/merchant/equip all teleport the character.
--- Only one action may move the player at a time, or loops will fight over CFrame.
--- A small settle delay runs right after the lock is acquired so the server has
--- time to register the previous action's final position/state before the next
--- one starts moving and firing remotes — this is what was causing actions to
--- teleport without their remote actually registering when several NPCs/timers
--- became ready back-to-back.
-local actionLock = false
-local function withLock(fn)
-    while actionLock do
-        task.wait(0.2)
-    end
-    actionLock = true
-    task.wait(ACTION_SETTLE_DELAY)
-    local ok, err = pcall(fn)
-    actionLock = false
-    if not ok then
-        warn("[AutoFarm] Action error: " .. tostring(err))
-    end
-end
-
--- Pins the character to a CFrame every frame (countering the physics push-out
--- glitch) until stopped. Returns a function to call when done pinning.
-local RunService = game:GetService("RunService")
-local function startPin(hrp, cframe)
-    local pinning = true
-    local conn
-    conn = RunService.Heartbeat:Connect(function()
-        if pinning then
-            hrp.CFrame = cframe
-            hrp.AssemblyLinearVelocity = Vector3.zero
-            hrp.AssemblyAngularVelocity = Vector3.zero
-        end
-    end)
-    return function()
-        pinning = false
-        conn:Disconnect()
-    end
-end
-
+-- ===== Helpers =====
 local function getHRP()
     local char = player.Character or player.CharacterAdded:Wait()
     return char:WaitForChild("HumanoidRootPart")
 end
 
--- Teleports the character to a CFrame, offset slightly backward so it doesn't
--- land inside the target's collision geometry (which causes Roblox to shove
--- the character back out, sometimes well outside interaction range), and
--- zeroes velocity afterward so no leftover momentum carries into that push.
-local function teleportTo(hrp, cframe, backOffset)
-    backOffset = backOffset or 4
-    hrp.CFrame = cframe * CFrame.new(0, 0, backOffset)
+-- Teleports offset back from the target so the character doesn't land inside
+-- collision geometry (which shoves it back out, sometimes well out of range),
+-- and zeroes velocity so nothing carries into that push.
+local function teleportTo(cframe, offset)
+    offset = offset or TELEPORT_OFFSET
+    local hrp = getHRP()
+    hrp.CFrame = cframe * CFrame.new(0, 0, offset)
     hrp.AssemblyLinearVelocity = Vector3.zero
     hrp.AssemblyAngularVelocity = Vector3.zero
 end
 
-local function getMyPlotCFrame()
+local function getMapShopPart(modelName)
+    local mapShop = workspace.Map:FindFirstChild("MapShop")
+    if not mapShop then return nil end
+    local model = mapShop:FindFirstChild(modelName)
+    if not model then return nil end
+    return model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart", true)
+end
+
+local function getEggPart(eggName)
+    local idx = EGG_HOLDER_INDEX[eggName]
+    if not idx then return nil end
+    local holders = workspace.Map:FindFirstChild("Island") and workspace.Map.Island:FindFirstChild("EggHolders")
+    if not holders then return nil end
+    local holder = holders:FindFirstChild(tostring(idx))
+    if not holder then return nil end
+    return holder:FindFirstChild("Part")
+end
+
+local function getMyPlotModel()
     local plotsFolder = workspace:FindFirstChild("Map") and workspace.Map:FindFirstChild("Plots")
     if not plotsFolder then return nil end
-
     for _, plot in ipairs(plotsFolder:GetChildren()) do
         local owner = plot:GetAttribute("Owner") or plot:GetAttribute("owner")
         if owner == player.UserId or tostring(owner) == tostring(player.UserId) then
-            if plot:IsA("Model") and plot.PrimaryPart then
-                return plot.PrimaryPart.CFrame + Vector3.new(0, 3, 0)
-            end
-            local part = plot:FindFirstChildWhichIsA("BasePart", true)
-            if part then
-                return part.CFrame + Vector3.new(0, 3, 0)
-            end
+            return plot
         end
     end
     return nil
 end
 
-local function goToEggs(hrp)
-    teleportTo(hrp, EGG_CFRAME)
-    task.wait(TELEPORT_SETTLE_DELAY)
-end
-
-local function returnToPlot(hrp)
-    local plotCF = getMyPlotCFrame()
-    if plotCF then
-        teleportTo(hrp, plotCF)
-        task.wait(TELEPORT_SETTLE_DELAY)
-    else
-        warn("Could not find your plot!")
-    end
-end
-
--- shopName: "Main" (dice shop) or "Potion"
+-- shopName: "Main" (dice) or "Potion"
 local function getRestockSeconds(shopName)
     local ok, label = pcall(function()
         return player.PlayerGui.Main.Canvas.MapShops[shopName].Holder.Timer.TextLabel
     end)
     if not ok or not label then return nil end
-
     local min, sec = label.Text:match("(%d+):(%d+)")
     if not min or not sec then return nil end
-
     return tonumber(min) * 60 + tonumber(sec)
 end
 
-local function useAllPotions()
-    for _, potion in ipairs(potions) do
-        pcall(function()
-            UsePotion:FireServer("Use", potion.Name, potion.Arg)
-        end)
-        task.wait(0.12)
-    end
-    print("Used all potions")
-end
+-- ================= Buy actions =================
 
--- ===== Auto Eggs (spam while idle at egg location) =====
-task.spawn(function()
-    while true do
-        if enabled and not actionLock then
-            pcall(function()
-                EggInfo:InvokeServer("Buy", "Frozen", 3)
-            end)
-        end
-        task.wait(EGG_SPAM_DELAY)
-    end
-end)
-
--- ===== Auto Dice =====
 local function buyDice()
-    withLock(function()
-        local hrp = getHRP()
-        teleportTo(hrp, DICE_SHOP)
-        task.wait(TELEPORT_SETTLE_DELAY)
-
-        local elapsed = 0
-        while elapsed < BUY_STAND_DURATION do
-            pcall(function()
-                BuyDice:FireServer("BuyBestAvailable")
-            end)
-            task.wait(BUY_FIRE_INTERVAL)
-            elapsed += BUY_FIRE_INTERVAL
-        end
-
-        goToEggs(hrp)
-        print("Bought dice → eggs")
-    end)
-end
-
-task.spawn(function()
-    while true do
-        if enabled then
-            buyDice()
-
-            local restockWait = getRestockSeconds("Main")
-            if restockWait then
-                print(("Dice restocking in %ds"):format(restockWait))
-                restockWait += RESTOCK_BUFFER
-            else
-                warn("Couldn't read dice restock timer, falling back to fixed wait")
-                restockWait = WAIT_AFTER_BUY
-            end
-
-            local waited = 0
-            while waited < restockWait and enabled do
-                task.wait(1)
-                waited += 1
-            end
-        else
-            task.wait(1)
-        end
+    local part = getMapShopPart("Shop")
+    if not part then
+        warn("Dice shop model not found")
+        return
     end
-end)
-
--- ===== Auto Potion =====
-local function buyPotion()
-    withLock(function()
-        local hrp = getHRP()
-        teleportTo(hrp, POTION_SHOP)
-        task.wait(TELEPORT_SETTLE_DELAY)
-
-        local elapsed = 0
-        while elapsed < BUY_STAND_DURATION do
-            pcall(function()
-                BuyPotion:FireServer("BuyBestAvailable")
-            end)
-            task.wait(BUY_FIRE_INTERVAL)
-            elapsed += BUY_FIRE_INTERVAL
-        end
-
-        goToEggs(hrp)
-        task.wait(0.5)
-        useAllPotions()
-        print("Bought potion → eggs")
-    end)
-end
-
-task.spawn(function()
-    while true do
-        if enabled then
-            buyPotion()
-
-            local restockWait = getRestockSeconds("Potion")
-            if restockWait then
-                print(("Potion restocking in %ds"):format(restockWait))
-                restockWait += RESTOCK_BUFFER
-            else
-                warn("Couldn't read potion restock timer, falling back to fixed wait")
-                restockWait = WAIT_AFTER_BUY
-            end
-
-            local waited = 0
-            while waited < restockWait and enabled do
-                task.wait(1)
-                waited += 1
-            end
-        else
-            task.wait(1)
-        end
-    end
-end)
-
--- Spam EquipBest at plot for a duration (every EQUIP_SPAM_DELAY seconds)
-local function equipAtPlot(duration)
-    local hrp = getHRP()
-    returnToPlot(hrp)
+    teleportTo(part.CFrame)
+    task.wait(TELEPORT_SETTLE_DELAY)
 
     local elapsed = 0
-    local count = 0
-    while elapsed < duration and enabled do
+    while elapsed < BUY_STAND_DURATION do
         pcall(function()
-            EquipBest:FireServer()
+            BuyDice:FireServer("BuyBestAvailable")
         end)
-        count += 1
-        print(("Equipped best (%d)"):format(count))
-        task.wait(EQUIP_SPAM_DELAY)
-        elapsed += EQUIP_SPAM_DELAY
+        task.wait(BUY_FIRE_INTERVAL)
+        elapsed += BUY_FIRE_INTERVAL
+    end
+    print("[Dice] Bought")
+end
+
+local function buyPotion()
+    local part = getMapShopPart("PotionShop")
+    if not part then
+        warn("Potion shop model not found")
+        return
+    end
+    teleportTo(part.CFrame)
+    task.wait(TELEPORT_SETTLE_DELAY)
+
+    local elapsed = 0
+    while elapsed < BUY_STAND_DURATION do
+        pcall(function()
+            BuyPotion:FireServer("BuyBestAvailable")
+        end)
+        task.wait(BUY_FIRE_INTERVAL)
+        elapsed += BUY_FIRE_INTERVAL
+    end
+    print("[Potion] Bought")
+end
+
+local function getFoodCartModel()
+    local mapShop = workspace.Map:FindFirstChild("MapShop")
+    return mapShop and mapShop:FindFirstChild("FoodCart")
+end
+
+local function buyFoodCart()
+    local cart = getFoodCartModel()
+    if not cart then return end
+    local part = cart.PrimaryPart or cart:FindFirstChildWhichIsA("BasePart", true)
+    if not part then return end
+
+    teleportTo(part.CFrame)
+    task.wait(TELEPORT_SETTLE_DELAY)
+
+    if not getFoodCartModel() then
+        warn("[FoodCart] Despawned before buying")
+        return
+    end
+
+    for _, item in ipairs(FOOD_ORDER) do
+        pcall(function()
+            FoodCartRemote:FireServer("BuyAll", item)
+        end)
+        task.wait(0.15)
+    end
+    print("[FoodCart] Done")
+end
+
+local function getMerchantModel()
+    local mapShop = workspace.Map:FindFirstChild("MapShop")
+    return mapShop and mapShop:FindFirstChild("Merchant")
+end
+
+local function buyMerchant()
+    local model = getMerchantModel()
+    if not model then return end
+    local part = model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart", true)
+    if not part then return end
+
+    teleportTo(part.CFrame)
+    task.wait(TELEPORT_SETTLE_DELAY)
+
+    if not getMerchantModel() then
+        warn("[Merchant] Despawned before buying")
+        return
+    end
+
+    for _, cat in ipairs(MERCHANT_CATEGORIES) do
+        for _, itemName in ipairs(cat.items) do
+            pcall(function()
+                MerchantRemote:FireServer("BuyAll", cat.name, itemName)
+            end)
+            task.wait(0.12)
+        end
+    end
+    print("[Merchant] Done")
+end
+
+local function openEgg()
+    local part = getEggPart(state.selectedEgg)
+    if not part then
+        warn("Egg holder not found for", state.selectedEgg)
+        return
+    end
+    teleportTo(part.CFrame)
+    task.wait(TELEPORT_SETTLE_DELAY)
+
+    local elapsed = 0
+    while elapsed < BUY_STAND_DURATION do
+        pcall(function()
+            EggInfo:InvokeServer("Buy", state.selectedEgg, EGG_BUY_QUANTITY)
+        end)
+        task.wait(BUY_FIRE_INTERVAL)
+        elapsed += BUY_FIRE_INTERVAL
     end
 end
 
--- ===== Auto Equip (every 5 min — stay at plot 20s, equip every 5s, then back to eggs) =====
+-- ================= Priority scheduler =================
+-- Merchant > FoodCart > Dice > Potion > Eggs. Only one of these moves the
+-- character at a time; each pass does at most one action, then re-checks
+-- from the top so a higher-priority item can interrupt promptly.
+local lastMerchant, lastFoodCart = nil, nil
+local nextDiceTime, nextPotionTime = 0, 0
+
 task.spawn(function()
     while true do
-        if enabled then
-            withLock(function()
-                equipAtPlot(EQUIP_SESSION_DURATION)
-                local hrp = getHRP()
-                goToEggs(hrp)
-                print("Equip session done → eggs")
-            end)
+        local didSomething = false
+
+        local merchant = state.merchant and getMerchantModel()
+        local foodcart = state.foodcart and getFoodCartModel()
+
+        if merchant and merchant ~= lastMerchant then
+            lastMerchant = merchant
+            buyMerchant()
+            didSomething = true
+        elseif foodcart and foodcart ~= lastFoodCart then
+            lastFoodCart = foodcart
+            buyFoodCart()
+            didSomething = true
+        elseif state.dice and tick() >= nextDiceTime then
+            buyDice()
+            local restockWait = getRestockSeconds("Main")
+            nextDiceTime = tick() + (restockWait and (restockWait + RESTOCK_BUFFER) or FALLBACK_RESTOCK_WAIT)
+            didSomething = true
+        elseif state.potion and tick() >= nextPotionTime then
+            buyPotion()
+            local restockWait = getRestockSeconds("Potion")
+            nextPotionTime = tick() + (restockWait and (restockWait + RESTOCK_BUFFER) or FALLBACK_RESTOCK_WAIT)
+            didSomething = true
+        elseif state.egg then
+            openEgg()
+            didSomething = true
         end
-        task.wait(EQUIP_INTERVAL)
+
+        if not merchant then lastMerchant = nil end
+        if not foodcart then lastFoodCart = nil end
+
+        if not didSomething then
+            task.wait(SCHEDULER_INTERVAL)
+        end
     end
 end)
 
--- ===== Auto Sell =====
-local function getInventoryCount()
-    local counter = player.PlayerGui.Main.Canvas.Inventory.MainFrame:FindFirstChild("Counter")
-    if counter and counter:IsA("TextLabel") then
-        local current = counter.Text:match("(%d+)/")
-        return tonumber(current) or 0
-    end
-    return 0
-end
+-- ================= Independent background features =================
+-- These don't move the character, so they run on their own without
+-- competing with the priority scheduler above.
 
-local function sellInventory()
-    withLock(function()
-        local hrp = getHRP()
-
-        -- Equip a few times at plot first
-        returnToPlot(hrp)
-        for i = 1, EQUIP_BEFORE_SELL_COUNT do
-            pcall(function()
-                EquipBest:FireServer()
-            end)
-            print(("Pre-sell equip %d/%d"):format(i, EQUIP_BEFORE_SELL_COUNT))
-            task.wait(EQUIP_SPAM_DELAY)
-        end
-
-        -- Then go sell
-        teleportTo(hrp, SELL_CFRAME)
-        task.wait(TELEPORT_SETTLE_DELAY)
-        Dialogue:InvokeServer("SellNpc", 1, "I want to sell my inventory", "preview")
-        task.wait(1.5)
-        Dialogue:InvokeServer("SellNpc", 1, "I want to sell my inventory", "commit")
-        print("Sold inventory → eggs")
-        goToEggs(hrp)
-    end)
-end
-
-task.spawn(function()
-    while true do
-        if enabled then
-            local count = getInventoryCount()
-            if count >= SELL_THRESHOLD then
-                print("Inventory is", count, "→ Selling...")
-                sellInventory()
-                task.wait(3)
+-- Auto Collect Money
+local function getCollectorParts()
+    local plot = getMyPlotModel()
+    if not plot then return {} end
+    local collectors = {}
+    for _, floor in ipairs(plot:GetChildren()) do
+        if floor.Name:match("^Floor%d+$") then
+            local holders = floor:FindFirstChild("Holders")
+            if holders then
+                for _, holder in ipairs(holders:GetChildren()) do
+                    local collector = holder:FindFirstChild("Collector")
+                    if collector and collector:IsA("BasePart") then
+                        table.insert(collectors, collector)
+                    end
+                end
             end
         end
-        task.wait(SELL_CHECK_INTERVAL)
+    end
+    return collectors
+end
+
+task.spawn(function()
+    while true do
+        if state.collect then
+            local ok, hrp = pcall(getHRP)
+            if ok then
+                local collectors = getCollectorParts()
+                for _, c in ipairs(collectors) do
+                    pcall(function() firetouchinterest(c, hrp, 0) end)
+                end
+                task.wait(0.1)
+                for _, c in ipairs(collectors) do
+                    pcall(function() firetouchinterest(c, hrp, 1) end)
+                end
+            end
+        end
+        task.wait(COLLECT_INTERVAL)
     end
 end)
 
--- ===== Auto Rebirth =====
-local function getRebirthButton()
+-- Auto Use Potions
+task.spawn(function()
+    while true do
+        if state.usePotions then
+            for _, potionName in ipairs(POTION_ORDER) do
+                pcall(function()
+                    UsePotion:FireServer("Use", potionName, "Max")
+                end)
+                task.wait(0.12)
+            end
+        end
+        task.wait(USE_POTIONS_INTERVAL)
+    end
+end)
+
+-- Auto Rebirth
+local function isRebirthReady()
     local ok, btn = pcall(function()
         return player.PlayerGui.Main.Canvas.Rebirth.MainFrame.Rebirth
     end)
-    if ok then return btn end
-    return nil
-end
-
-local function isRebirthReady()
-    local btn = getRebirthButton()
-    if not btn then return false end
+    if not ok or not btn then return false end
     local color = btn.BackgroundColor3
     return color.G > color.R
 end
 
 task.spawn(function()
     while true do
-        if enabled then
+        if state.rebirth then
             local ok, ready = pcall(isRebirthReady)
             if ok and ready then
-                withLock(function()
-                    print("[AutoRebirth] Requirements met — firing rebirth")
-                    RebirthRemote:FireServer()
-                    task.wait(REBIRTH_COOLDOWN)
-                    -- after rebirth, go back to eggs
-                    local hrp = getHRP()
-                    goToEggs(hrp)
-                end)
+                RebirthRemote:FireServer()
+                print("[Rebirth] Fired")
+                task.wait(REBIRTH_COOLDOWN)
             end
         end
         task.wait(REBIRTH_CHECK_INTERVAL)
     end
 end)
 
--- ===== Auto FoodCart =====
-local function getFoodCartModel()
-    local mapShop = workspace.Map:FindFirstChild("MapShop")
-    if not mapShop then return nil end
-    return mapShop:FindFirstChild("FoodCart")
-end
-
-local function buyFoodCart()
-    withLock(function()
-        local cart = getFoodCartModel()
-        if not cart then
-            warn("FoodCart not found (probably despawned)")
-            return
-        end
-        local part = cart.PrimaryPart or cart:FindFirstChildWhichIsA("BasePart", true)
-        if not part then
-            warn("No BasePart on FoodCart model")
-            return
-        end
-
-        local hrp = getHRP()
-        teleportTo(hrp, part.CFrame, 0)
-        task.wait(TELEPORT_SETTLE_DELAY)
-
-        -- re-check it's still there after settling, in case it despawned
-        -- while we were waiting on the lock or settling
-        if not getFoodCartModel() then
-            warn("FoodCart despawned right before buying")
-            goToEggs(hrp)
-            return
-        end
-
-        for _, item in ipairs(FOODCART_ITEMS) do
-            pcall(function()
-                FoodCartRemote:FireServer("BuyAll", item)
-            end)
-            task.wait(0.15)
-        end
-
-        print("Done with FoodCart → eggs")
-        goToEggs(hrp)
-    end)
-end
-
-local lastFoodCart = nil
-task.spawn(function()
-    while true do
-        if enabled then
-            local cart = getFoodCartModel()
-            if cart and cart ~= lastFoodCart then
-                lastFoodCart = cart
-                buyFoodCart()
-            elseif not cart then
-                lastFoodCart = nil
-            end
-        end
-        task.wait(NPC_CHECK_INTERVAL)
-    end
+-- Anti-AFK, always on
+local VirtualUser = game:GetService("VirtualUser")
+player.Idled:Connect(function()
+    VirtualUser:CaptureController()
+    VirtualUser:ClickButton2(Vector2.new())
 end)
 
--- ===== Auto Merchant =====
-local function getMerchantModel()
-    local mapShop = workspace.Map:FindFirstChild("MapShop")
-    if not mapShop then return nil end
-    return mapShop:FindFirstChild("Merchant")
-end
+-- ================= UI =================
+local Window = Rayfield:CreateWindow({
+    Name = "AutoFarm",
+    LoadingTitle = "AutoFarm",
+    LoadingSubtitle = "buns",
+    ConfigurationSaving = {
+        Enabled = false,
+    },
+})
 
-local function findProximityPrompt(model)
-    for _, inst in ipairs(model:GetDescendants()) do
-        if inst:IsA("ProximityPrompt") then
-            return inst
-        end
-    end
-    return nil
-end
+local MainTab = Window:CreateTab("Main")
 
-local function getMerchantHolder()
-    local ok, holder = pcall(function()
-        return player.PlayerGui.Main.Canvas.Merchant.Main.Holder
-    end)
-    if ok then return holder end
-    return nil
-end
+MainTab:CreateToggle({
+    Name = "Auto Buy Merchant",
+    CurrentValue = false,
+    Flag = "AutoMerchant",
+    Callback = function(v) state.merchant = v end,
+})
 
-local function buyAllFromMerchant()
-    withLock(function()
-        local model = getMerchantModel()
-        if not model then
-            warn("Merchant not found (probably despawned)")
-            return
-        end
+MainTab:CreateToggle({
+    Name = "Auto Buy FoodCart",
+    CurrentValue = false,
+    Flag = "AutoFoodCart",
+    Callback = function(v) state.foodcart = v end,
+})
 
-        local part = model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart", true)
-        if not part then
-            warn("No BasePart on Merchant model")
-            return
-        end
+MainTab:CreateToggle({
+    Name = "Auto Buy Dice",
+    CurrentValue = false,
+    Flag = "AutoDice",
+    Callback = function(v) state.dice = v end,
+})
 
-        local hrp = getHRP()
-        local targetCFrame = part.CFrame
+MainTab:CreateToggle({
+    Name = "Auto Buy Potions",
+    CurrentValue = false,
+    Flag = "AutoPotion",
+    Callback = function(v) state.potion = v end,
+})
 
-        -- Initial teleport + kill velocity
-        hrp.CFrame = targetCFrame
-        hrp.AssemblyLinearVelocity = Vector3.zero
-        hrp.AssemblyAngularVelocity = Vector3.zero
-        task.wait(0.25)
+MainTab:CreateToggle({
+    Name = "Auto Use Potions",
+    CurrentValue = false,
+    Flag = "AutoUsePotions",
+    Callback = function(v) state.usePotions = v end,
+})
 
-        -- Hard pin every frame
-        local pinning = true
-        local pinConn = RunService.Heartbeat:Connect(function()
-            if not pinning or not hrp or not hrp.Parent then return end
-            hrp.CFrame = targetCFrame
-            hrp.AssemblyLinearVelocity = Vector3.zero
-            hrp.AssemblyAngularVelocity = Vector3.zero
-        end)
+MainTab:CreateToggle({
+    Name = "Auto Collect Money",
+    CurrentValue = false,
+    Flag = "AutoCollect",
+    Callback = function(v) state.collect = v end,
+})
 
-        -- Open the merchant GUI
-        local prompt = findProximityPrompt(model)
-        if prompt then
-            pcall(function()
-                fireproximityprompt(prompt)
-            end)
-        else
-            warn("No ProximityPrompt found on Merchant")
-        end
-        task.wait(0.8)
+MainTab:CreateToggle({
+    Name = "Auto Rebirth",
+    CurrentValue = false,
+    Flag = "AutoRebirth",
+    Callback = function(v) state.rebirth = v end,
+})
 
-        -- ===== Hardcoded lists =====
-        local DICE_ORDER = {
-            "Basic", "Bronze", "Iron", "Silver", "Gold", "Sapphire", "Emerald", "Ruby",
-            "Obsidian", "Crystal", "Nebula", "Void", "Celestial", "Abyssal", "Infernal",
-            "Ethereal", "Galactic", "Quantum", "Eldritch", "Sovereign", "Arcane",
-            "Paradox", "Oblivion", "Singularity", "Transcendent", "Omnipotent",
-            "Seraphic", "Valentine"
-        }
+MainTab:CreateDropdown({
+    Name = "Egg Type",
+    Options = EGG_NAMES,
+    CurrentOption = {"Basic"},
+    MultipleOptions = false,
+    Flag = "EggType",
+    Callback = function(option)
+        state.selectedEgg = type(option) == "table" and option[1] or option
+    end,
+})
 
-        local POTION_ORDER = {
-            "Luck I", "Cash I", "Luck II", "Cash II", "Mutation I", "Dice Consumption I",
-            "Luck III", "Cash III", "Mutation II", "Godly Cash", "Godly Luck", "Egg Luck I",
-            "Dice Consumption II", "Egg Luck II", "Godly Mutation", "Godly Dice Consumption", "Godly Egg Luck"
-        }
+MainTab:CreateToggle({
+    Name = "Auto Egg",
+    CurrentValue = false,
+    Flag = "AutoEgg",
+    Callback = function(v) state.egg = v end,
+})
 
-        local FOOD_ORDER = {
-            "Apple", "Potato", "Carrot", "Loaf", "Fish", "Steak"
-        }
-
-        local EXCLUSIVE_ORDER = {
-            "Holy Token", "Rainbow Godly"
-        }
-
-        local categories = {
-            {name = "Dices", items = DICE_ORDER},
-            {name = "Potions", items = POTION_ORDER},
-            {name = "Foods", items = FOOD_ORDER},
-            {name = "Exclusives", items = EXCLUSIVE_ORDER},
-        }
-
-        local bought = 0
-
-        for _, cat in ipairs(categories) do
-            for _, itemName in ipairs(cat.items) do
-                pcall(function()
-                    MerchantRemote:FireServer("BuyAll", cat.name, itemName)
-                end)
-                print(("Bought %s (%s)"):format(itemName, cat.name))
-                bought += 1
-                task.wait(0.12)
-            end
-        end
-
-        -- Hold pin a bit after buys
-        task.wait(0.8)
-        pinning = false
-        task.wait(0.1)
-        pinConn:Disconnect()
-
-        print(("Done — fired %d BuyAll(s) from Merchant"):format(bought))
-
-        -- 5 second delay before continuing other tasks
-        task.wait(5)
-
-        local hrp2 = getHRP()
-        goToEggs(hrp2)
-        print("Merchant finished → eggs")
-    end)
-end
-
-local lastMerchant = nil
-task.spawn(function()
-    while true do
-        if enabled then
-            local merchant = getMerchantModel()
-            if merchant and merchant ~= lastMerchant then
-                lastMerchant = merchant
-                buyAllFromMerchant()
-            elseif not merchant then
-                lastMerchant = nil
-            end
-        end
-        task.wait(NPC_CHECK_INTERVAL)
-    end
-end)
-
-UIS.InputBegan:Connect(function(input, gpe)
-    if gpe then return end
-    if input.KeyCode == Enum.KeyCode.B then
-        enabled = not enabled
-        if enabled then
-            -- on enable, go straight to eggs
-            task.spawn(function()
-                withLock(function()
-                    local hrp = getHRP()
-                    goToEggs(hrp)
-                end)
-            end)
-        end
-        print(enabled and "✅ Auto Farm: ON (eggs + shops)" or "❌ Auto Farm: OFF")
-    end
-end)
-
-print("Full script loaded. Press B to toggle Auto Farm")
-print("Eggs spam | Equip session every 5 min (20s at plot, equip every 5s) | Pre-sell equip x3 at plot")
+print("AutoFarm loaded.")
