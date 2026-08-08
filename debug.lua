@@ -1,26 +1,21 @@
--- ================= Fusion Standalone Script (v5) =================
--- Now claims by firing the real ProximityPrompt ("Claim")
+-- ================= Fusion Standalone Script (v6) =================
+-- Opens the machine first (makes pet appear) → then claims
 
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
-local ProximityPromptService = game:GetService("ProximityPromptService")
 
 local player = Players.LocalPlayer
 local remotes = RS:WaitForChild("Remotes")
 local EggInfo = remotes:WaitForChild("EggInfo")
 
--- ===== Config =====
 local TELEPORT_SETTLE_DELAY = 0.6
 local FUSION_CHECK_INTERVAL = 3
 local FUSION_WAIT_INTERVAL = 1
 local FUSION_MAX_WAIT = 300
-local CLAIM_SETTLE_DELAY = 0.7
-local AFTER_CLAIM_COOLDOWN = 3
+local AFTER_CLAIM_COOLDOWN = 3.5
 
 local FUSE_MACHINE_CFRAME = CFrame.new(-104.240242, 1.77263951 + 5, 198.388123)
-
--- Claim CFrame you gave earlier (still good as fallback)
 local CLAIM_CFRAME = CFrame.new(
     -116.513695, 5.76566458, 199.923004,
     0.133674741, -1.7736415e-08, 0.991025269,
@@ -28,7 +23,6 @@ local CLAIM_CFRAME = CFrame.new(
     -0.991025269, 3.74590625e-09, 0.133674741
 )
 
--- ===== Pinning (only for FuseMachine) =====
 local pinned = false
 local pinTarget = nil
 
@@ -67,21 +61,18 @@ local function setCFrameOnce(cframe)
     end
 end
 
--- ===== Remote helpers =====
 local function getPlayerState()
     local ok, result = pcall(function()
         return EggInfo:InvokeServer("State")
     end)
-    if not ok or not result then return nil end
-    return result
+    return ok and result or nil
 end
 
 local function getFusionState()
     local ok, result = pcall(function()
         return EggInfo:InvokeServer("GetFusionState")
     end)
-    if not ok or not result then return nil end
-    return result
+    return ok and result or nil
 end
 
 local function fusePets(petIds, mode)
@@ -98,45 +89,54 @@ local function fusePets(petIds, mode)
     return result
 end
 
--- ===== Fire the real Claim prompt =====
 local function fireClaimPrompt()
-    local claimPart = workspace:FindFirstChild("Map")
+    local fuseMachine = workspace:FindFirstChild("Map")
         and workspace.Map:FindFirstChild("Island")
         and workspace.Map.Island:FindFirstChild("FuseMachine")
-        and workspace.Map.Island.FuseMachine:FindFirstChild("Claim")
 
-    if not claimPart then
-        warn("[Fusion] Could not find FuseMachine.Claim")
+    if not fuseMachine then
+        warn("[Fusion] Could not find FuseMachine")
         return false
     end
 
-    local prompt = claimPart:FindFirstChildOfClass("ProximityPrompt")
-    if not prompt then
-        warn("[Fusion] No ProximityPrompt on Claim")
-        return false
+    local openPrompt = fuseMachine:FindFirstChild("Prox") and fuseMachine.Prox:FindFirstChildOfClass("ProximityPrompt")
+    local claimPrompt = fuseMachine:FindFirstChild("Claim") and fuseMachine.Claim:FindFirstChildOfClass("ProximityPrompt")
+
+    local targetPart = fuseMachine:FindFirstChild("Claim") or fuseMachine:FindFirstChild("Prox")
+    if targetPart then
+        setCFrameOnce(targetPart:GetPivot() + Vector3.new(0, 3, 0))
+    else
+        setCFrameOnce(CLAIM_CFRAME)
+    end
+    task.wait(0.4)
+
+    -- 1. Open Machine (makes the pet appear)
+    if openPrompt then
+        print("[Fusion] Firing Open Machine prompt...")
+        openPrompt:InputHoldBegin()
+        task.wait(0.15)
+        openPrompt:InputHoldEnd()
+        pcall(function() fireproximityprompt(openPrompt) end)
+        task.wait(0.7)
+    else
+        warn("[Fusion] Open Machine prompt not found")
     end
 
-    print("[Fusion] Found Claim prompt → firing...")
-
-    -- Make sure we are close enough
-    setCFrameOnce(claimPart:GetPivot() + Vector3.new(0, 3, 0))
-    task.wait(0.3)
-
-    -- Fire the prompt (HoldDuration is 0 so this is instant)
-    prompt:InputHoldBegin()
-    task.wait(0.15)
-    prompt:InputHoldEnd()
-
-    -- Extra safety: some games need this
-    pcall(function()
-        fireproximityprompt(prompt)
-    end)
-
-    print("[Fusion] Claim prompt fired")
-    return true
+    -- 2. Claim
+    if claimPrompt then
+        print("[Fusion] Firing Claim prompt...")
+        claimPrompt:InputHoldBegin()
+        task.wait(0.15)
+        claimPrompt:InputHoldEnd()
+        pcall(function() fireproximityprompt(claimPrompt) end)
+        print("[Fusion] Claim prompt fired")
+        return true
+    else
+        warn("[Fusion] Claim prompt not found")
+        return false
+    end
 end
 
--- ===== Pet grouping =====
 local function findFusableGroups(state, minCount, variantFilter)
     minCount = minCount or 6
     local groups = {}
@@ -166,7 +166,6 @@ local function findFusableGroups(state, minCount, variantFilter)
     return fusable
 end
 
--- ===== Teleports =====
 local function teleportToFuseMachine()
     local part = workspace:FindFirstChild("Map")
         and workspace.Map:FindFirstChild("Island")
@@ -182,7 +181,6 @@ local function teleportToFuseMachine()
     task.wait(TELEPORT_SETTLE_DELAY)
 end
 
--- ===== Wait for fusion ready =====
 local function waitForFusionReady()
     local startTime = tick()
     while tick() - startTime < FUSION_MAX_WAIT do
@@ -202,7 +200,6 @@ local function waitForFusionReady()
     return nil
 end
 
--- ===== Main fuse functions =====
 local function fuseToGolden()
     local state = getPlayerState()
     if not state then return false end
@@ -234,9 +231,8 @@ local function fuseToGolden()
         return false
     end
 
-    -- Stop pinning and claim with the real prompt
     unpin()
-    task.wait(0.2)
+    task.wait(0.3)
     fireClaimPrompt()
     task.wait(AFTER_CLAIM_COOLDOWN)
     return true
@@ -274,13 +270,12 @@ local function fuseToDiamond()
     end
 
     unpin()
-    task.wait(0.2)
+    task.wait(0.3)
     fireClaimPrompt()
     task.wait(AFTER_CLAIM_COOLDOWN)
     return true
 end
 
--- ===== Main loop =====
 task.spawn(function()
     while true do
         local ok, err = pcall(function()
@@ -292,4 +287,4 @@ task.spawn(function()
     end
 end)
 
-print("[Fusion] Standalone fusion script loaded (v5 - ProximityPrompt claim).")
+print("[Fusion] Standalone fusion script loaded (v6 - Open + Claim).")
