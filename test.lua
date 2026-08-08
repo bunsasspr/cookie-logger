@@ -1,4 +1,4 @@
--- ================= AutoFarm — Fluent Modded rework =================
+-- ================= AutoFarm — Fluent Modded rework + Fusion =================
 local Fluent = loadstring(game:HttpGet(
     "https://github.com/StyearX/Fluent-Modded/releases/download/Fluent/FluentPro"
 ))()
@@ -28,11 +28,18 @@ local TELEPORT_SETTLE_DELAY = 0.5
 local SCHEDULER_INTERVAL = 1
 local RESTOCK_BUFFER = 2
 local FALLBACK_RESTOCK_WAIT = 120
-local EQUIP_BEST_SETTLE = 0.5        -- pause after firing EquipBest (claims money)
+local EQUIP_BEST_SETTLE = 0.5
 local USE_POTIONS_INTERVAL = 10
 local REBIRTH_CHECK_INTERVAL = 2
 local REBIRTH_COOLDOWN = 5
 local SELL_COOLDOWN = 3
+
+-- Fusion config
+local FUSION_CHECK_INTERVAL = 4
+local FUSION_WAIT_INTERVAL = 1
+local FUSION_MAX_WAIT = 300
+local AFTER_CLAIM_COOLDOWN = 2.5
+local FUSE_MACHINE_CFRAME = CFrame.new(-104.240242, 1.77263951 + 5, 198.388123)
 
 local DICE_ORDER = {
     "Basic", "Bronze", "Iron", "Silver", "Gold", "Sapphire", "Emerald", "Ruby",
@@ -69,6 +76,8 @@ local state = {
     usePotions = false, egg = false, eggQuantity = 3,
     rebirth = false, equipBest = false, sell = false, sellThreshold = 30,
     selectedEgg = "Basic",
+    autoCraftGolden = false,
+    autoCraftDiamond = false,
 }
 
 -- ===== Helpers =====
@@ -78,9 +87,6 @@ local function getHRP()
 end
 
 -- ================= Pinning system =================
--- Heartbeat pinning runs every frame (~60×/s). It locks the player's HRP to an
--- exact CFrame and zeroes velocity, so the physics engine can't push/slide you
--- away after teleporting to NPCs, eggs, or the pot.
 local pinned = false
 local pinTarget = nil
 
@@ -135,13 +141,11 @@ local function getMyPlotModel()
     return nil
 end
 
--- Returns the CFrame of the player's plot center (the "pot")
 local function getPlotCFrame()
     local plot = getMyPlotModel()
     if not plot then return nil end
     local part = plot.PrimaryPart or plot:FindFirstChildWhichIsA("BasePart", true)
     if part then return part.CFrame + Vector3.new(0, 3, 0) end
-    -- fallback: use Spawn part
     local spawn = plot:FindFirstChild("Spawn")
     if spawn and spawn:IsA("BasePart") then return spawn.CFrame end
     return nil
@@ -166,7 +170,7 @@ local function getInventoryCount()
     return tonumber(current) or 0
 end
 
--- PotionUpdater — tracks which potions we actually own
+-- PotionUpdater
 local ownedPotionCounts = {}
 if PotionUpdater then
     PotionUpdater.OnClientEvent:Connect(function(event, data)
@@ -189,7 +193,6 @@ local function getOwnedPotions()
         if count > 0 then table.insert(owned, name) end
     end
     if #owned > 0 then return owned end
-    -- fallback: GUI reading
     local ok, holder = pcall(function()
         return player.PlayerGui.Main.Canvas.Potions.Holder.Holder
     end)
@@ -206,7 +209,7 @@ local function getOwnedPotions()
     return owned
 end
 
--- ================= Buy actions (all use pinning) =================
+-- ================= Buy actions =================
 local function buyDice()
     local part = getMapShopPart("Shop")
     if not part then return end
@@ -286,9 +289,6 @@ local function openEgg()
     unpin()
 end
 
--- ================= Auto Equip Best (claims placeholder money too) =================
--- Firing EquipBest while standing on your pot equips your best dice AND claims
--- all the placeholder money — so this replaces the old firetouchinterest collect.
 local function equipBest()
     local cf = getPlotCFrame()
     if not cf then warn("[EquipBest] Could not find your plot"); return end
@@ -299,7 +299,6 @@ local function equipBest()
     unpin()
 end
 
--- Auto Use Potions — only fires for potions you actually own
 task.spawn(function()
     while true do
         if state.usePotions then
@@ -313,14 +312,10 @@ task.spawn(function()
     end
 end)
 
--- ================= Auto Sell (equips best first, then sells) =================
 local function sellInventory()
-    -- Step 1: go to your pot and equip best (claims money + equips)
     if state.equipBest then
         equipBest()
     end
-
-    -- Step 2: go sell
     local part = getMapShopPart("SellShop")
     if not part then return end
     pinTo(part.CFrame)
@@ -331,16 +326,195 @@ local function sellInventory()
     unpin()
 end
 
+-- ================= FUSION SYSTEM =================
+local lastClaimedJobId = nil
+local fusionBusy = false
+
+local function getPlayerState()
+    local ok, result = pcall(function()
+        return EggInfo:InvokeServer("State")
+    end)
+    return ok and result or nil
+end
+
+local function getFusionState()
+    local ok, result = pcall(function()
+        return EggInfo:InvokeServer("GetFusionState")
+    end)
+    return ok and result or nil
+end
+
+local function fusePets(petIds, mode)
+    local ok, result = pcall(function()
+        return EggInfo:InvokeServer("Fuse", {
+            PetIds = petIds,
+            Mode = mode,
+        })
+    end)
+    if not ok then
+        warn("[Fusion] Fuse failed:", result)
+        return nil
+    end
+    return result
+end
+
+local function claimFusion(jobId)
+    if not jobId or jobId == lastClaimedJobId then return nil end
+
+    print("[Fusion] Claiming JobId:", jobId)
+    local ok, result = pcall(function()
+        return EggInfo:InvokeServer("ClaimFusion", {
+            JobId = jobId,
+        })
+    end)
+
+    if ok and type(result) == "table" then
+        print("[Fusion] ClaimFusion → Success:", result.Success, "Reason:", result.Reason)
+        if result.Success then
+            lastClaimedJobId = jobId
+        end
+    end
+    return result
+end
+
+local function findFusableGroups(playerState, minCount, variantFilter)
+    minCount = minCount or 6
+    local groups = {}
+    local pets = playerState and playerState.Pets
+    if not pets then return {} end
+
+    for _, pet in pairs(pets) do
+        if type(pet) == "table" and pet.Name and pet.Id then
+            if not variantFilter or pet.Variant == variantFilter then
+                local name = pet.Name
+                if not groups[name] then
+                    groups[name] = { name = name, ids = {}, count = 0 }
+                end
+                table.insert(groups[name].ids, pet.Id)
+                groups[name].count = groups[name].count + 1
+            end
+        end
+    end
+
+    local fusable = {}
+    for _, group in pairs(groups) do
+        if group.count >= minCount then
+            table.insert(fusable, group)
+        end
+    end
+    table.sort(fusable, function(a, b) return a.count > b.count end)
+    return fusable
+end
+
+local function teleportToFuseMachine()
+    local part = workspace:FindFirstChild("Map")
+        and workspace.Map:FindFirstChild("Island")
+        and workspace.Map.Island:FindFirstChild("FuseMachine")
+        and workspace.Map.Island.FuseMachine:FindFirstChild("Machine")
+        and workspace.Map.Island.FuseMachine.Machine:FindFirstChild("Machine Plinth")
+
+    if part and part:IsA("BasePart") then
+        pinTo(part.CFrame + Vector3.new(0, 5, 0))
+    else
+        pinTo(FUSE_MACHINE_CFRAME)
+    end
+    task.wait(TELEPORT_SETTLE_DELAY)
+end
+
+local function waitForFusionReady()
+    local startTime = tick()
+    while tick() - startTime < FUSION_MAX_WAIT do
+        local fs = getFusionState()
+        if fs and fs.Fusion then
+            local jobId = fs.Fusion.JobId
+            if jobId and jobId == lastClaimedJobId then
+                task.wait(FUSION_WAIT_INTERVAL)
+                continue
+            end
+            if fs.Fusion.Ready or (fs.Fusion.Remaining and fs.Fusion.Remaining <= 0) then
+                print("[Fusion] Ready! JobId:", jobId)
+                return fs.Fusion
+            end
+            if not fs.Fusion.Active then
+                return nil
+            end
+        end
+        task.wait(FUSION_WAIT_INTERVAL)
+    end
+    warn("[Fusion] Timed out")
+    return nil
+end
+
+local function tryFuse(variantFilter, mode)
+    if fusionBusy then return false end
+    fusionBusy = true
+
+    local playerState = getPlayerState()
+    if not playerState then
+        fusionBusy = false
+        return false
+    end
+
+    local groups = findFusableGroups(playerState, 6, variantFilter)
+    if #groups == 0 then
+        fusionBusy = false
+        return false
+    end
+
+    local group = groups[1]
+    print("[Fusion] Found", group.count, variantFilter, group.name, "→", mode)
+
+    local petIds = {}
+    for i = 1, 6 do
+        table.insert(petIds, group.ids[i])
+    end
+
+    -- TP + Fuse
+    teleportToFuseMachine()
+    local fuseResult = fusePets(petIds, mode)
+    if fuseResult then
+        print("[Fusion] Fuse result → Success:", fuseResult.Success, "Reason:", fuseResult.Reason)
+    end
+
+    -- Wait for timer
+    local fusionInfo = waitForFusionReady()
+    if fusionInfo and fusionInfo.JobId then
+        claimFusion(fusionInfo.JobId)
+        task.wait(AFTER_CLAIM_COOLDOWN)
+    end
+
+    unpin()
+    fusionBusy = false
+    return true
+end
+
+-- Fusion background loop (lower priority than shops)
+task.spawn(function()
+    while true do
+        if not fusionBusy then
+            if state.autoCraftGolden then
+                tryFuse("Normal", "Golden")
+            end
+            if state.autoCraftDiamond then
+                tryFuse("Golden", "Diamond")
+            end
+        end
+        task.wait(FUSION_CHECK_INTERVAL)
+    end
+end)
+
 -- ================= Priority scheduler =================
--- Merchant > FoodCart > Dice > Potion > Sell > Eggs
--- (Rebirth & Auto Use Potions run as independent background loops.)
--- EquipBest is NOT a standalone step — it triggers inside sellInventory
--- right before selling (pin to pot → EquipBest → pin to SellShop → sell).
 local lastMerchant, lastFoodCart = nil, nil
 local nextDiceTime, nextPotionTime = 0, 0
 
 task.spawn(function()
     while true do
+        -- Don't fight the fusion system for the pin
+        if fusionBusy then
+            task.wait(0.5)
+            continue
+        end
+
         local didSomething = false
         local merchant = state.merchant and getMerchantModel()
         local foodcart = state.foodcart and getFoodCartModel()
@@ -470,6 +644,16 @@ EggTab:AddToggle("AutoEgg", {
     Callback = function(v) state.egg = v end,
 })
 
+-- NEW FUSION TOGGLES
+EggTab:AddToggle("AutoCraftGolden", {
+    Title = "Auto Craft Golden", Default = false,
+    Callback = function(v) state.autoCraftGolden = v end,
+})
+EggTab:AddToggle("AutoCraftDiamond", {
+    Title = "Auto Craft Diamond", Default = false,
+    Callback = function(v) state.autoCraftDiamond = v end,
+})
+
 -- ============ Settings Tab ============
 local SettingsTab = Window:AddTab({ Title = "Settings", Icon = "solar/settings-bold" })
 
@@ -486,7 +670,6 @@ InterfaceManager:SetLibrary(Fluent)
 InterfaceManager:SetFolder("BunsHub")
 SaveManager:SetFolder("BunsHub/Config")
 
--- ===== Apply default theme/interface settings =====
 InterfaceManager.Settings = {
     Theme       = "Cyanic",
     Acrylic     = true,
@@ -498,35 +681,27 @@ InterfaceManager.Settings = {
     Font        = "SourceSans",
 }
 
--- Save the interface defaults and apply theme+font
 pcall(function()
     InterfaceManager:SaveSettings()
     Fluent:SetTheme("Cyanic")
     InterfaceManager:ApplyFont("SourceSans")
 end)
 
--- Interface section only (theme/font/acrylic/transparency/animated/keybind).
--- The manual config section is not needed because everything auto-saves.
 InterfaceManager:BuildInterfaceSection(SettingsTab)
 SaveManager:IgnoreThemeSettings()
 SaveManager:LoadAutoloadConfig()
 
--- ===== Auto-save: every time a user element changes, save to "AutoSave" =====
--- NOTE: task.delay returns a thread, so we cancel it with task.cancel(),
--- not :Cancel() (that was causing the "attempt to index thread" error).
 local autoSaveThread
 for idx, opt in pairs(SaveManager.Options) do
     if SaveManager.Parser[opt.Type] and not SaveManager.Ignore[idx] then
         local cb = opt.Callback
         opt.Callback = function(v)
             if cb then cb(v) end
-            -- Debounce auto-save: wait 0.5s after last change then save
             if autoSaveThread then task.cancel(autoSaveThread) end
             autoSaveThread = task.delay(0.5, function()
                 pcall(function() SaveManager:Save("AutoSave") end)
             end)
         end
-        -- If the element has an OnChanged, hook that too
         if opt.OnChanged then
             local old = opt.OnChanged
             opt.OnChanged = function()
@@ -537,11 +712,9 @@ for idx, opt in pairs(SaveManager.Options) do
     end
 end
 
--- Also set Autoload to AutoSave so it loads on next run
 pcall(function()
     local autoPath = "BunsHub/Config/settings/autoload.txt"
     if not isfile(autoPath) then
-        -- Create an initial AutoSave so autoload has something to load
         task.delay(1, function()
             pcall(function()
                 SaveManager:Save("AutoSave")
@@ -551,4 +724,4 @@ pcall(function()
     end
 end)
 
-print("AutoFarm loaded (Fluent Modded).")
+print("AutoFarm loaded (Fluent Modded + Fusion).")
