@@ -10,7 +10,7 @@ local HumanoidRootPart = Character:WaitForChild("HumanoidRootPart")
 
 local CollectDelay = 0.35          -- how fast it loops
 local MaxDistance = 80             -- only collect things within this range
-local Teleport = true              -- true = teleport to the part, false = just fire touch
+local Teleport = false              -- true = teleport to the part, false = just fire touch
 
 local function getHRP()
     Character = LocalPlayer.Character
