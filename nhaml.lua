@@ -462,8 +462,9 @@ pcall(function()
     InterfaceManager:ApplyFont("SourceSans")
 end)
 
+-- Interface section only (theme/font/acrylic/transparency/animated/keybind).
+-- The manual config section is not needed because everything auto-saves.
 InterfaceManager:BuildInterfaceSection(SettingsTab)
-SaveManager:BuildConfigSection(SettingsTab)
 SaveManager:IgnoreThemeSettings()
 SaveManager:LoadAutoloadConfig()
 
