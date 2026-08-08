@@ -5,6 +5,7 @@ local Fluent = loadstring(game:HttpGet(
 
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
 
 local player = Players.LocalPlayer
 local remotes = RS:WaitForChild("Remotes")
@@ -23,7 +24,6 @@ local PotionUpdater = remotes:FindFirstChild("PotionUpdater")
 -- ===== Config =====
 local BUY_STAND_DURATION = 2
 local BUY_FIRE_INTERVAL = 0.5
-local TELEPORT_OFFSET = 4
 local TELEPORT_SETTLE_DELAY = 0.5
 local SCHEDULER_INTERVAL = 1
 local RESTOCK_BUFFER = 2
@@ -77,13 +77,33 @@ local function getHRP()
     return char:WaitForChild("HumanoidRootPart")
 end
 
-local function teleportTo(cframe, offset)
-    offset = offset or TELEPORT_OFFSET
-    local hrp = getHRP()
-    hrp.CFrame = cframe * CFrame.new(0, 0, offset)
-    hrp.AssemblyLinearVelocity = Vector3.zero
-    hrp.AssemblyAngularVelocity = Vector3.zero
+-- ================= Pinning system =================
+-- Heartbeat pinning runs every frame (~60×/s). It locks the player's HRP to an
+-- exact CFrame and zeroes velocity, so the physics engine can't push/slide you
+-- away after teleporting to NPCs, eggs, or the pot.
+local pinned = false
+local pinTarget = nil
+
+local function pinTo(cframe)
+    pinTarget = cframe
+    pinned = true
 end
+
+local function unpin()
+    pinned = false
+    pinTarget = nil
+end
+
+RunService.Heartbeat:Connect(function()
+    if pinned and pinTarget then
+        local ok, hrp = pcall(getHRP)
+        if ok then
+            hrp.CFrame = pinTarget
+            hrp.AssemblyLinearVelocity = Vector3.zero
+            hrp.AssemblyAngularVelocity = Vector3.zero
+        end
+    end
+end)
 
 local function getMapShopPart(modelName)
     local mapShop = workspace.Map:FindFirstChild("MapShop")
@@ -186,27 +206,31 @@ local function getOwnedPotions()
     return owned
 end
 
--- ================= Buy actions =================
+-- ================= Buy actions (all use pinning) =================
 local function buyDice()
     local part = getMapShopPart("Shop")
     if not part then return end
-    teleportTo(part.CFrame); task.wait(TELEPORT_SETTLE_DELAY)
+    pinTo(part.CFrame)
+    task.wait(TELEPORT_SETTLE_DELAY)
     local elapsed = 0
     while elapsed < BUY_STAND_DURATION do
         pcall(function() BuyDice:FireServer("BuyBestAvailable") end)
         task.wait(BUY_FIRE_INTERVAL); elapsed = elapsed + BUY_FIRE_INTERVAL
     end
+    unpin()
 end
 
 local function buyPotion()
     local part = getMapShopPart("PotionShop")
     if not part then return end
-    teleportTo(part.CFrame); task.wait(TELEPORT_SETTLE_DELAY)
+    pinTo(part.CFrame)
+    task.wait(TELEPORT_SETTLE_DELAY)
     local elapsed = 0
     while elapsed < BUY_STAND_DURATION do
         pcall(function() BuyPotion:FireServer("BuyBestAvailable") end)
         task.wait(BUY_FIRE_INTERVAL); elapsed = elapsed + BUY_FIRE_INTERVAL
     end
+    unpin()
 end
 
 local function getFoodCartModel()
@@ -218,12 +242,14 @@ local function buyFoodCart()
     local cart = getFoodCartModel(); if not cart then return end
     local part = cart.PrimaryPart or cart:FindFirstChildWhichIsA("BasePart", true)
     if not part then return end
-    teleportTo(part.CFrame); task.wait(TELEPORT_SETTLE_DELAY)
-    if not getFoodCartModel() then return end
+    pinTo(part.CFrame)
+    task.wait(TELEPORT_SETTLE_DELAY)
+    if not getFoodCartModel() then unpin(); return end
     for _, item in ipairs(FOOD_ORDER) do
         pcall(function() FoodCartRemote:FireServer("BuyAll", item) end)
         task.wait(0.15)
     end
+    unpin()
 end
 
 local function getMerchantModel()
@@ -235,25 +261,29 @@ local function buyMerchant()
     local model = getMerchantModel(); if not model then return end
     local part = model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart", true)
     if not part then return end
-    teleportTo(part.CFrame); task.wait(TELEPORT_SETTLE_DELAY)
-    if not getMerchantModel() then return end
+    pinTo(part.CFrame)
+    task.wait(TELEPORT_SETTLE_DELAY)
+    if not getMerchantModel() then unpin(); return end
     for _, cat in ipairs(MERCHANT_CATEGORIES) do
         for _, itemName in ipairs(cat.items) do
             pcall(function() MerchantRemote:FireServer("BuyAll", cat.name, itemName) end)
             task.wait(0.12)
         end
     end
+    unpin()
 end
 
 local function openEgg()
     local part = getEggPart(state.selectedEgg)
     if not part then return end
-    teleportTo(part.CFrame); task.wait(TELEPORT_SETTLE_DELAY)
+    pinTo(part.CFrame)
+    task.wait(TELEPORT_SETTLE_DELAY)
     local elapsed = 0
     while elapsed < BUY_STAND_DURATION do
         pcall(function() EggInfo:InvokeServer("Buy", state.selectedEgg, state.eggQuantity) end)
         task.wait(BUY_FIRE_INTERVAL); elapsed = elapsed + BUY_FIRE_INTERVAL
     end
+    unpin()
 end
 
 -- ================= Auto Equip Best (claims placeholder money too) =================
@@ -262,10 +292,11 @@ end
 local function equipBest()
     local cf = getPlotCFrame()
     if not cf then warn("[EquipBest] Could not find your plot"); return end
-    teleportTo(cf, 0)
+    pinTo(cf)
     task.wait(TELEPORT_SETTLE_DELAY)
     pcall(function() EquipBest:FireServer() end)
     task.wait(EQUIP_BEST_SETTLE)
+    unpin()
 end
 
 -- Auto Use Potions — only fires for potions you actually own
@@ -292,17 +323,19 @@ local function sellInventory()
     -- Step 2: go sell
     local part = getMapShopPart("SellShop")
     if not part then return end
-    teleportTo(part.CFrame); task.wait(TELEPORT_SETTLE_DELAY)
+    pinTo(part.CFrame)
+    task.wait(TELEPORT_SETTLE_DELAY)
     pcall(function() Dialogue:InvokeServer("SellNpc", 1, "I want to sell my inventory", "preview") end)
     task.wait(1.5)
     pcall(function() Dialogue:InvokeServer("SellNpc", 1, "I want to sell my inventory", "commit") end)
+    unpin()
 end
 
 -- ================= Priority scheduler =================
 -- Merchant > FoodCart > Dice > Potion > Sell > Eggs
 -- (Rebirth & Auto Use Potions run as independent background loops.)
 -- EquipBest is NOT a standalone step — it triggers inside sellInventory
--- right before selling (teleport to pot → EquipBest → teleport to SellShop → sell).
+-- right before selling (pin to pot → EquipBest → pin to SellShop → sell).
 local lastMerchant, lastFoodCart = nil, nil
 local nextDiceTime, nextPotionTime = 0, 0
 
