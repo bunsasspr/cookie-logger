@@ -482,15 +482,17 @@ SaveManager:IgnoreThemeSettings()
 SaveManager:LoadAutoloadConfig()
 
 -- ===== Auto-save: every time a user element changes, save to "AutoSave" =====
-local autoSaveTimer
+-- NOTE: task.delay returns a thread, so we cancel it with task.cancel(),
+-- not :Cancel() (that was causing the "attempt to index thread" error).
+local autoSaveThread
 for idx, opt in pairs(SaveManager.Options) do
     if SaveManager.Parser[opt.Type] and not SaveManager.Ignore[idx] then
         local cb = opt.Callback
         opt.Callback = function(v)
             if cb then cb(v) end
             -- Debounce auto-save: wait 0.5s after last change then save
-            if autoSaveTimer then autoSaveTimer:Cancel() end
-            autoSaveTimer = task.delay(0.5, function()
+            if autoSaveThread then task.cancel(autoSaveThread) end
+            autoSaveThread = task.delay(0.5, function()
                 pcall(function() SaveManager:Save("AutoSave") end)
             end)
         end
