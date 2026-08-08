@@ -447,22 +447,17 @@ end
 
 local function tryFuse(variantFilter, mode)
     if fusionBusy then return false end
-    fusionBusy = true
 
     local playerState = getPlayerState()
-    if not playerState then
-        fusionBusy = false
-        return false
-    end
+    if not playerState then return false end
 
     local groups = findFusableGroups(playerState, 6, variantFilter)
-    if #groups == 0 then
-        fusionBusy = false
-        return false
-    end
+    if #groups == 0 then return false end
 
     local group = groups[1]
     print("[Fusion] Found", group.count, variantFilter, group.name, "→", mode)
+
+    fusionBusy = true
 
     local petIds = {}
     for i = 1, 6 do
@@ -476,7 +471,7 @@ local function tryFuse(variantFilter, mode)
         print("[Fusion] Fuse result → Success:", fuseResult.Success, "Reason:", fuseResult.Reason)
     end
 
-    -- Wait for timer
+    -- Wait for timer then claim
     local fusionInfo = waitForFusionReady()
     if fusionInfo and fusionInfo.JobId then
         claimFusion(fusionInfo.JobId)
@@ -488,60 +483,73 @@ local function tryFuse(variantFilter, mode)
     return true
 end
 
--- Fusion background loop (lower priority than shops)
-task.spawn(function()
-    while true do
-        if not fusionBusy then
-            if state.autoCraftGolden then
-                tryFuse("Normal", "Golden")
-            end
-            if state.autoCraftDiamond then
-                tryFuse("Golden", "Diamond")
-            end
-        end
-        task.wait(FUSION_CHECK_INTERVAL)
-    end
-end)
-
 -- ================= Priority scheduler =================
+-- Priority:
+-- 1. Merchant
+-- 2. FoodCart
+-- 3. Dice
+-- 4. Potion
+-- 5. Sell
+-- 6. Fusion (Golden / Diamond)
+-- 7. Eggs
+
 local lastMerchant, lastFoodCart = nil, nil
 local nextDiceTime, nextPotionTime = 0, 0
 
 task.spawn(function()
     while true do
-        -- Don't fight the fusion system for the pin
-        if fusionBusy then
-            task.wait(0.5)
-            continue
-        end
-
         local didSomething = false
         local merchant = state.merchant and getMerchantModel()
         local foodcart = state.foodcart and getFoodCartModel()
         local sellReady = state.sell and getInventoryCount() >= state.sellThreshold
 
+        -- Highest priority: shops & sell
         if merchant and merchant ~= lastMerchant then
-            lastMerchant = merchant; buyMerchant(); didSomething = true
+            lastMerchant = merchant
+            buyMerchant()
+            didSomething = true
+
         elseif foodcart and foodcart ~= lastFoodCart then
-            lastFoodCart = foodcart; buyFoodCart(); didSomething = true
+            lastFoodCart = foodcart
+            buyFoodCart()
+            didSomething = true
+
         elseif state.dice and tick() >= nextDiceTime then
             buyDice()
             local r = getRestockSeconds("Main")
             nextDiceTime = tick() + (r and (r + RESTOCK_BUFFER) or FALLBACK_RESTOCK_WAIT)
             didSomething = true
+
         elseif state.potion and tick() >= nextPotionTime then
             buyPotion()
             local r = getRestockSeconds("Potion")
             nextPotionTime = tick() + (r and (r + RESTOCK_BUFFER) or FALLBACK_RESTOCK_WAIT)
             didSomething = true
+
         elseif sellReady then
-            sellInventory(); task.wait(SELL_COOLDOWN); didSomething = true
+            sellInventory()
+            task.wait(SELL_COOLDOWN)
+            didSomething = true
+
+        -- Fusion (only when no higher priority work)
+        elseif state.autoCraftGolden and tryFuse("Normal", "Golden") then
+            didSomething = true
+
+        elseif state.autoCraftDiamond and tryFuse("Golden", "Diamond") then
+            didSomething = true
+
+        -- Lowest: eggs
         elseif state.egg then
-            openEgg(); didSomething = true
+            openEgg()
+            didSomething = true
         end
+
         if not merchant then lastMerchant = nil end
         if not foodcart then lastFoodCart = nil end
-        if not didSomething then task.wait(SCHEDULER_INTERVAL) end
+
+        if not didSomething then
+            task.wait(SCHEDULER_INTERVAL)
+        end
     end
 end)
 
