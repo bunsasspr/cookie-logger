@@ -1,9 +1,15 @@
--- ================= Fusion Standalone Script =================
+-- ================= Fusion Standalone Script (v2) =================
 -- Standalone script for testing the pet fusion feature.
--- Detects 6 identical pets (by Name), teleports to the FuseMachine,
--- fuses them to Golden, claims the result, then upgrades Golden → Diamond.
 --
--- Based on data from FullGameDump/pets.txt and the existing rng.lua patterns.
+-- Flow:
+--   1. Detect 6 identical Normal pets (by Name) → fuse to Golden → claim
+--   2. Detect 6 identical Golden pets (by Name) → fuse to Diamond → claim
+--
+-- Changes from v1:
+--   - Claim remote is "AcknowledgeFusion" (not "ClaimFusion")
+--   - Teleport to spawn, then back to FuseMachine before claiming
+--   - Diamond fusion requires 6 Golden pets (not 1)
+--   - Better claim timer detection using Remaining / ReadyAt / Ready
 
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
@@ -18,11 +24,15 @@ local TELEPORT_SETTLE_DELAY = 0.5
 local FUSION_CHECK_INTERVAL = 2
 local FUSION_WAIT_INTERVAL = 1
 local FUSION_MAX_WAIT = 300  -- 5 minutes max wait for fusion to complete
+local CLAIM_TELEPORT_DELAY = 0.5
 
 -- FuseMachine location (from FullGameDump data)
 -- Machine Plinth CFrame: -104.240242, 1.77263951, 198.388123
--- We add a small Y offset so the player stands on top of the plinth
 local FUSE_MACHINE_CFRAME = CFrame.new(-104.240242, 1.77263951 + 5, 198.388123)
+
+-- Spawn location (from FullGameDump data)
+-- SpawnLocation CFrame: 6, 0.5, 122
+local SPAWN_CFRAME = CFrame.new(6, 0.5 + 5, 122)
 
 -- ===== Pinning system (same as rng.lua) =====
 local pinned = false
@@ -91,25 +101,26 @@ local function fusePets(petIds, mode)
     return result
 end
 
-local function claimFusion(jobId)
+local function acknowledgeFusion(jobId)
     local ok, result = pcall(function()
-        return EggInfo:InvokeServer("ClaimFusion", {
+        return EggInfo:InvokeServer("AcknowledgeFusion", {
             JobId = jobId,
         })
     end)
     if not ok then
-        warn("[Fusion] ClaimFusion call failed:", result)
+        warn("[Fusion] AcknowledgeFusion call failed:", result)
         return nil
     end
     return result
 end
 
 -- ===== Pet grouping logic =====
--- Groups pets by Name and returns groups that have >= 6 pets.
+-- Groups pets by Name, optionally filtered by Variant.
+-- Returns groups that have >= minCount pets, sorted by count descending.
 -- Each group entry: { name = "Mike", ids = {id1, id2, ...}, count = N }
-local function findFusableGroups(state, minCount)
+local function findFusableGroups(state, minCount, variantFilter)
     minCount = minCount or 6
-    local groups = {}  -- name -> {ids = {}, count = N}
+    local groups = {}
 
     local pets = state and state.Pets
     if not pets then
@@ -119,12 +130,15 @@ local function findFusableGroups(state, minCount)
 
     for _, pet in pairs(pets) do
         if type(pet) == "table" and pet.Name and pet.Id then
-            local name = pet.Name
-            if not groups[name] then
-                groups[name] = { name = name, ids = {}, count = 0 }
+            -- If variantFilter is specified, only include pets with that variant
+            if not variantFilter or pet.Variant == variantFilter then
+                local name = pet.Name
+                if not groups[name] then
+                    groups[name] = { name = name, ids = {}, count = 0 }
+                end
+                table.insert(groups[name].ids, pet.Id)
+                groups[name].count = groups[name].count + 1
             end
-            table.insert(groups[name].ids, pet.Id)
-            groups[name].count = groups[name].count + 1
         end
     end
 
@@ -144,7 +158,7 @@ local function findFusableGroups(state, minCount)
     return fusable
 end
 
--- ===== Teleport to FuseMachine =====
+-- ===== Teleport functions =====
 local function teleportToFuseMachine()
     local part = workspace.Map.Island.FuseMachine.Machine:FindFirstChild("Machine Plinth")
     if part and part:IsA("BasePart") then
@@ -156,14 +170,35 @@ local function teleportToFuseMachine()
     task.wait(TELEPORT_SETTLE_DELAY)
 end
 
--- ===== Wait for fusion to complete =====
-local function waitForFusionComplete()
+local function teleportToSpawn()
+    local spawn = workspace.Map:FindFirstChild("SpawnLocation")
+    if spawn and spawn:IsA("BasePart") then
+        pinTo(spawn.CFrame + Vector3.new(0, 5, 0))
+    else
+        -- Fallback to hardcoded CFrame from dump data
+        pinTo(SPAWN_CFRAME)
+    end
+    task.wait(TELEPORT_SETTLE_DELAY)
+end
+
+-- ===== Wait for fusion to be ready to claim =====
+-- Uses multiple indicators: Ready, Remaining, ReadyAt
+local function waitForFusionReady()
     local startTime = tick()
     while tick() - startTime < FUSION_MAX_WAIT do
         local fs = getFusionState()
         if fs and fs.Fusion then
+            -- Check if fusion is ready using multiple indicators
             if fs.Fusion.Ready then
                 print("[Fusion] Fusion is ready! JobId:", fs.Fusion.JobId)
+                return fs.Fusion
+            end
+            if fs.Fusion.Remaining and fs.Fusion.Remaining <= 0 then
+                print("[Fusion] Fusion remaining is 0! JobId:", fs.Fusion.JobId)
+                return fs.Fusion
+            end
+            if fs.Fusion.ReadyAt and tick() >= fs.Fusion.ReadyAt then
+                print("[Fusion] ReadyAt timestamp passed! JobId:", fs.Fusion.JobId)
                 return fs.Fusion
             end
             if not fs.Fusion.Active then
@@ -178,22 +213,43 @@ local function waitForFusionComplete()
     return nil
 end
 
--- ===== Main fusion routine =====
-local function runFusion()
-    -- Step 1: Get player state
-    local state = getPlayerState()
-    if not state then return end
-
-    -- Step 2: Find groups of 6+ identical pets
-    local fusableGroups = findFusableGroups(state, 6)
-    if #fusableGroups == 0 then
-        print("[Fusion] No groups of 6+ identical pets found")
-        return
+-- ===== Claim fusion (teleport to spawn, back to machine, then acknowledge) =====
+local function claimFusionWithTeleport(fusionInfo)
+    if not fusionInfo.JobId then
+        warn("[Fusion] No JobId in fusion info, cannot claim")
+        return nil
     end
 
-    -- Step 3: Take the first (largest) group
+    -- Teleport to spawn, then back to machine (as described by user)
+    print("[Fusion] Teleporting to spawn for claim...")
+    teleportToSpawn()
+    task.wait(CLAIM_TELEPORT_DELAY)
+    print("[Fusion] Teleporting back to FuseMachine...")
+    teleportToFuseMachine()
+
+    -- Call AcknowledgeFusion
+    print("[Fusion] Acknowledging fusion with JobId:", fusionInfo.JobId)
+    local result = acknowledgeFusion(fusionInfo.JobId)
+    if result then
+        print("[Fusion] AcknowledgeFusion result:", result)
+    end
+    return result
+end
+
+-- ===== Fuse 6 identical Normal pets to Golden =====
+local function fuseToGolden()
+    local state = getPlayerState()
+    if not state then return false end
+
+    -- Find groups of 6+ identical Normal pets by Name
+    local fusableGroups = findFusableGroups(state, 6, "Normal")
+    if #fusableGroups == 0 then
+        print("[Fusion] No groups of 6+ identical Normal pets found")
+        return false
+    end
+
     local group = fusableGroups[1]
-    print("[Fusion] Found", group.count, "identical pets named:", group.name)
+    print("[Fusion] Found", group.count, "identical Normal pets named:", group.name)
 
     -- Take exactly 6 pet IDs
     local petIds = {}
@@ -201,92 +257,95 @@ local function runFusion()
         table.insert(petIds, group.ids[i])
     end
 
-    -- Step 4: Teleport to the FuseMachine
+    -- Teleport to the FuseMachine
     print("[Fusion] Teleporting to FuseMachine...")
     teleportToFuseMachine()
 
-    -- Step 5: Fuse to Golden
+    -- Fuse to Golden
     print("[Fusion] Fusing 6x", group.name, "to Golden...")
     local fuseResult = fusePets(petIds, "Golden")
     if fuseResult then
         print("[Fusion] Fuse result:", fuseResult)
     end
 
-    -- Step 6: Wait for fusion to complete
-    local fusionInfo = waitForFusionComplete()
+    -- Wait for fusion to complete
+    local fusionInfo = waitForFusionReady()
     if not fusionInfo then
         unpin()
-        return
+        return false
     end
 
-    -- Step 7: Claim the fusion
-    if fusionInfo.JobId then
-        print("[Fusion] Claiming fusion with JobId:", fusionInfo.JobId)
-        local claimResult = claimFusion(fusionInfo.JobId)
-        if claimResult then
-            print("[Fusion] Claim result:", claimResult)
-        end
-    else
-        warn("[Fusion] No JobId in fusion info, cannot claim")
-    end
-
+    -- Claim the fusion
+    claimFusionWithTeleport(fusionInfo)
     unpin()
+    return true
+end
 
-    -- Step 8: Gold → Diamond upgrade
-    -- After claiming, the Golden pet should be in our inventory.
-    -- We need to find it and fuse it to Diamond.
-    task.wait(1)
-    local newState = getPlayerState()
-    if not newState then return end
+-- ===== Fuse 6 identical Golden pets to Diamond =====
+local function fuseToDiamond()
+    local state = getPlayerState()
+    if not state then return false end
 
-    -- Find the Golden pet with the same name
-    local goldenPetId = nil
-    local pets = newState.Pets
-    if pets then
-        for _, pet in pairs(pets) do
-            if type(pet) == "table" and pet.Name == group.name and pet.Variant == "Golden" then
-                goldenPetId = pet.Id
-                break
-            end
-        end
+    -- Find groups of 6+ identical Golden pets by Name
+    local fusableGroups = findFusableGroups(state, 6, "Golden")
+    if #fusableGroups == 0 then
+        print("[Fusion] No groups of 6+ identical Golden pets found")
+        return false
     end
 
-    if goldenPetId then
-        print("[Fusion] Found Golden", group.name, "with Id:", goldenPetId)
-        print("[Fusion] Teleporting to FuseMachine for Diamond upgrade...")
-        teleportToFuseMachine()
+    local group = fusableGroups[1]
+    print("[Fusion] Found", group.count, "identical Golden pets named:", group.name)
 
-        print("[Fusion] Fusing Golden", group.name, "to Diamond...")
-        local diamondResult = fusePets({goldenPetId}, "Diamond")
-        if diamondResult then
-            print("[Fusion] Diamond fuse result:", diamondResult)
-        end
+    -- Take exactly 6 pet IDs
+    local petIds = {}
+    for i = 1, 6 do
+        table.insert(petIds, group.ids[i])
+    end
 
-        -- Wait for diamond fusion to complete
-        local diamondFusionInfo = waitForFusionComplete()
-        if diamondFusionInfo and diamondFusionInfo.JobId then
-            print("[Fusion] Claiming Diamond fusion with JobId:", diamondFusionInfo.JobId)
-            local diamondClaimResult = claimFusion(diamondFusionInfo.JobId)
-            if diamondClaimResult then
-                print("[Fusion] Diamond claim result:", diamondClaimResult)
-            end
-        end
+    -- Teleport to the FuseMachine
+    print("[Fusion] Teleporting to FuseMachine...")
+    teleportToFuseMachine()
 
+    -- Fuse to Diamond
+    print("[Fusion] Fusing 6x Golden", group.name, "to Diamond...")
+    local fuseResult = fusePets(petIds, "Diamond")
+    if fuseResult then
+        print("[Fusion] Fuse result:", fuseResult)
+    end
+
+    -- Wait for fusion to complete
+    local fusionInfo = waitForFusionReady()
+    if not fusionInfo then
         unpin()
-    else
-        print("[Fusion] No Golden", group.name, "found in inventory for Diamond upgrade")
+        return false
     end
+
+    -- Claim the fusion
+    claimFusionWithTeleport(fusionInfo)
+    unpin()
+    return true
 end
 
 -- ===== Main loop =====
 task.spawn(function()
     while true do
-        local ok, err = pcall(runFusion)
+        local ok, err = pcall(function()
+            -- Try Golden fusion first (6 Normal → 1 Golden)
+            local goldenDone = fuseToGolden()
+            if goldenDone then
+                task.wait(1)
+            end
+            -- Then try Diamond fusion (6 Golden → 1 Diamond)
+            local diamondDone = fuseToDiamond()
+            if diamondDone then
+                task.wait(1)
+            end
+        end)
         if not ok then
-            warn("[Fusion] Error in runFusion:", err)
+            warn("[Fusion] Error:", err)
         end
         task.wait(FUSION_CHECK_INTERVAL)
     end
 end)
 
-print("[Fusion] Standalone fusion script loaded.")
+print("[Fusion] Standalone fusion script loaded (v2).")
