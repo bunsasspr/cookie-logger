@@ -1,74 +1,105 @@
--- Auto Collect (no remote version)
--- Adjust the filters below until it works for this game
+-- Auto Collect Money (only your own plot)
+-- Kawaii Anime RNG
 
 local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
-
 local LocalPlayer = Players.LocalPlayer
-local Character = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
-local HumanoidRootPart = Character:WaitForChild("HumanoidRootPart")
 
-local CollectDelay = 0.35          -- how fast it loops
-local MaxDistance = 80             -- only collect things within this range
-local Teleport = false              -- true = teleport to the part, false = just fire touch
+local CollectDelay = 0.4          -- lower = faster (0.3 ~ 0.6 is usually good)
+local UseTeleport = false          -- true = teleport to collector, false = firetouch only
 
 local function getHRP()
-    Character = LocalPlayer.Character
-    if not Character then return nil end
-    return Character:FindFirstChild("HumanoidRootPart")
+    local char = LocalPlayer.Character
+    if not char then return nil end
+    return char:FindFirstChild("HumanoidRootPart")
 end
 
-local function isCollectable(part)
-    if not part:IsA("BasePart") then return false end
-    if not part.Parent then return false end
+-- Find your own plot
+local function getMyPlot()
+    local plotsFolder = workspace:FindFirstChild("Map") and workspace.Map:FindFirstChild("Plots")
+    if not plotsFolder then return nil end
 
-    local name = part.Name:lower()
-    -- Add / remove keywords that match the money parts in this game
-    if name:find("cash") or name:find("money") or name:find("coin") 
-    or name:find("collect") or name:find("bill") or name:find("dollar") then
-        return true
+    for _, plot in ipairs(plotsFolder:GetChildren()) do
+        -- Method 1: Owner attribute / value
+        local owner = plot:GetAttribute("Owner") or plot:GetAttribute("owner")
+        if owner and (owner == LocalPlayer.Name or owner == LocalPlayer.UserId or tostring(owner) == tostring(LocalPlayer.UserId)) then
+            return plot
+        end
+
+        -- Method 2: StringValue / ObjectValue named Owner
+        local ownerVal = plot:FindFirstChild("Owner") or plot:FindFirstChild("owner") or plot:FindFirstChild("Player")
+        if ownerVal then
+            if ownerVal:IsA("StringValue") and ownerVal.Value == LocalPlayer.Name then
+                return plot
+            elseif ownerVal:IsA("ObjectValue") and ownerVal.Value == LocalPlayer then
+                return plot
+            elseif ownerVal:IsA("IntValue") and ownerVal.Value == LocalPlayer.UserId then
+                return plot
+            end
+        end
+
+        -- Method 3: Plot name contains your name
+        if plot.Name:lower():find(LocalPlayer.Name:lower()) then
+            return plot
+        end
     end
 
-    -- Sometimes the collectible is a child of a model
-    if part.Parent.Name:lower():find("cash") 
-    or part.Parent.Name:lower():find("money") then
-        return true
-    end
+    -- Fallback: closest plot to you (works most of the time)
+    local hrp = getHRP()
+    if not hrp then return nil end
 
-    return false
+    local closest, closestDist = nil, math.huge
+    for _, plot in ipairs(plotsFolder:GetChildren()) do
+        local primary = plot.PrimaryPart or plot:FindFirstChildWhichIsA("BasePart")
+        if primary then
+            local dist = (hrp.Position - primary.Position).Magnitude
+            if dist < closestDist then
+                closestDist = dist
+                closest = plot
+            end
+        end
+    end
+    return closest
 end
 
-local function tryCollect(part)
+local function collectFromPlot(plot)
+    if not plot then return end
+
+    local holders = plot:FindFirstChild("Floor1") and plot.Floor1:FindFirstChild("Holders")
+    if not holders then return end
+
     local hrp = getHRP()
     if not hrp then return end
 
-    local distance = (hrp.Position - part.Position).Magnitude
-    if distance > MaxDistance then return end
-
-    if Teleport then
-        -- Instant teleport (most reliable when no remote)
-        hrp.CFrame = part.CFrame + Vector3.new(0, 3, 0)
-    else
-        -- Simulate touch without moving (cleaner but sometimes blocked)
-        firetouchinterest(hrp, part, 0)
-        task.wait(0.05)
-        firetouchinterest(hrp, part, 1)
+    for _, holder in ipairs(holders:GetChildren()) do
+        if holder.Name:match("ItemHolder") then
+            local collector = holder:FindFirstChild("Collector")
+            if collector and collector:IsA("BasePart") then
+                if UseTeleport then
+                    -- Teleport right on top of the collector
+                    hrp.CFrame = collector.CFrame + Vector3.new(0, 3, 0)
+                else
+                    -- Fire touch without moving (cleaner)
+                    firetouchinterest(hrp, collector, 0)
+                    task.wait(0.03)
+                    firetouchinterest(hrp, collector, 1)
+                end
+                task.wait(0.05) -- tiny delay between holders
+            end
+        end
     end
 end
 
 -- Main loop
 task.spawn(function()
     while true do
-        local hrp = getHRP()
-        if hrp then
-            for _, obj in ipairs(workspace:GetDescendants()) do
-                if isCollectable(obj) then
-                    pcall(tryCollect, obj)
-                end
-            end
+        local myPlot = getMyPlot()
+        if myPlot then
+            collectFromPlot(myPlot)
+        else
+            warn("[AutoCollect] Could not find your plot")
         end
         task.wait(CollectDelay)
     end
 end)
 
-print("Auto Collect started")
+print("✅ Auto Collect (own plot only) started")
