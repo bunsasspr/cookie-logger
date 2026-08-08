@@ -397,7 +397,7 @@ local Window = Rayfield:CreateWindow({
     },
 })
 
-local MainTab = Window:CreateTab("Main")
+local MainTab = Window:CreateTab({ name = "Main" })
 
 MainTab:CreateToggle({
     Name = "Auto Buy Merchant",
