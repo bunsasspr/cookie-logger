@@ -1,10 +1,9 @@
--- ================= Fusion Standalone Script (v3) =================
--- Flow:
---   1. TP to FuseMachine (once)
---   2. Fuse
---   3. Wait until timer finishes
---   4. TP to claim position
---   5. Fire AcknowledgeFusion
+-- ================= Fusion Standalone Script (v4) =================
+-- Changes:
+--   - No continuous pin while claiming (just set CFrame once)
+--   - Tracks last claimed JobId so it never reclaims the same one
+--   - Longer settle time + cooldown after claim
+--   - Better result dumping for debugging
 
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
@@ -15,11 +14,12 @@ local remotes = RS:WaitForChild("Remotes")
 local EggInfo = remotes:WaitForChild("EggInfo")
 
 -- ===== Config =====
-local TELEPORT_SETTLE_DELAY = 0.5
-local FUSION_CHECK_INTERVAL = 2
+local TELEPORT_SETTLE_DELAY = 0.6
+local FUSION_CHECK_INTERVAL = 3
 local FUSION_WAIT_INTERVAL = 1
 local FUSION_MAX_WAIT = 300
-local CLAIM_TELEPORT_DELAY = 0.5
+local CLAIM_SETTLE_DELAY = 0.8          -- time standing on claim pad before firing
+local AFTER_CLAIM_COOLDOWN = 4          -- wait after successful claim
 
 -- FuseMachine location
 local FUSE_MACHINE_CFRAME = CFrame.new(-104.240242, 1.77263951 + 5, 198.388123)
@@ -32,7 +32,7 @@ local CLAIM_CFRAME = CFrame.new(
     -0.991025269, 3.74590625e-09, 0.133674741
 )
 
--- ===== Pinning system =====
+-- ===== Pinning (only used for FuseMachine) =====
 local pinned = false
 local pinTarget = nil
 
@@ -61,6 +61,16 @@ RunService.Heartbeat:Connect(function()
         end
     end
 end)
+
+-- Just set CFrame once (no continuous pin) – used for claim
+local function setCFrameOnce(cframe)
+    local ok, hrp = pcall(getHRP)
+    if ok and hrp then
+        hrp.CFrame = cframe
+        hrp.AssemblyLinearVelocity = Vector3.zero
+        hrp.AssemblyAngularVelocity = Vector3.zero
+    end
+end
 
 -- ===== Remote helpers =====
 local function getPlayerState()
@@ -110,6 +120,19 @@ local function acknowledgeFusion(jobId)
         return nil
     end
     return result
+end
+
+-- Pretty-print tables for debugging
+local function dump(t, name)
+    if type(t) ~= "table" then
+        print("[Fusion]", name or "value", "=", t)
+        return
+    end
+    print("[Fusion]", name or "table", "{")
+    for k, v in pairs(t) do
+        print("   ", k, "=", v)
+    end
+    print("}")
 end
 
 -- ===== Pet grouping =====
@@ -167,31 +190,43 @@ local function teleportToFuseMachine()
 end
 
 local function teleportToClaimPosition()
-    pinTo(CLAIM_CFRAME)
-    task.wait(CLAIM_TELEPORT_DELAY)
+    -- Important: stop continuous pin so the server sees a normal character
+    unpin()
+    setCFrameOnce(CLAIM_CFRAME)
+    task.wait(CLAIM_SETTLE_DELAY)
 end
 
 -- ===== Wait for fusion ready =====
+local lastClaimedJobId = nil
+
 local function waitForFusionReady()
     local startTime = tick()
     while tick() - startTime < FUSION_MAX_WAIT do
         local fs = getFusionState()
         if fs and fs.Fusion then
+            local jobId = fs.Fusion.JobId
+
+            -- Skip if we already claimed this one
+            if jobId and jobId == lastClaimedJobId then
+                task.wait(FUSION_WAIT_INTERVAL)
+                continue
+            end
+
             if fs.Fusion.Ready then
-                print("[Fusion] Fusion ready! JobId:", fs.Fusion.JobId)
+                print("[Fusion] Fusion ready! JobId:", jobId)
                 return fs.Fusion
             end
             if fs.Fusion.Remaining and fs.Fusion.Remaining <= 0 then
-                print("[Fusion] Remaining <= 0! JobId:", fs.Fusion.JobId)
+                print("[Fusion] Remaining <= 0! JobId:", jobId)
                 return fs.Fusion
             end
             if fs.Fusion.ReadyAt and tick() >= fs.Fusion.ReadyAt then
-                print("[Fusion] ReadyAt passed! JobId:", fs.Fusion.JobId)
+                print("[Fusion] ReadyAt passed! JobId:", jobId)
                 return fs.Fusion
             end
             if not fs.Fusion.Active then
-                print("[Fusion] Fusion no longer active. Outcome:", fs.Fusion.Outcome or "unknown")
-                return fs.Fusion
+                -- finished / already claimed
+                return nil
             end
         end
         task.wait(FUSION_WAIT_INTERVAL)
@@ -200,10 +235,15 @@ local function waitForFusionReady()
     return nil
 end
 
--- ===== Claim (TP to claim pos → fire event) =====
+-- ===== Claim =====
 local function claimFusion(fusionInfo)
     if not fusionInfo or not fusionInfo.JobId then
         warn("[Fusion] No JobId, cannot claim")
+        return nil
+    end
+
+    if fusionInfo.JobId == lastClaimedJobId then
+        print("[Fusion] Already claimed this JobId, skipping")
         return nil
     end
 
@@ -212,9 +252,15 @@ local function claimFusion(fusionInfo)
 
     print("[Fusion] Firing AcknowledgeFusion with JobId:", fusionInfo.JobId)
     local result = acknowledgeFusion(fusionInfo.JobId)
+
+    dump(result, "AcknowledgeFusion result")
+
     if result then
-        print("[Fusion] AcknowledgeFusion result:", result)
+        lastClaimedJobId = fusionInfo.JobId
+        print("[Fusion] Claim accepted, waiting cooldown...")
+        task.wait(AFTER_CLAIM_COOLDOWN)
     end
+
     return result
 end
 
@@ -237,16 +283,14 @@ local function fuseToGolden()
         table.insert(petIds, group.ids[i])
     end
 
-    -- 1. TP to FuseMachine (once)
+    -- 1. TP to FuseMachine
     print("[Fusion] Teleporting to FuseMachine...")
     teleportToFuseMachine()
 
     -- 2. Fuse
     print("[Fusion] Fusing 6x", group.name, "→ Golden...")
     local fuseResult = fusePets(petIds, "Golden")
-    if fuseResult then
-        print("[Fusion] Fuse result:", fuseResult)
-    end
+    dump(fuseResult, "Fuse result")
 
     -- 3. Wait for timer
     local fusionInfo = waitForFusionReady()
@@ -255,7 +299,7 @@ local function fuseToGolden()
         return false
     end
 
-    -- 4 + 5. TP to claim pos → fire claim
+    -- 4 + 5. TP to claim (no pin) → fire claim
     claimFusion(fusionInfo)
     unpin()
     return true
@@ -280,25 +324,19 @@ local function fuseToDiamond()
         table.insert(petIds, group.ids[i])
     end
 
-    -- 1. TP to FuseMachine (once)
     print("[Fusion] Teleporting to FuseMachine...")
     teleportToFuseMachine()
 
-    -- 2. Fuse
     print("[Fusion] Fusing 6x Golden", group.name, "→ Diamond...")
     local fuseResult = fusePets(petIds, "Diamond")
-    if fuseResult then
-        print("[Fusion] Fuse result:", fuseResult)
-    end
+    dump(fuseResult, "Fuse result")
 
-    -- 3. Wait for timer
     local fusionInfo = waitForFusionReady()
     if not fusionInfo then
         unpin()
         return false
     end
 
-    -- 4 + 5. TP to claim pos → fire claim
     claimFusion(fusionInfo)
     unpin()
     return true
@@ -310,12 +348,12 @@ task.spawn(function()
         local ok, err = pcall(function()
             local goldenDone = fuseToGolden()
             if goldenDone then
-                task.wait(1)
+                task.wait(1.5)
             end
 
             local diamondDone = fuseToDiamond()
             if diamondDone then
-                task.wait(1)
+                task.wait(1.5)
             end
         end)
         if not ok then
@@ -325,4 +363,4 @@ task.spawn(function()
     end
 end)
 
-print("[Fusion] Standalone fusion script loaded (v3).")
+print("[Fusion] Standalone fusion script loaded (v4).")
