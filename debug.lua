@@ -1,119 +1,223 @@
--- ============================================================
---  AUTO COLLECT MONEY — Standalone v2
---  Teleports to the Collector, fires the touch, teleports back
---  Works because the server checks character position
--- ============================================================
+--// Auto-Collect Observer
+--// Run this FIRST, then start the other auto-collect script.
 
 local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
-local VirtualUser = game:GetService("VirtualUser")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local CollectionService = game:GetService("CollectionService")
 
 local player = Players.LocalPlayer
+local collector =
+    workspace.Map.Plots.Plot.Floor1.Holders.ItemHolder1.Collector
 
--- ===== Anti AFK =====
-player.Idled:Connect(function()
-    VirtualUser:CaptureController()
-    VirtualUser:ClickButton2(Vector2.new())
-end)
-
--- ===== Config =====
-local COLLECT_INTERVAL = 2.0   -- seconds between collect attempts
-local TOUCH_DURATION = 0.3     -- how long to "touch" the collector
-
--- ===== Find your plot =====
-local function getMyPlot()
-    local plotsFolder = workspace:FindFirstChild("Map") and workspace.Map:FindFirstChild("Plots")
-    if not plotsFolder then return nil end
-    for _, plot in ipairs(plotsFolder:GetChildren()) do
-        local owner = plot:GetAttribute("Owner") or plot:GetAttribute("owner")
-        if owner == player.UserId or tostring(owner) == tostring(player.UserId) then
-            return plot
-        end
-    end
-    return nil
+local function log(...)
+    print("[COLLECT-SPY]", ...)
 end
 
--- ===== Find the Collector part (exact path from game dump) =====
-local function getCollectorPart()
-    local plot = getMyPlot()
-    if not plot then return nil end
+log("====================================")
+log("COLLECTION SPY STARTED")
+log("Collector:", collector:GetFullName())
+log("====================================")
 
-    -- Exact path: plot.Floor1.Holders.ItemHolder1.Collector
-    local floor1 = plot:FindFirstChild("Floor1")
-    if floor1 then
-        local holders = floor1:FindFirstChild("Holders")
-        if holders then
-            local itemHolder = holders:FindFirstChild("ItemHolder1")
-            if itemHolder then
-                local collector = itemHolder:FindFirstChild("Collector")
-                if collector and collector:IsA("BasePart") then
-                    return collector
+--==================================================
+-- 1. ALL RemoteEvent / RemoteFunction calls
+--==================================================
+
+local mt = getrawmetatable(game)
+local oldNamecall = mt.__namecall
+
+setreadonly(mt, false)
+
+mt.__namecall = newcclosure(function(self, ...)
+    local method = getnamecallmethod()
+
+    if method == "FireServer"
+        or method == "InvokeServer"
+        or method == "Fire"
+        or method == "Invoke" then
+
+        local name = tostring(self:GetFullName()):lower()
+
+        if name:find("collect")
+            or name:find("cash")
+            or name:find("money")
+            or name:find("income")
+            or name:find("claim")
+            or name:find("pickup")
+            or name:find("harvest")
+            or name:find("orb") then
+
+            log("NETWORK:", method, self:GetFullName(), ...)
+        end
+    end
+
+    return oldNamecall(self, ...)
+end)
+
+setreadonly(mt, true)
+
+--==================================================
+-- 2. Monitor Collector attributes
+--==================================================
+
+for name, value in pairs(collector:GetAttributes()) do
+    log("ATTRIBUTE:", name, "=", value)
+end
+
+collector.AttributeChanged:Connect(function(name)
+    log(
+        "ATTRIBUTE CHANGED:",
+        name,
+        "=",
+        collector:GetAttribute(name)
+    )
+end)
+
+--==================================================
+-- 3. Monitor Collector descendants
+--==================================================
+
+collector.DescendantAdded:Connect(function(obj)
+    log(
+        "DESCENDANT ADDED:",
+        obj:GetFullName(),
+        obj.ClassName
+    )
+end)
+
+collector.DescendantRemoving:Connect(function(obj)
+    log(
+        "DESCENDANT REMOVED:",
+        obj:GetFullName(),
+        obj.ClassName
+    )
+end)
+
+--==================================================
+-- 4. Monitor GUI amount
+--==================================================
+
+local amount =
+    collector:FindFirstChild("FrameTag", true)
+    and collector.FrameTag.Frame:FindFirstChild("Amount")
+
+if amount then
+    log("INITIAL AMOUNT:", amount.Text)
+
+    amount:GetPropertyChangedSignal("Text"):Connect(function()
+        log("AMOUNT CHANGED:", amount.Text)
+    end)
+end
+
+--==================================================
+-- 5. Monitor ValueBases inside collector
+--==================================================
+
+for _, obj in ipairs(collector:GetDescendants()) do
+
+    if obj:IsA("ValueBase") then
+
+        log(
+            "VALUE:",
+            obj:GetFullName(),
+            "=",
+            obj.Value
+        )
+
+        obj.Changed:Connect(function(value)
+            log(
+                "VALUE CHANGED:",
+                obj:GetFullName(),
+                "=",
+                value
+            )
+        end)
+
+    end
+
+end
+
+--==================================================
+-- 6. CollectionService tags
+--==================================================
+
+for _, tag in ipairs(CollectionService:GetTags(collector)) do
+    log("COLLECTOR TAG:", tag)
+end
+
+--==================================================
+-- 7. Watch ALL instances for collect-related names
+--==================================================
+
+for _, obj in ipairs(game:GetDescendants()) do
+
+    local n = obj.Name:lower()
+
+    if n:find("collect")
+        or n:find("cash")
+        or n:find("money")
+        or n:find("income")
+        or n:find("claim")
+        or n:find("pickup")
+        or n:find("harvest") then
+
+        log(
+            "RELATED INSTANCE:",
+            obj:GetFullName(),
+            obj.ClassName
+        )
+
+    end
+
+end
+
+--==================================================
+-- 8. Inspect currently loaded Lua functions
+--==================================================
+
+if getgc and debug and debug.getinfo then
+
+    log("Scanning GC functions...")
+
+    local count = 0
+
+    for _, obj in ipairs(getgc(true)) do
+
+        if type(obj) == "function" then
+
+            local ok, info = pcall(debug.getinfo, obj)
+
+            if ok and info then
+
+                local source = tostring(info.source or "")
+                local name = tostring(info.name or "")
+
+                local text =
+                    (source .. " " .. name):lower()
+
+                if text:find("collect")
+                    or text:find("cash")
+                    or text:find("money")
+                    or text:find("income")
+                    or text:find("claim")
+                    or text:find("pickup")
+                    or text:find("harvest") then
+
+                    count += 1
+
+                    log(
+                        "FUNCTION:",
+                        "name=" .. name,
+                        "source=" .. source
+                    )
                 end
+
             end
         end
     end
 
-    -- Fallback: search whole plot for a part named Collector
-    for _, part in ipairs(plot:GetDescendants()) do
-        if part:IsA("BasePart") and part.Name == "Collector" then
-            return part
-        end
-    end
-
-    -- Last resort: any part with TouchTransmitter
-    for _, part in ipairs(plot:GetDescendants()) do
-        if part:IsA("BasePart") and part:FindFirstChildOfClass("TouchTransmitter") then
-            return part
-        end
-    end
-
-    return nil
+    log("Matching functions:", count)
 end
 
--- ===== Teleport to collector, fire touch, teleport back =====
-local function collectMoney()
-    local collector = getCollectorPart()
-    if not collector then return false end
-
-    local char = player.Character
-    if not char then return false end
-    local hrp = char:FindFirstChild("HumanoidRootPart")
-    if not hrp then return false end
-
-    -- Save current position
-    local originalCF = hrp.CFrame
-
-    -- Teleport to the collector
-    hrp.CFrame = collector.CFrame * CFrame.new(0, 2, 0)
-    hrp.AssemblyLinearVelocity = Vector3.zero
-    hrp.AssemblyAngularVelocity = Vector3.zero
-    task.wait(0.1)
-
-    -- Fire the touch event
-    local ok = pcall(function()
-        firetouchinterest(collector, hrp, 0)  -- touch start
-        task.wait(TOUCH_DURATION)
-        firetouchinterest(collector, hrp, 1)  -- touch end
-    end)
-
-    -- Teleport back
-    task.wait(0.1)
-    hrp.CFrame = originalCF
-    hrp.AssemblyLinearVelocity = Vector3.zero
-    hrp.AssemblyAngularVelocity = Vector3.zero
-
-    return ok
-end
-
--- ===== Main loop =====
-task.spawn(function()
-    while true do
-        local ok = pcall(collectMoney)
-        if not ok then
-            -- collector not found yet, keep trying
-        end
-        task.wait(COLLECT_INTERVAL)
-    end
-end)
-
-print("✅ Auto Collect v2 loaded! Teleporting to collector every " .. COLLECT_INTERVAL .. "s")
+log("====================================")
+log("NOW START THE OTHER AUTO-COLLECT SCRIPT")
+log("====================================")
