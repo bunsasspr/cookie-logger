@@ -14,6 +14,7 @@ local RebirthRemote = remotes:WaitForChild("Rebirth")
 local FoodCartRemote = remotes:WaitForChild("FoodCart")
 local MerchantRemote = remotes:WaitForChild("Merchant")
 local EggInfo = remotes:WaitForChild("EggInfo")
+local Dialogue = remotes:WaitForChild("Dialogue")
 
 -- ===== Config =====
 local BUY_STAND_DURATION = 2       -- seconds to stand + spam-fire (dice/potion/eggs)
@@ -27,7 +28,7 @@ local COLLECT_INTERVAL = 3         -- seconds between money-collection sweeps
 local USE_POTIONS_INTERVAL = 10    -- seconds between auto-use-potion sweeps
 local REBIRTH_CHECK_INTERVAL = 2   -- seconds
 local REBIRTH_COOLDOWN = 5         -- seconds after firing rebirth
-local EGG_BUY_QUANTITY = 3
+local SELL_COOLDOWN = 3            -- seconds after selling before re-checking
 
 -- Full item pools (found via Dark Dex) — fired blind, server rejects anything not
 -- actually in stock, so no GUI reading is needed for Merchant at all.
@@ -61,7 +62,7 @@ local EGG_HOLDER_INDEX = {
 }
 local EGG_NAMES = {"Basic", "Forest", "Jungle", "Beach", "Monster", "Desert", "Galaxy", "Candy", "Lava", "Frozen"}
 
--- ===== Feature state (driven by the Rayfield toggles below) =====
+-- ===== Feature state (driven by the Rayfield elements below) =====
 local state = {
     dice = false,
     potion = false,
@@ -70,8 +71,11 @@ local state = {
     collect = false,
     usePotions = false,
     egg = false,
+    eggQuantity = 3,
     rebirth = false,
     selectedEgg = "Basic",
+    sell = false,
+    sellThreshold = 30,
 }
 
 -- ===== Helpers =====
@@ -130,6 +134,42 @@ local function getRestockSeconds(shopName)
     local min, sec = label.Text:match("(%d+):(%d+)")
     if not min or not sec then return nil end
     return tonumber(min) * 60 + tonumber(sec)
+end
+
+local function getInventoryCount()
+    local ok, counter = pcall(function()
+        return player.PlayerGui.Main.Canvas.Inventory.MainFrame.Counter
+    end)
+    if not ok or not counter then return 0 end
+    local current = counter.Text:match("(%d+)/")
+    return tonumber(current) or 0
+end
+
+-- Reads the Potions inventory GUI for potions you actually own (count > 0).
+-- NOTE: this path hasn't been confirmed live yet — if it prints nothing found
+-- while you do own potions, the structure differs and we'll need to dump it
+-- like we did for Merchant/FoodCart.
+local function getOwnedPotions()
+    local owned = {}
+    local ok, holder = pcall(function()
+        return player.PlayerGui.Main.Canvas.Potions.Holder.Holder
+    end)
+    if not ok or not holder then
+        warn("[UsePotions] Could not find Potions inventory GUI at the expected path")
+        return owned
+    end
+
+    for _, entry in ipairs(holder:GetChildren()) do
+        local nameLabel = entry:FindFirstChild("NameLabel")
+        local ownedLabel = entry:FindFirstChild("OwnedLabel")
+        if nameLabel and ownedLabel then
+            local count = tonumber(ownedLabel.Text:match("(%d+)"))
+            if count and count > 0 then
+                table.insert(owned, nameLabel.Text)
+            end
+        end
+    end
+    return owned
 end
 
 -- ================= Buy actions =================
@@ -244,17 +284,37 @@ local function openEgg()
     local elapsed = 0
     while elapsed < BUY_STAND_DURATION do
         pcall(function()
-            EggInfo:InvokeServer("Buy", state.selectedEgg, EGG_BUY_QUANTITY)
+            EggInfo:InvokeServer("Buy", state.selectedEgg, state.eggQuantity)
         end)
         task.wait(BUY_FIRE_INTERVAL)
         elapsed += BUY_FIRE_INTERVAL
     end
 end
 
+local function sellInventory()
+    local part = getMapShopPart("SellShop")
+    if not part then
+        warn("[Sell] SellShop model not found")
+        return
+    end
+    teleportTo(part.CFrame)
+    task.wait(TELEPORT_SETTLE_DELAY)
+
+    pcall(function()
+        Dialogue:InvokeServer("SellNpc", 1, "I want to sell my inventory", "preview")
+    end)
+    task.wait(1.5)
+    pcall(function()
+        Dialogue:InvokeServer("SellNpc", 1, "I want to sell my inventory", "commit")
+    end)
+    print("[Sell] Done")
+end
+
 -- ================= Priority scheduler =================
--- Merchant > FoodCart > Dice > Potion > Eggs. Only one of these moves the
--- character at a time; each pass does at most one action, then re-checks
--- from the top so a higher-priority item can interrupt promptly.
+-- Merchant > Sell > FoodCart > Dice > Potion > Eggs. Sell's slot is a guess
+-- since it wasn't specified — say the word if you want it reordered.
+-- Only one of these moves the character at a time; each pass does at most one
+-- action, then re-checks from the top so a higher-priority item can interrupt.
 local lastMerchant, lastFoodCart = nil, nil
 local nextDiceTime, nextPotionTime = 0, 0
 
@@ -264,10 +324,15 @@ task.spawn(function()
 
         local merchant = state.merchant and getMerchantModel()
         local foodcart = state.foodcart and getFoodCartModel()
+        local sellReady = state.sell and getInventoryCount() >= state.sellThreshold
 
         if merchant and merchant ~= lastMerchant then
             lastMerchant = merchant
             buyMerchant()
+            didSomething = true
+        elseif sellReady then
+            sellInventory()
+            task.wait(SELL_COOLDOWN)
             didSomething = true
         elseif foodcart and foodcart ~= lastFoodCart then
             lastFoodCart = foodcart
@@ -341,11 +406,12 @@ task.spawn(function()
     end
 end)
 
--- Auto Use Potions
+-- Auto Use Potions — only fires for potions you actually own
 task.spawn(function()
     while true do
         if state.usePotions then
-            for _, potionName in ipairs(POTION_ORDER) do
+            local owned = getOwnedPotions()
+            for _, potionName in ipairs(owned) do
                 pcall(function()
                     UsePotion:FireServer("Use", potionName, "Max")
                 end)
@@ -389,11 +455,10 @@ end)
 
 -- ================= UI =================
 local Window = Rayfield:CreateWindow({
-    Name = "AutoFarm",
-    LoadingTitle = "AutoFarm",
-    LoadingSubtitle = "buns",
-    ConfigurationSaving = {
-        Enabled = false,
+    name = "AutoFarm",
+    subtitle = "buns",
+    configuration = {
+        enabled = true,
     },
 })
 
@@ -448,7 +513,26 @@ MainTab:CreateToggle({
     Callback = function(v) state.rebirth = v end,
 })
 
-MainTab:CreateDropdown({
+MainTab:CreateToggle({
+    Name = "Auto Sell",
+    CurrentValue = false,
+    Flag = "AutoSell",
+    Callback = function(v) state.sell = v end,
+})
+
+MainTab:CreateSlider({
+    Name = "Sell Threshold",
+    Range = {1, 100},
+    Increment = 1,
+    Suffix = "items",
+    CurrentValue = 30,
+    Flag = "SellThreshold",
+    Callback = function(v) state.sellThreshold = v end,
+})
+
+local EggTab = Window:CreateTab({ name = "Eggs", icon = 0 })
+
+EggTab:CreateDropdown({
     Name = "Egg Type",
     Options = EGG_NAMES,
     CurrentOption = {"Basic"},
@@ -459,7 +543,17 @@ MainTab:CreateDropdown({
     end,
 })
 
-MainTab:CreateToggle({
+EggTab:CreateSlider({
+    Name = "Egg Quantity",
+    Range = {1, 10},
+    Increment = 1,
+    Suffix = "eggs",
+    CurrentValue = 3,
+    Flag = "EggQuantity",
+    Callback = function(v) state.eggQuantity = v end,
+})
+
+EggTab:CreateToggle({
     Name = "Auto Egg",
     CurrentValue = false,
     Flag = "AutoEgg",
