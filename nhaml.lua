@@ -27,7 +27,10 @@ local TELEPORT_SETTLE_DELAY = 0.5
 local SCHEDULER_INTERVAL = 1
 local RESTOCK_BUFFER = 2
 local FALLBACK_RESTOCK_WAIT = 120
-local COLLECT_INTERVAL = 3
+local COLLECT_INTERVAL = 1
+local COLLECT_TOUCH_HOLD = 0.15   -- how long to "stand" on each collector
+local COLLECT_BETWEEN = 0.1       -- pause between collectors
+local COLLECT_SWEEPS = 2          -- how many touch cycles per sweep
 local USE_POTIONS_INTERVAL = 10
 local REBIRTH_CHECK_INTERVAL = 2
 local REBIRTH_COOLDOWN = 5
@@ -311,9 +314,17 @@ task.spawn(function()
             local ok, hrp = pcall(getHRP)
             if ok then
                 local parts = getCollectorParts()
-                for _, c in ipairs(parts) do pcall(function() firetouchinterest(c, hrp, 0) end) end
-                task.wait(0.1)
-                for _, c in ipairs(parts) do pcall(function() firetouchinterest(c, hrp, 1) end) end
+                for _, c in ipairs(parts) do
+                    -- Skip collectors currently on cooldown (server attribute)
+                    if c:GetAttribute("on_cooldown") ~= true then
+                        for _ = 1, COLLECT_SWEEPS do
+                            pcall(function() firetouchinterest(c, hrp, 0) end)
+                            task.wait(COLLECT_TOUCH_HOLD)
+                            pcall(function() firetouchinterest(c, hrp, 1) end)
+                            task.wait(COLLECT_BETWEEN)
+                        end
+                    end
+                end
             end
         end
         task.wait(COLLECT_INTERVAL)
