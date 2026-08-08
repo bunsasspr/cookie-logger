@@ -12,6 +12,7 @@ local remotes = RS:WaitForChild("Remotes")
 local BuyDice = remotes:WaitForChild("BuyDice")
 local BuyPotion = remotes:WaitForChild("BuyPotion")
 local UsePotion = remotes:WaitForChild("UsePotion")
+local EquipBest = remotes:FindFirstChild("EquipBest") or remotes:WaitForChild("EquipBest")
 local RebirthRemote = remotes:WaitForChild("Rebirth")
 local FoodCartRemote = remotes:WaitForChild("FoodCart")
 local MerchantRemote = remotes:WaitForChild("Merchant")
@@ -20,21 +21,19 @@ local Dialogue = remotes:WaitForChild("Dialogue")
 local PotionUpdater = remotes:FindFirstChild("PotionUpdater")
 
 -- ===== Config =====
-local BUY_STAND_DURATION = 2       -- seconds to stand + spam-fire (dice/potion/eggs)
-local BUY_FIRE_INTERVAL = 0.5      -- seconds between spam-fires
-local TELEPORT_OFFSET = 4          -- studs back from target, avoids the collision push-out glitch
-local TELEPORT_SETTLE_DELAY = 0.5  -- pause after teleporting before firing
-local SCHEDULER_INTERVAL = 1       -- seconds between priority re-checks
-local RESTOCK_BUFFER = 2           -- extra seconds after a restock timer hits 0
-local FALLBACK_RESTOCK_WAIT = 120  -- used if a restock timer label can't be read
-local COLLECT_INTERVAL = 3         -- seconds between money-collection sweeps
-local USE_POTIONS_INTERVAL = 10    -- seconds between auto-use-potion sweeps
-local REBIRTH_CHECK_INTERVAL = 2   -- seconds
-local REBIRTH_COOLDOWN = 5         -- seconds after firing rebirth
-local SELL_COOLDOWN = 3            -- seconds after selling before re-checking
+local BUY_STAND_DURATION = 2
+local BUY_FIRE_INTERVAL = 0.5
+local TELEPORT_OFFSET = 4
+local TELEPORT_SETTLE_DELAY = 0.5
+local SCHEDULER_INTERVAL = 1
+local RESTOCK_BUFFER = 2
+local FALLBACK_RESTOCK_WAIT = 120
+local EQUIP_BEST_SETTLE = 0.5        -- pause after firing EquipBest (claims money)
+local USE_POTIONS_INTERVAL = 10
+local REBIRTH_CHECK_INTERVAL = 2
+local REBIRTH_COOLDOWN = 5
+local SELL_COOLDOWN = 3
 
--- Full item pools (found via Dark Dex) — fired blind, server rejects anything not
--- actually in stock, so no GUI reading is needed for Merchant at all.
 local DICE_ORDER = {
     "Basic", "Bronze", "Iron", "Silver", "Gold", "Sapphire", "Emerald", "Ruby",
     "Obsidian", "Crystal", "Nebula", "Void", "Celestial", "Abyssal", "Infernal",
@@ -58,27 +57,18 @@ local MERCHANT_CATEGORIES = {
     {name = "Exclusive", items = EXCLUSIVE_ORDER},
 }
 
--- workspace.Map.Island.EggHolders.<N> holds a model named after the egg type
 local EGG_HOLDER_INDEX = {
     Basic = 1, Forest = 2, Jungle = 3, Beach = 4, Monster = 5,
     Desert = 6, Galaxy = 7, Candy = 8, Lava = 9, Frozen = 10,
 }
 local EGG_NAMES = {"Basic", "Forest", "Jungle", "Beach", "Monster", "Desert", "Galaxy", "Candy", "Lava", "Frozen"}
 
--- ===== Feature state (driven by the Fluent elements below) =====
+-- ===== Feature state =====
 local state = {
-    dice = false,
-    potion = false,
-    merchant = false,
-    foodcart = false,
-    collect = false,
-    usePotions = false,
-    egg = false,
-    eggQuantity = 3,
-    rebirth = false,
+    dice = false, potion = false, merchant = false, foodcart = false,
+    usePotions = false, egg = false, eggQuantity = 3,
+    rebirth = false, equipBest = false, sell = false, sellThreshold = 30,
     selectedEgg = "Basic",
-    sell = false,
-    sellThreshold = 30,
 }
 
 -- ===== Helpers =====
@@ -87,9 +77,6 @@ local function getHRP()
     return char:WaitForChild("HumanoidRootPart")
 end
 
--- Teleports offset back from the target so the character doesn't land inside
--- collision geometry (which shoves it back out, sometimes well out of range),
--- and zeroes velocity so nothing carries into that push.
 local function teleportTo(cframe, offset)
     offset = offset or TELEPORT_OFFSET
     local hrp = getHRP()
@@ -128,7 +115,18 @@ local function getMyPlotModel()
     return nil
 end
 
--- shopName: "Main" (dice) or "Potion"
+-- Returns the CFrame of the player's plot center (the "pot")
+local function getPlotCFrame()
+    local plot = getMyPlotModel()
+    if not plot then return nil end
+    local part = plot.PrimaryPart or plot:FindFirstChildWhichIsA("BasePart", true)
+    if part then return part.CFrame + Vector3.new(0, 3, 0) end
+    -- fallback: use Spawn part
+    local spawn = plot:FindFirstChild("Spawn")
+    if spawn and spawn:IsA("BasePart") then return spawn.CFrame end
+    return nil
+end
+
 local function getRestockSeconds(shopName)
     local ok, label = pcall(function()
         return player.PlayerGui.Main.Canvas.MapShops[shopName].Holder.Timer.TextLabel
@@ -148,10 +146,7 @@ local function getInventoryCount()
     return tonumber(current) or 0
 end
 
--- Tracks potions we actually own, fed by the game's PotionUpdater remote.
--- The game fires  PotionUpdater:OnClientEvent("Update", { [name] = { Owned = n } })
--- (confirmed from PotionHandler.lua in the game dump). We only auto-use potions
--- with owned count > 0 so we never waste a fire on something we don't have.
+-- PotionUpdater — tracks which potions we actually own
 local ownedPotionCounts = {}
 if PotionUpdater then
     PotionUpdater.OnClientEvent:Connect(function(event, data)
@@ -165,31 +160,16 @@ if PotionUpdater then
             end
         end
     end)
-    -- Ask the server for the current potion state so we have it on load
-    pcall(function()
-        PotionUpdater:FireServer("Request")
-    end)
-else
-    warn("[UsePotions] PotionUpdater remote not found — owned-potion detection disabled")
+    pcall(function() PotionUpdater:FireServer("Request") end)
 end
 
--- Returns the names of potions we actually own (count > 0).
--- Primary source is the PotionUpdater feed; falls back to reading the Potions
--- inventory GUI in case the remote feed is empty.
 local function getOwnedPotions()
     local owned = {}
-
     for name, count in pairs(ownedPotionCounts) do
-        if count > 0 then
-            table.insert(owned, name)
-        end
+        if count > 0 then table.insert(owned, name) end
     end
-
-    if #owned > 0 then
-        return owned
-    end
-
-    -- Fallback: try reading the Potions inventory GUI
+    if #owned > 0 then return owned end
+    -- fallback: GUI reading
     local ok, holder = pcall(function()
         return player.PlayerGui.Main.Canvas.Potions.Holder.Holder
     end)
@@ -199,56 +179,34 @@ local function getOwnedPotions()
             local ownedLabel = entry:FindFirstChild("OwnedLabel")
             if nameLabel and ownedLabel then
                 local count = tonumber(ownedLabel.Text:match("(%d+)"))
-                if count and count > 0 then
-                    table.insert(owned, nameLabel.Text)
-                end
+                if count and count > 0 then table.insert(owned, nameLabel.Text) end
             end
         end
     end
-
     return owned
 end
 
 -- ================= Buy actions =================
-
 local function buyDice()
     local part = getMapShopPart("Shop")
-    if not part then
-        warn("Dice shop model not found")
-        return
-    end
-    teleportTo(part.CFrame)
-    task.wait(TELEPORT_SETTLE_DELAY)
-
+    if not part then return end
+    teleportTo(part.CFrame); task.wait(TELEPORT_SETTLE_DELAY)
     local elapsed = 0
     while elapsed < BUY_STAND_DURATION do
-        pcall(function()
-            BuyDice:FireServer("BuyBestAvailable")
-        end)
-        task.wait(BUY_FIRE_INTERVAL)
-        elapsed = elapsed + BUY_FIRE_INTERVAL
+        pcall(function() BuyDice:FireServer("BuyBestAvailable") end)
+        task.wait(BUY_FIRE_INTERVAL); elapsed = elapsed + BUY_FIRE_INTERVAL
     end
-    print("[Dice] Bought")
 end
 
 local function buyPotion()
     local part = getMapShopPart("PotionShop")
-    if not part then
-        warn("Potion shop model not found")
-        return
-    end
-    teleportTo(part.CFrame)
-    task.wait(TELEPORT_SETTLE_DELAY)
-
+    if not part then return end
+    teleportTo(part.CFrame); task.wait(TELEPORT_SETTLE_DELAY)
     local elapsed = 0
     while elapsed < BUY_STAND_DURATION do
-        pcall(function()
-            BuyPotion:FireServer("BuyBestAvailable")
-        end)
-        task.wait(BUY_FIRE_INTERVAL)
-        elapsed = elapsed + BUY_FIRE_INTERVAL
+        pcall(function() BuyPotion:FireServer("BuyBestAvailable") end)
+        task.wait(BUY_FIRE_INTERVAL); elapsed = elapsed + BUY_FIRE_INTERVAL
     end
-    print("[Potion] Bought")
 end
 
 local function getFoodCartModel()
@@ -257,26 +215,15 @@ local function getFoodCartModel()
 end
 
 local function buyFoodCart()
-    local cart = getFoodCartModel()
-    if not cart then return end
+    local cart = getFoodCartModel(); if not cart then return end
     local part = cart.PrimaryPart or cart:FindFirstChildWhichIsA("BasePart", true)
     if not part then return end
-
-    teleportTo(part.CFrame)
-    task.wait(TELEPORT_SETTLE_DELAY)
-
-    if not getFoodCartModel() then
-        warn("[FoodCart] Despawned before buying")
-        return
-    end
-
+    teleportTo(part.CFrame); task.wait(TELEPORT_SETTLE_DELAY)
+    if not getFoodCartModel() then return end
     for _, item in ipairs(FOOD_ORDER) do
-        pcall(function()
-            FoodCartRemote:FireServer("BuyAll", item)
-        end)
+        pcall(function() FoodCartRemote:FireServer("BuyAll", item) end)
         task.wait(0.15)
     end
-    print("[FoodCart] Done")
 end
 
 local function getMerchantModel()
@@ -285,173 +232,49 @@ local function getMerchantModel()
 end
 
 local function buyMerchant()
-    local model = getMerchantModel()
-    if not model then return end
+    local model = getMerchantModel(); if not model then return end
     local part = model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart", true)
     if not part then return end
-
-    teleportTo(part.CFrame)
-    task.wait(TELEPORT_SETTLE_DELAY)
-
-    if not getMerchantModel() then
-        warn("[Merchant] Despawned before buying")
-        return
-    end
-
+    teleportTo(part.CFrame); task.wait(TELEPORT_SETTLE_DELAY)
+    if not getMerchantModel() then return end
     for _, cat in ipairs(MERCHANT_CATEGORIES) do
         for _, itemName in ipairs(cat.items) do
-            pcall(function()
-                MerchantRemote:FireServer("BuyAll", cat.name, itemName)
-            end)
+            pcall(function() MerchantRemote:FireServer("BuyAll", cat.name, itemName) end)
             task.wait(0.12)
         end
     end
-    print("[Merchant] Done")
 end
 
 local function openEgg()
     local part = getEggPart(state.selectedEgg)
-    if not part then
-        warn("Egg holder not found for", state.selectedEgg)
-        return
-    end
-    teleportTo(part.CFrame)
-    task.wait(TELEPORT_SETTLE_DELAY)
-
+    if not part then return end
+    teleportTo(part.CFrame); task.wait(TELEPORT_SETTLE_DELAY)
     local elapsed = 0
     while elapsed < BUY_STAND_DURATION do
-        pcall(function()
-            EggInfo:InvokeServer("Buy", state.selectedEgg, state.eggQuantity)
-        end)
-        task.wait(BUY_FIRE_INTERVAL)
-        elapsed = elapsed + BUY_FIRE_INTERVAL
+        pcall(function() EggInfo:InvokeServer("Buy", state.selectedEgg, state.eggQuantity) end)
+        task.wait(BUY_FIRE_INTERVAL); elapsed = elapsed + BUY_FIRE_INTERVAL
     end
 end
 
-local function sellInventory()
-    local part = getMapShopPart("SellShop")
-    if not part then
-        warn("[Sell] SellShop model not found")
-        return
-    end
-    teleportTo(part.CFrame)
+-- ================= Auto Equip Best (claims placeholder money too) =================
+-- Firing EquipBest while standing on your pot equips your best dice AND claims
+-- all the placeholder money — so this replaces the old firetouchinterest collect.
+local function equipBest()
+    local cf = getPlotCFrame()
+    if not cf then warn("[EquipBest] Could not find your plot"); return end
+    teleportTo(cf, 0)
     task.wait(TELEPORT_SETTLE_DELAY)
-
-    pcall(function()
-        Dialogue:InvokeServer("SellNpc", 1, "I want to sell my inventory", "preview")
-    end)
-    task.wait(1.5)
-    pcall(function()
-        Dialogue:InvokeServer("SellNpc", 1, "I want to sell my inventory", "commit")
-    end)
-    print("[Sell] Done")
+    pcall(function() EquipBest:FireServer() end)
+    task.wait(EQUIP_BEST_SETTLE)
 end
-
--- ================= Priority scheduler =================
--- Merchant > Sell > FoodCart > Dice > Potion > Eggs. Sell's slot is a guess
--- since it wasn't specified — say the word if you want it reordered.
--- Only one of these moves the character at a time; each pass does at most one
--- action, then re-checks from the top so a higher-priority item can interrupt.
-local lastMerchant, lastFoodCart = nil, nil
-local nextDiceTime, nextPotionTime = 0, 0
-
-task.spawn(function()
-    while true do
-        local didSomething = false
-
-        local merchant = state.merchant and getMerchantModel()
-        local foodcart = state.foodcart and getFoodCartModel()
-        local sellReady = state.sell and getInventoryCount() >= state.sellThreshold
-
-        if merchant and merchant ~= lastMerchant then
-            lastMerchant = merchant
-            buyMerchant()
-            didSomething = true
-        elseif sellReady then
-            sellInventory()
-            task.wait(SELL_COOLDOWN)
-            didSomething = true
-        elseif foodcart and foodcart ~= lastFoodCart then
-            lastFoodCart = foodcart
-            buyFoodCart()
-            didSomething = true
-        elseif state.dice and tick() >= nextDiceTime then
-            buyDice()
-            local restockWait = getRestockSeconds("Main")
-            nextDiceTime = tick() + (restockWait and (restockWait + RESTOCK_BUFFER) or FALLBACK_RESTOCK_WAIT)
-            didSomething = true
-        elseif state.potion and tick() >= nextPotionTime then
-            buyPotion()
-            local restockWait = getRestockSeconds("Potion")
-            nextPotionTime = tick() + (restockWait and (restockWait + RESTOCK_BUFFER) or FALLBACK_RESTOCK_WAIT)
-            didSomething = true
-        elseif state.egg then
-            openEgg()
-            didSomething = true
-        end
-
-        if not merchant then lastMerchant = nil end
-        if not foodcart then lastFoodCart = nil end
-
-        if not didSomething then
-            task.wait(SCHEDULER_INTERVAL)
-        end
-    end
-end)
-
--- ================= Independent background features =================
--- These don't move the character, so they run on their own without
--- competing with the priority scheduler above.
-
--- Auto Collect Money
-local function getCollectorParts()
-    local plot = getMyPlotModel()
-    if not plot then return {} end
-    local collectors = {}
-    for _, floor in ipairs(plot:GetChildren()) do
-        if floor.Name:match("^Floor%d+$") then
-            local holders = floor:FindFirstChild("Holders")
-            if holders then
-                for _, holder in ipairs(holders:GetChildren()) do
-                    local collector = holder:FindFirstChild("Collector")
-                    if collector and collector:IsA("BasePart") then
-                        table.insert(collectors, collector)
-                    end
-                end
-            end
-        end
-    end
-    return collectors
-end
-
-task.spawn(function()
-    while true do
-        if state.collect then
-            local ok, hrp = pcall(getHRP)
-            if ok then
-                local collectors = getCollectorParts()
-                for _, c in ipairs(collectors) do
-                    pcall(function() firetouchinterest(c, hrp, 0) end)
-                end
-                task.wait(0.1)
-                for _, c in ipairs(collectors) do
-                    pcall(function() firetouchinterest(c, hrp, 1) end)
-                end
-            end
-        end
-        task.wait(COLLECT_INTERVAL)
-    end
-end)
 
 -- Auto Use Potions — only fires for potions you actually own
 task.spawn(function()
     while true do
         if state.usePotions then
             local owned = getOwnedPotions()
-            for _, potionName in ipairs(owned) do
-                pcall(function()
-                    UsePotion:FireServer("Use", potionName, "Max")
-                end)
+            for _, name in ipairs(owned) do
+                pcall(function() UsePotion:FireServer("Use", name, "Max") end)
                 task.wait(0.12)
             end
         end
@@ -459,11 +282,65 @@ task.spawn(function()
     end
 end)
 
+-- ================= Auto Sell (equips best first, then sells) =================
+local function sellInventory()
+    -- Step 1: go to your pot and equip best (claims money + equips)
+    if state.equipBest then
+        equipBest()
+    end
+
+    -- Step 2: go sell
+    local part = getMapShopPart("SellShop")
+    if not part then return end
+    teleportTo(part.CFrame); task.wait(TELEPORT_SETTLE_DELAY)
+    pcall(function() Dialogue:InvokeServer("SellNpc", 1, "I want to sell my inventory", "preview") end)
+    task.wait(1.5)
+    pcall(function() Dialogue:InvokeServer("SellNpc", 1, "I want to sell my inventory", "commit") end)
+end
+
+-- ================= Priority scheduler =================
+-- Merchant > FoodCart > Dice > Potion > Sell > Eggs
+-- (Rebirth & Auto Use Potions run as independent background loops.)
+-- EquipBest is NOT a standalone step — it triggers inside sellInventory
+-- right before selling (teleport to pot → EquipBest → teleport to SellShop → sell).
+local lastMerchant, lastFoodCart = nil, nil
+local nextDiceTime, nextPotionTime = 0, 0
+
+task.spawn(function()
+    while true do
+        local didSomething = false
+        local merchant = state.merchant and getMerchantModel()
+        local foodcart = state.foodcart and getFoodCartModel()
+        local sellReady = state.sell and getInventoryCount() >= state.sellThreshold
+
+        if merchant and merchant ~= lastMerchant then
+            lastMerchant = merchant; buyMerchant(); didSomething = true
+        elseif foodcart and foodcart ~= lastFoodCart then
+            lastFoodCart = foodcart; buyFoodCart(); didSomething = true
+        elseif state.dice and tick() >= nextDiceTime then
+            buyDice()
+            local r = getRestockSeconds("Main")
+            nextDiceTime = tick() + (r and (r + RESTOCK_BUFFER) or FALLBACK_RESTOCK_WAIT)
+            didSomething = true
+        elseif state.potion and tick() >= nextPotionTime then
+            buyPotion()
+            local r = getRestockSeconds("Potion")
+            nextPotionTime = tick() + (r and (r + RESTOCK_BUFFER) or FALLBACK_RESTOCK_WAIT)
+            didSomething = true
+        elseif sellReady then
+            sellInventory(); task.wait(SELL_COOLDOWN); didSomething = true
+        elseif state.egg then
+            openEgg(); didSomething = true
+        end
+        if not merchant then lastMerchant = nil end
+        if not foodcart then lastFoodCart = nil end
+        if not didSomething then task.wait(SCHEDULER_INTERVAL) end
+    end
+end)
+
 -- Auto Rebirth
 local function isRebirthReady()
-    local ok, btn = pcall(function()
-        return player.PlayerGui.Main.Canvas.Rebirth.MainFrame.Rebirth
-    end)
+    local ok, btn = pcall(function() return player.PlayerGui.Main.Canvas.Rebirth.MainFrame.Rebirth end)
     if not ok or not btn then return false end
     local color = btn.BackgroundColor3
     return color.G > color.R
@@ -474,8 +351,7 @@ task.spawn(function()
         if state.rebirth then
             local ok, ready = pcall(isRebirthReady)
             if ok and ready then
-                RebirthRemote:FireServer()
-                print("[Rebirth] Fired")
+                RebirthRemote:FireServer(); print("[Rebirth] Fired")
                 task.wait(REBIRTH_COOLDOWN)
             end
         end
@@ -483,7 +359,6 @@ task.spawn(function()
     end
 end)
 
--- Anti-AFK, always on
 local VirtualUser = game:GetService("VirtualUser")
 player.Idled:Connect(function()
     VirtualUser:CaptureController()
@@ -497,7 +372,7 @@ local Window = Fluent:CreateWindow({
     TabWidth    = 150,
     Size        = UDim2.fromOffset(520, 480),
     Acrylic     = true,
-    Theme       = "AMOLED",
+    Theme       = "Cyanic",
     MinimizeKey = Enum.KeyCode.LeftControl,
     Search      = true,
 })
@@ -505,102 +380,69 @@ local Window = Fluent:CreateWindow({
 -- ============ Main Tab ============
 local MainTab = Window:AddTab({ Title = "Main", Icon = "solar/home-bold" })
 
-MainTab:AddToggle("AutoMerchant", {
-    Title = "Auto Buy Merchant",
-    Default = false,
-    Callback = function(v) state.merchant = v end,
-})
-
-MainTab:AddToggle("AutoFoodCart", {
-    Title = "Auto Buy FoodCart",
-    Default = false,
-    Callback = function(v) state.foodcart = v end,
-})
-
-MainTab:AddToggle("AutoDice", {
-    Title = "Auto Buy Dice",
-    Default = false,
-    Callback = function(v) state.dice = v end,
-})
-
-MainTab:AddToggle("AutoPotion", {
-    Title = "Auto Buy Potions",
-    Default = false,
-    Callback = function(v) state.potion = v end,
-})
-
 MainTab:AddToggle("AutoUsePotions", {
-    Title = "Auto Use Potions",
-    Default = false,
+    Title = "Auto Use Potions", Default = false,
     Callback = function(v) state.usePotions = v end,
 })
-
-MainTab:AddToggle("AutoCollect", {
-    Title = "Auto Collect Money",
-    Default = false,
-    Callback = function(v) state.collect = v end,
-})
-
 MainTab:AddToggle("AutoRebirth", {
-    Title = "Auto Rebirth",
-    Default = false,
+    Title = "Auto Rebirth", Default = false,
     Callback = function(v) state.rebirth = v end,
 })
-
+MainTab:AddToggle("AutoEquipBest", {
+    Title = "Auto Equip Best", Default = false,
+    Callback = function(v) state.equipBest = v end,
+})
 MainTab:AddToggle("AutoSell", {
-    Title = "Auto Sell",
-    Default = false,
+    Title = "Auto Sell", Default = false,
     Callback = function(v) state.sell = v end,
 })
-
 MainTab:AddSlider("SellThreshold", {
-    Title = "Sell Threshold",
-    Default = 30,
-    Min = 1,
-    Max = 100,
-    Rounding = 1,
-    Callback = function(v) state.sellThreshold = v end,
+    Title = "Sell Threshold", Default = 30, Min = 1, Max = 100, Rounding = 1,
+    Callback = function(v) state.sellThreshold = tonumber(v) or 30 end,
+})
+
+-- ============ Shop Tab ============
+local ShopTab = Window:AddTab({ Title = "Shop", Icon = "solar/cart-large-2-bold" })
+
+ShopTab:AddToggle("AutoDice", {
+    Title = "Auto Buy Dice", Default = false,
+    Callback = function(v) state.dice = v end,
+})
+ShopTab:AddToggle("AutoPotion", {
+    Title = "Auto Buy Potions", Default = false,
+    Callback = function(v) state.potion = v end,
+})
+ShopTab:AddToggle("AutoMerchant", {
+    Title = "Auto Merchant", Default = false,
+    Callback = function(v) state.merchant = v end,
+})
+ShopTab:AddToggle("AutoFoodCart", {
+    Title = "Auto FoodCart", Default = false,
+    Callback = function(v) state.foodcart = v end,
 })
 
 -- ============ Eggs Tab ============
 local EggTab = Window:AddTab({ Title = "Eggs", Icon = "solar/database-bold" })
 
 EggTab:AddDropdown("EggType", {
-    Title = "Egg Type",
-    Values = EGG_NAMES,
-    Default = "Basic",
-    Multi = false,
-    Callback = function(v)
-        state.selectedEgg = v
-    end,
+    Title = "Egg Type", Values = EGG_NAMES, Default = "Basic", Multi = false,
+    Callback = function(v) state.selectedEgg = v end,
 })
-
 EggTab:AddSlider("EggQuantity", {
-    Title = "Egg Quantity",
-    Default = 3,
-    Min = 1,
-    Max = 10,
-    Rounding = 1,
+    Title = "Egg Quantity", Default = 3, Min = 1, Max = 10, Rounding = 1,
     Callback = function(v) state.eggQuantity = v end,
 })
-
 EggTab:AddToggle("AutoEgg", {
-    Title = "Auto Egg",
-    Default = false,
+    Title = "Auto Egg", Default = false,
     Callback = function(v) state.egg = v end,
 })
 
--- ============ Settings Tab (config save/load) ============
+-- ============ Settings Tab ============
 local SettingsTab = Window:AddTab({ Title = "Settings", Icon = "solar/settings-bold" })
 
--- Fluent Modded's own SaveManager/InterfaceManager — this is what makes
--- configs persist to disk. Element ids ("AutoDice", "SellThreshold", etc.)
--- above are the keys that get saved. BuildConfigSection auto-generates the
--- Save/Load buttons on the Settings tab.
 local SaveManager = loadstring(game:HttpGet(
     "https://raw.githubusercontent.com/StyearX/Fluent-modded/main/Addons/SaveManager.lua"
 ))()
-
 local InterfaceManager = loadstring(game:HttpGet(
     "https://raw.githubusercontent.com/StyearX/Fluent-modded/main/Addons/InterfaceManager.lua"
 ))()
@@ -611,10 +453,69 @@ InterfaceManager:SetLibrary(Fluent)
 InterfaceManager:SetFolder("BunsHub")
 SaveManager:SetFolder("BunsHub/Config")
 
-InterfaceManager:BuildInterfaceSection(SettingsTab)
-SaveManager:BuildConfigSection(SettingsTab)
+-- ===== Apply default theme/interface settings =====
+InterfaceManager.Settings = {
+    Theme       = "Cyanic",
+    Acrylic     = true,
+    Transparency = true,
+    DisableBG   = false,
+    Favorites   = {},
+    Animated    = true,
+    MenuKeybind = "LeftControl",
+    Font        = "SourceSans",
+}
 
+-- Save the interface defaults and apply theme+font
+pcall(function()
+    InterfaceManager:SaveSettings()
+    Fluent:SetTheme("Cyanic")
+    InterfaceManager:ApplyFont("SourceSans")
+end)
+
+-- Interface section only (theme/font/acrylic/transparency/animated/keybind).
+-- The manual config section is not needed because everything auto-saves.
+InterfaceManager:BuildInterfaceSection(SettingsTab)
 SaveManager:IgnoreThemeSettings()
 SaveManager:LoadAutoloadConfig()
+
+-- ===== Auto-save: every time a user element changes, save to "AutoSave" =====
+-- NOTE: task.delay returns a thread, so we cancel it with task.cancel(),
+-- not :Cancel() (that was causing the "attempt to index thread" error).
+local autoSaveThread
+for idx, opt in pairs(SaveManager.Options) do
+    if SaveManager.Parser[opt.Type] and not SaveManager.Ignore[idx] then
+        local cb = opt.Callback
+        opt.Callback = function(v)
+            if cb then cb(v) end
+            -- Debounce auto-save: wait 0.5s after last change then save
+            if autoSaveThread then task.cancel(autoSaveThread) end
+            autoSaveThread = task.delay(0.5, function()
+                pcall(function() SaveManager:Save("AutoSave") end)
+            end)
+        end
+        -- If the element has an OnChanged, hook that too
+        if opt.OnChanged then
+            local old = opt.OnChanged
+            opt.OnChanged = function()
+                if old then old() end
+                pcall(function() SaveManager:Save("AutoSave") end)
+            end
+        end
+    end
+end
+
+-- Also set Autoload to AutoSave so it loads on next run
+pcall(function()
+    local autoPath = "BunsHub/Config/settings/autoload.txt"
+    if not isfile(autoPath) then
+        -- Create an initial AutoSave so autoload has something to load
+        task.delay(1, function()
+            pcall(function()
+                SaveManager:Save("AutoSave")
+                writefile(autoPath, "AutoSave")
+            end)
+        end)
+    end
+end)
 
 print("AutoFarm loaded (Fluent Modded).")
