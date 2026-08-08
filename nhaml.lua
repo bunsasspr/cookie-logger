@@ -28,7 +28,6 @@ local TELEPORT_SETTLE_DELAY = 0.5
 local SCHEDULER_INTERVAL = 1
 local RESTOCK_BUFFER = 2
 local FALLBACK_RESTOCK_WAIT = 120
-local EQUIP_BEST_INTERVAL = 30       -- seconds between auto equip-best sweeps
 local EQUIP_BEST_SETTLE = 0.5        -- pause after firing EquipBest (claims money)
 local USE_POTIONS_INTERVAL = 10
 local REBIRTH_CHECK_INTERVAL = 2
@@ -116,7 +115,7 @@ local function getMyPlotModel()
     return nil
 end
 
--- Teleports to the player's plot center (the "pot") so EquipBest registers
+-- Returns the CFrame of the player's plot center (the "pot")
 local function getPlotCFrame()
     local plot = getMyPlotModel()
     if not plot then return nil end
@@ -283,8 +282,14 @@ task.spawn(function()
     end
 end)
 
--- ================= Auto Sell =================
+-- ================= Auto Sell (equips best first, then sells) =================
 local function sellInventory()
+    -- Step 1: go to your pot and equip best (claims money + equips)
+    if state.equipBest then
+        equipBest()
+    end
+
+    -- Step 2: go sell
     local part = getMapShopPart("SellShop")
     if not part then return end
     teleportTo(part.CFrame); task.wait(TELEPORT_SETTLE_DELAY)
@@ -294,11 +299,12 @@ local function sellInventory()
 end
 
 -- ================= Priority scheduler =================
--- Merchant > FoodCart > Dice > Potion > Sell > EquipBest > Eggs
+-- Merchant > FoodCart > Dice > Potion > Sell > Eggs
 -- (Rebirth & Auto Use Potions run as independent background loops.)
+-- EquipBest is NOT a standalone step — it triggers inside sellInventory
+-- right before selling (teleport to pot → EquipBest → teleport to SellShop → sell).
 local lastMerchant, lastFoodCart = nil, nil
 local nextDiceTime, nextPotionTime = 0, 0
-local nextEquipBestTime = 0
 
 task.spawn(function()
     while true do
@@ -323,10 +329,6 @@ task.spawn(function()
             didSomething = true
         elseif sellReady then
             sellInventory(); task.wait(SELL_COOLDOWN); didSomething = true
-        elseif state.equipBest and tick() >= nextEquipBestTime then
-            equipBest()
-            nextEquipBestTime = tick() + EQUIP_BEST_INTERVAL
-            didSomething = true
         elseif state.egg then
             openEgg(); didSomething = true
         end
@@ -388,7 +390,6 @@ MainTab:AddToggle("AutoRebirth", {
 })
 MainTab:AddToggle("AutoEquipBest", {
     Title = "Auto Equip Best", Default = false,
-    Description = "Equips best dice & claims placeholder money at your pot",
     Callback = function(v) state.equipBest = v end,
 })
 MainTab:AddToggle("AutoSell", {
