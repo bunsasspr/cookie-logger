@@ -1,4 +1,5 @@
 -- ================= AutoFarm — Fluent Modded rework + Fusion =================
+-- Non-blocking farm: fusion only briefly pins to deposit/claim, then resumes shops/eggs/sell.
 local Fluent = loadstring(game:HttpGet(
     "https://github.com/StyearX/Fluent-Modded/releases/download/Fluent/FluentPro"
 ))()
@@ -40,8 +41,9 @@ local FUSION_WAIT_INTERVAL = 1
 local FUSION_MAX_WAIT = 300
 local AFTER_CLAIM_COOLDOWN = 2.5
 local FUSE_MACHINE_CFRAME = CFrame.new(-104.240242, 1.77263951 + 5, 198.388123)
-local MAX_STUCK_RETRIES = 3       -- give up retrying a stuck job after this many failed attempts
-local STUCK_RETRY_BACKOFF = 10    -- seconds to wait between stuck-job retries
+local MAX_STUCK_RETRIES = 3
+local STUCK_RETRY_BACKOFF = 10
+local FUSION_START_INTERVAL = 5   -- how often idle farm tries to start a new fuse
 
 local DICE_ORDER = {
     "Basic", "Bronze", "Iron", "Silver", "Gold", "Sapphire", "Emerald", "Ruby",
@@ -81,6 +83,9 @@ local state = {
     autoCraftGolden = false,
     autoCraftDiamond = false,
 }
+
+-- Shared lock so farm actions and fusion never pin at the same time
+local actionBusy = false
 
 -- ===== Helpers =====
 local function getHRP()
@@ -211,10 +216,12 @@ local function getOwnedPotions()
     return owned
 end
 
--- ================= Buy actions =================
+-- ================= Buy actions (respect actionBusy) =================
 local function buyDice()
+    if actionBusy then return end
     local part = getMapShopPart("Shop")
     if not part then return end
+    actionBusy = true
     pinTo(part.CFrame)
     task.wait(TELEPORT_SETTLE_DELAY)
     local elapsed = 0
@@ -223,11 +230,14 @@ local function buyDice()
         task.wait(BUY_FIRE_INTERVAL); elapsed = elapsed + BUY_FIRE_INTERVAL
     end
     unpin()
+    actionBusy = false
 end
 
 local function buyPotion()
+    if actionBusy then return end
     local part = getMapShopPart("PotionShop")
     if not part then return end
+    actionBusy = true
     pinTo(part.CFrame)
     task.wait(TELEPORT_SETTLE_DELAY)
     local elapsed = 0
@@ -236,6 +246,7 @@ local function buyPotion()
         task.wait(BUY_FIRE_INTERVAL); elapsed = elapsed + BUY_FIRE_INTERVAL
     end
     unpin()
+    actionBusy = false
 end
 
 local function getFoodCartModel()
@@ -244,17 +255,20 @@ local function getFoodCartModel()
 end
 
 local function buyFoodCart()
+    if actionBusy then return end
     local cart = getFoodCartModel(); if not cart then return end
     local part = cart.PrimaryPart or cart:FindFirstChildWhichIsA("BasePart", true)
     if not part then return end
+    actionBusy = true
     pinTo(part.CFrame)
     task.wait(TELEPORT_SETTLE_DELAY)
-    if not getFoodCartModel() then unpin(); return end
+    if not getFoodCartModel() then unpin(); actionBusy = false; return end
     for _, item in ipairs(FOOD_ORDER) do
         pcall(function() FoodCartRemote:FireServer("BuyAll", item) end)
         task.wait(0.15)
     end
     unpin()
+    actionBusy = false
 end
 
 local function getMerchantModel()
@@ -263,12 +277,14 @@ local function getMerchantModel()
 end
 
 local function buyMerchant()
+    if actionBusy then return end
     local model = getMerchantModel(); if not model then return end
     local part = model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart", true)
     if not part then return end
+    actionBusy = true
     pinTo(part.CFrame)
     task.wait(TELEPORT_SETTLE_DELAY)
-    if not getMerchantModel() then unpin(); return end
+    if not getMerchantModel() then unpin(); actionBusy = false; return end
     for _, cat in ipairs(MERCHANT_CATEGORIES) do
         for _, itemName in ipairs(cat.items) do
             pcall(function() MerchantRemote:FireServer("BuyAll", cat.name, itemName) end)
@@ -276,11 +292,14 @@ local function buyMerchant()
         end
     end
     unpin()
+    actionBusy = false
 end
 
 local function openEgg()
+    if actionBusy then return end
     local part = getEggPart(state.selectedEgg)
     if not part then return end
+    actionBusy = true
     pinTo(part.CFrame)
     task.wait(TELEPORT_SETTLE_DELAY)
     local elapsed = 0
@@ -289,16 +308,20 @@ local function openEgg()
         task.wait(BUY_FIRE_INTERVAL); elapsed = elapsed + BUY_FIRE_INTERVAL
     end
     unpin()
+    actionBusy = false
 end
 
 local function equipBest()
+    if actionBusy then return end
     local cf = getPlotCFrame()
     if not cf then warn("[EquipBest] Could not find your plot"); return end
+    actionBusy = true
     pinTo(cf)
     task.wait(TELEPORT_SETTLE_DELAY)
     pcall(function() EquipBest:FireServer() end)
     task.wait(EQUIP_BEST_SETTLE)
     unpin()
+    actionBusy = false
 end
 
 task.spawn(function()
@@ -315,24 +338,31 @@ task.spawn(function()
 end)
 
 local function sellInventory()
+    if actionBusy then return end
+    actionBusy = true
     if state.equipBest then
+        -- equipBest sets its own actionBusy; temporarily release so it can run
+        actionBusy = false
         equipBest()
+        actionBusy = true
     end
     local part = getMapShopPart("SellShop")
-    if not part then return end
+    if not part then actionBusy = false; return end
     pinTo(part.CFrame)
     task.wait(TELEPORT_SETTLE_DELAY)
     pcall(function() Dialogue:InvokeServer("SellNpc", 1, "I want to sell my inventory", "preview") end)
     task.wait(1.5)
     pcall(function() Dialogue:InvokeServer("SellNpc", 1, "I want to sell my inventory", "commit") end)
     unpin()
+    actionBusy = false
 end
 
--- ================= FUSION SYSTEM =================
+-- ================= FUSION SYSTEM (non-blocking) =================
+-- Flow: deposit pets → unpin → farm continues → when ready, claim → check for
+-- another 6 identical → if yes fuse again first → else resume farm.
 local lastClaimedJobId = nil
 local pendingFusion = nil          -- {JobId = ..., Mode = ...}
-local fusionActionBusy = false
-local stuckJobRetries = {}         -- [JobId] = retry count, so we don't hammer forever on a job our claim can't actually clear
+local stuckJobRetries = {}
 
 local function getPlayerState()
     local ok, result = pcall(function()
@@ -362,8 +392,6 @@ local function fusePets(petIds, mode)
     return result
 end
 
--- outcome is now actually passed in from the caller (was missing before,
--- which meant this always thought outcome==nil and skipped the Failed path)
 local function claimFusion(jobId, outcome)
     if not jobId or jobId == lastClaimedJobId then return nil end
 
@@ -404,9 +432,6 @@ local function claimFusion(jobId, outcome)
         end
     end
 
-    -- Only mark as handled if we actually got a successful response — a job that
-    -- both methods failed to clear should NOT be silently forgotten, or we'll
-    -- just start firing new Fuse attempts that keep bouncing off FusionInProgress.
     if result and result.Success ~= false then
         lastClaimedJobId = jobId
         stuckJobRetries[jobId] = nil
@@ -415,8 +440,8 @@ local function claimFusion(jobId, outcome)
         warn(("[Fusion] Could not clear JobId %s (attempt %d/%d) — neither ClaimFusion nor AcknowledgeFusion worked"):format(
             jobId, stuckJobRetries[jobId], MAX_STUCK_RETRIES))
         if stuckJobRetries[jobId] >= MAX_STUCK_RETRIES then
-            warn("[Fusion] Giving up on this job for now — the real claim remote is probably different from what's coded. Won't spam retries.")
-            lastClaimedJobId = jobId -- stop retrying this specific job, but don't pretend it succeeded
+            warn("[Fusion] Giving up on this job for now — won't spam retries.")
+            lastClaimedJobId = jobId
         end
     end
 
@@ -486,12 +511,10 @@ local function syncExistingFusion()
     return true
 end
 
+-- Deposit only: pin → fuse → unpin → return. Does NOT wait for the timer.
 local function startFuse(variantFilter, mode)
-    if fusionActionBusy then return false end
-
-    if syncExistingFusion() then
-        return false
-    end
+    if actionBusy then return false end
+    if syncExistingFusion() then return false end
 
     local playerState = getPlayerState()
     if not playerState then return false end
@@ -502,7 +525,7 @@ local function startFuse(variantFilter, mode)
     local group = groups[1]
     print("[Fusion] Found", group.count, variantFilter, group.name, "→", mode)
 
-    fusionActionBusy = true
+    actionBusy = true
 
     local petIds = {}
     for i = 1, 6 do
@@ -532,16 +555,28 @@ local function startFuse(variantFilter, mode)
     end
 
     unpin()
-    fusionActionBusy = false
+    actionBusy = false
     return true
 end
 
--- Background watcher: claims when ready (success OR fail), then tries next fuse
+-- Try Golden then Diamond once (used after claim or by idle starter)
+local function tryStartAnyFuse()
+    if actionBusy or pendingFusion then return false end
+    if state.autoCraftGolden then
+        if startFuse("Normal", "Golden") then return true end
+    end
+    if not pendingFusion and state.autoCraftDiamond then
+        if startFuse("Golden", "Diamond") then return true end
+    end
+    return false
+end
+
+-- Background watcher: only claims when ready, then optionally starts next fuse, else farm continues
 task.spawn(function()
     while true do
         task.wait(1.2)
 
-        if fusionActionBusy then
+        if actionBusy then
             continue
         end
 
@@ -565,10 +600,9 @@ task.spawn(function()
             continue
         end
 
-        -- If we've already given up on this specific job, don't keep re-triggering
-        -- the whole claim+refuse cycle every 1.2s — back off.
         if stuckJobRetries[jobId] and stuckJobRetries[jobId] >= MAX_STUCK_RETRIES then
             task.wait(STUCK_RETRY_BACKOFF)
+            continue
         end
 
         local ready = fusion.Ready
@@ -578,29 +612,34 @@ task.spawn(function()
         if ready then
             print("[Fusion] Timer finished (Outcome:", fusion.Outcome or "?", ") → claiming...")
 
-            fusionActionBusy = true
+            actionBusy = true
             teleportToFuseMachine()
-            claimFusion(jobId, fusion.Outcome) -- FIX: outcome is now actually passed
+            claimFusion(jobId, fusion.Outcome)
             task.wait(AFTER_CLAIM_COOLDOWN)
             unpin()
+            actionBusy = false
 
             local stillStuck = stuckJobRetries[jobId] and stuckJobRetries[jobId] >= MAX_STUCK_RETRIES
             pendingFusion = nil
-            fusionActionBusy = false
 
-            -- Only try starting a new fuse if the previous job actually cleared —
-            -- otherwise we'll just hit FusionInProgress again immediately.
+            -- After claim: if 6 identical pets exist, fuse again BEFORE resuming farm
             if not stillStuck then
-                if state.autoCraftGolden then
-                    startFuse("Normal", "Golden")
-                end
-                if not pendingFusion and state.autoCraftDiamond then
-                    startFuse("Golden", "Diamond")
-                end
+                tryStartAnyFuse()
             end
+            -- else farm scheduler keeps running as usual
         elseif not fusion.Active then
             pendingFusion = nil
         end
+    end
+end)
+
+-- Idle starter: while farm runs, periodically try to begin a fuse if none is pending
+task.spawn(function()
+    while true do
+        task.wait(FUSION_START_INTERVAL)
+        if actionBusy or pendingFusion then continue end
+        if not state.autoCraftGolden and not state.autoCraftDiamond then continue end
+        tryStartAnyFuse()
     end
 end)
 
@@ -629,6 +668,88 @@ local VirtualUser = game:GetService("VirtualUser")
 player.Idled:Connect(function()
     VirtualUser:CaptureController()
     VirtualUser:ClickButton2(Vector2.new())
+end)
+
+-- ================= MAIN FARM SCHEDULER =================
+-- Runs shops / eggs / sell independently of fusion.
+-- Skips a tick if actionBusy (fusion is depositing or claiming).
+local nextDice, nextPotion, nextMerchant, nextFood, nextEgg, nextSell = 0, 0, 0, 0, 0, 0
+local lastSellCheck = 0
+
+local function shopDue(shopName, fallback)
+    local secs = getRestockSeconds(shopName)
+    if secs == nil then return true end -- no timer visible → try buy
+    return secs <= RESTOCK_BUFFER
+end
+
+task.spawn(function()
+    while true do
+        task.wait(SCHEDULER_INTERVAL)
+        if actionBusy then continue end
+
+        local now = tick()
+
+        -- Auto Sell by inventory threshold
+        if state.sell and now - lastSellCheck >= SELL_COOLDOWN then
+            lastSellCheck = now
+            local count = getInventoryCount()
+            if count >= state.sellThreshold then
+                print("[Sell] Inventory", count, "≥ threshold", state.sellThreshold)
+                sellInventory()
+                nextSell = now + SELL_COOLDOWN
+                continue
+            end
+        end
+
+        -- Auto Equip Best (standalone, when sell is off)
+        if state.equipBest and not state.sell and now >= nextSell then
+            equipBest()
+            nextSell = now + 15
+        end
+
+        if state.dice and now >= nextDice then
+            if shopDue("Shop") then
+                buyDice()
+                nextDice = now + 3
+            else
+                local secs = getRestockSeconds("Shop")
+                nextDice = now + math.max(1, (secs or FALLBACK_RESTOCK_WAIT) - RESTOCK_BUFFER)
+            end
+        end
+
+        if actionBusy then continue end
+
+        if state.potion and now >= nextPotion then
+            if shopDue("PotionShop") then
+                buyPotion()
+                nextPotion = now + 3
+            else
+                local secs = getRestockSeconds("PotionShop")
+                nextPotion = now + math.max(1, (secs or FALLBACK_RESTOCK_WAIT) - RESTOCK_BUFFER)
+            end
+        end
+
+        if actionBusy then continue end
+
+        if state.merchant and now >= nextMerchant then
+            buyMerchant()
+            nextMerchant = now + 8
+        end
+
+        if actionBusy then continue end
+
+        if state.foodcart and now >= nextFood then
+            buyFoodCart()
+            nextFood = now + 8
+        end
+
+        if actionBusy then continue end
+
+        if state.egg and now >= nextEgg then
+            openEgg()
+            nextEgg = now + 4
+        end
+    end
 end)
 
 -- ================= UI — Fluent Modded =================
@@ -782,4 +903,4 @@ pcall(function()
     end
 end)
 
-print("AutoFarm loaded (Fluent Modded + Fusion).")
+print("AutoFarm loaded (Fluent Modded + non-blocking Fusion).")
