@@ -359,21 +359,52 @@ local function fusePets(petIds, mode)
     return result
 end
 
-local function claimFusion(jobId)
+local function claimFusion(jobId, outcome)
     if not jobId or jobId == lastClaimedJobId then return nil end
 
-    print("[Fusion] Claiming JobId:", jobId)
-    local ok, result = pcall(function()
-        return EggInfo:InvokeServer("ClaimFusion", {
-            JobId = jobId,
-        })
-    end)
+    print("[Fusion] Claiming JobId:", jobId, "Outcome:", outcome or "?")
 
-    if ok and type(result) == "table" then
-        print("[Fusion] ClaimFusion → Success:", result.Success, "Reason:", result.Reason)
-        -- Mark as claimed whether it succeeded or failed (Outcome = Succeeded / Failed)
-        lastClaimedJobId = jobId
+    local result
+
+    -- Try the correct remote based on outcome
+    if outcome == "Failed" then
+        -- Failed fusions use AcknowledgeFusion
+        local ok, res = pcall(function()
+            return EggInfo:InvokeServer("AcknowledgeFusion", {
+                JobId = jobId,
+            })
+        end)
+        if ok then result = res end
+        print("[Fusion] AcknowledgeFusion →", result and result.Success, result and result.Reason)
+    else
+        -- Successful fusions use ClaimFusion
+        local ok, res = pcall(function()
+            return EggInfo:InvokeServer("ClaimFusion", {
+                JobId = jobId,
+            })
+        end)
+        if ok then result = res end
+        print("[Fusion] ClaimFusion →", result and result.Success, result and result.Reason)
     end
+
+    -- Fallback: if the first one failed, try the other
+    if not result or result.Success == false then
+        print("[Fusion] First claim method failed, trying fallback...")
+        local ok2, res2 = pcall(function()
+            if outcome == "Failed" then
+                return EggInfo:InvokeServer("ClaimFusion", { JobId = jobId })
+            else
+                return EggInfo:InvokeServer("AcknowledgeFusion", { JobId = jobId })
+            end
+        end)
+        if ok2 and res2 then
+            result = res2
+            print("[Fusion] Fallback result →", result.Success, result.Reason)
+        end
+    end
+
+    -- Always mark as handled so we don't loop forever
+    lastClaimedJobId = jobId
     return result
 end
 
