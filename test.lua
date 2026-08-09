@@ -866,12 +866,12 @@ OpenBtn.Size = UDim2.fromOffset(55, 55)
 OpenBtn.Position = UDim2.new(0.02, 0, 0.85, 0)
 OpenBtn.BackgroundColor3 = Color3.fromRGB(30, 30, 40)
 OpenBtn.BackgroundTransparency = 0.15
-OpenBtn.Image = "rbxassetid://117032319690583"   -- ← put your image ID here
+OpenBtn.Image = "rbxassetid://YOUR_IMAGE_ID_HERE"   -- your ID
 OpenBtn.ScaleType = Enum.ScaleType.Fit
 OpenBtn.Parent = OpenGui
 
 local corner = Instance.new("UICorner")
-corner.CornerRadius = UDim.new(0, 12)   -- change to UDim.new(1, 0) if you want a circle
+corner.CornerRadius = UDim.new(0, 12)
 corner.Parent = OpenBtn
 
 local stroke = Instance.new("UIStroke")
@@ -889,5 +889,37 @@ end
 OpenBtn.MouseButton1Click:Connect(function()
     if Window and Window.Minimize then
         Window:Minimize()
+    end
+end)
+
+-- Drag support
+local UserInputService = game:GetService("UserInputService")
+local dragging, dragStart, startPos = false, nil, nil
+
+OpenBtn.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+    or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = true
+        dragStart = input.Position
+        startPos = OpenBtn.Position
+
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then
+                dragging = false
+            end
+        end)
+    end
+end)
+
+OpenBtn.InputChanged:Connect(function(input)
+    if (input.UserInputType == Enum.UserInputType.MouseMovement
+    or input.UserInputType == Enum.UserInputType.Touch) and dragging then
+        local delta = input.Position - dragStart
+        OpenBtn.Position = UDim2.new(
+            startPos.X.Scale,
+            startPos.X.Offset + delta.X,
+            startPos.Y.Scale,
+            startPos.Y.Offset + delta.Y
+        )
     end
 end)
