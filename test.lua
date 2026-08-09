@@ -77,6 +77,7 @@ local state = {
     dice = false, potion = false, merchant = false, foodcart = false,
     usePotions = false, egg = false, eggQuantity = 3,
     rebirth = false, equipBest = false, sell = false, sellThreshold = 30,
+    equipBestInterval = 30,
     selectedEgg = "Basic",
     autoCraftGolden = false,
     autoCraftDiamond = false,
@@ -315,9 +316,7 @@ task.spawn(function()
 end)
 
 local function sellInventory()
-    if state.equipBest then
-        equipBest()
-    end
+    equipBest()
     local part = getMapShopPart("SellShop")
     if not part then return end
     pinTo(part.CFrame)
@@ -622,6 +621,16 @@ task.spawn(function()
     end
 end)
 
+-- Auto Equip Best
+task.spawn(function()
+    while true do
+        if state.equipBest then
+            equipBest()
+        end
+        task.wait(state.equipBestInterval)
+    end
+end)
+
 local VirtualUser = game:GetService("VirtualUser")
 player.Idled:Connect(function()
     VirtualUser:CaptureController()
@@ -654,6 +663,10 @@ MainTab:AddToggle("AutoRebirth", {
 MainTab:AddToggle("AutoEquipBest", {
     Title = "Auto Equip Best", Default = false,
     Callback = function(v) state.equipBest = v end,
+})
+MainTab:AddSlider("EquipBestInterval", {
+    Title = "Equip Best Interval (s)", Default = 30, Min = 5, Max = 100, Rounding = 1,
+    Callback = function(v) state.equipBestInterval = tonumber(v) or 30 end,
 })
 MainTab:AddToggle("AutoSell", {
     Title = "Auto Sell", Default = false,
