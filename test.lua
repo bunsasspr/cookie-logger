@@ -851,3 +851,43 @@ pcall(function()
 end)
 
 print("AutoFarm loaded (Fluent Modded + Fusion).")
+-- ===== Floating open/close icon =====
+local FloatingButtonManager = Fluent.FloatingButtonManager
+
+local OpenGui = Instance.new("ScreenGui")
+OpenGui.Name = "BunsHubOpenUI"
+OpenGui.ResetOnSpawn = false
+OpenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+OpenGui.Parent = game:GetService("CoreGui")
+
+local OpenBtn = Instance.new("ImageButton")
+OpenBtn.Name = "OpenBtn"
+OpenBtn.Size = UDim2.fromOffset(55, 55)
+OpenBtn.Position = UDim2.new(0.02, 0, 0.85, 0)
+OpenBtn.BackgroundColor3 = Color3.fromRGB(30, 30, 40)
+OpenBtn.BackgroundTransparency = 0.15
+OpenBtn.Image = "rbxassetid://117032319690583"   -- ← put your image ID here
+OpenBtn.ScaleType = Enum.ScaleType.Fit
+OpenBtn.Parent = OpenGui
+
+local corner = Instance.new("UICorner")
+corner.CornerRadius = UDim.new(0, 12)   -- change to UDim.new(1, 0) if you want a circle
+corner.Parent = OpenBtn
+
+local stroke = Instance.new("UIStroke")
+stroke.Color = Color3.fromRGB(0, 200, 255)
+stroke.Thickness = 1.5
+stroke.Transparency = 0.4
+stroke.Parent = OpenBtn
+
+if FloatingButtonManager then
+    FloatingButtonManager:SetLibrary(Fluent)
+    FloatingButtonManager:SetFolder("BunsHub/Floating")
+    FloatingButtonManager:AddButton("OpenBtn", OpenBtn, false, false)
+end
+
+OpenBtn.MouseButton1Click:Connect(function()
+    if Window and Window.Minimize then
+        Window:Minimize()
+    end
+end)
