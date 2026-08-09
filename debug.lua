@@ -1,51 +1,7 @@
--- ================= Fusion Standalone Script (v7) =================
--- Fully remote: Fuse → wait → ClaimFusion
-
-local Players = game:GetService("Players")
-local RS = game:GetService("ReplicatedStorage")
-local RunService = game:GetService("RunService")
-
-local player = Players.LocalPlayer
-local remotes = RS:WaitForChild("Remotes")
-local EggInfo = remotes:WaitForChild("EggInfo")
-
-local TELEPORT_SETTLE_DELAY = 0.6
-local FUSION_CHECK_INTERVAL = 3
-local FUSION_WAIT_INTERVAL = 1
-local FUSION_MAX_WAIT = 300
-local AFTER_CLAIM_COOLDOWN = 3
-
-local FUSE_MACHINE_CFRAME = CFrame.new(-104.240242, 1.77263951 + 5, 198.388123)
-
-local pinned = false
-local pinTarget = nil
+-- ================= FUSION SYSTEM (forced claim on fail) =================
 local lastClaimedJobId = nil
-
-local function getHRP()
-    local char = player.Character or player.CharacterAdded:Wait()
-    return char:WaitForChild("HumanoidRootPart")
-end
-
-local function pinTo(cframe)
-    pinTarget = cframe
-    pinned = true
-end
-
-local function unpin()
-    pinned = false
-    pinTarget = nil
-end
-
-RunService.Heartbeat:Connect(function()
-    if pinned and pinTarget then
-        local ok, hrp = pcall(getHRP)
-        if ok and hrp then
-            hrp.CFrame = pinTarget
-            hrp.AssemblyLinearVelocity = Vector3.zero
-            hrp.AssemblyAngularVelocity = Vector3.zero
-        end
-    end
-end)
+local pendingFusion = nil
+local fusionActionBusy = false
 
 local function getPlayerState()
     local ok, result = pcall(function()
@@ -69,47 +25,62 @@ local function fusePets(petIds, mode)
         })
     end)
     if not ok then
-        warn("[Fusion] Fuse failed:", result)
+        warn("[Fusion] Fuse call error:", result)
         return nil
     end
     return result
 end
 
-local function claimFusion(jobId)
-    if not jobId then return nil end
-    if jobId == lastClaimedJobId then
-        print("[Fusion] Already claimed this JobId, skipping")
-        return nil
-    end
+-- Force claim — tries both remotes until the fusion is gone
+local function forceClaim(jobId, outcome)
+    if not jobId then return false end
+    if jobId == lastClaimedJobId then return true end
 
-    print("[Fusion] Claiming with ClaimFusion | JobId:", jobId)
-    local ok, result = pcall(function()
-        return EggInfo:InvokeServer("ClaimFusion", {
-            JobId = jobId,
-        })
-    end)
+    print("[Fusion] Force claiming JobId:", jobId, "Outcome:", outcome or "?")
 
-    if not ok then
-        warn("[Fusion] ClaimFusion call failed:", result)
-        return nil
-    end
-
-    if type(result) == "table" then
-        print("[Fusion] ClaimFusion → Success:", result.Success, "Reason:", result.Reason)
-        if result.Success then
-            lastClaimedJobId = jobId
-        end
+    -- Always try AcknowledgeFusion first when Outcome is Failed
+    local remotesToTry = {}
+    if outcome == "Failed" then
+        table.insert(remotesToTry, "AcknowledgeFusion")
+        table.insert(remotesToTry, "ClaimFusion")
     else
-        print("[Fusion] ClaimFusion result:", result)
+        table.insert(remotesToTry, "ClaimFusion")
+        table.insert(remotesToTry, "AcknowledgeFusion")
     end
 
-    return result
+    for _, remoteName in ipairs(remotesToTry) do
+        local ok, result = pcall(function()
+            return EggInfo:InvokeServer(remoteName, {
+                JobId = jobId,
+            })
+        end)
+
+        if ok and type(result) == "table" then
+            print("[Fusion]", remoteName, "→ Success:", result.Success, "Reason:", result.Reason)
+
+            -- Check if the fusion is actually gone
+            task.wait(0.4)
+            local fs = getFusionState()
+            if not fs or not fs.Fusion or not fs.Fusion.Active or fs.Fusion.JobId ~= jobId then
+                print("[Fusion] Fusion cleared successfully with", remoteName)
+                lastClaimedJobId = jobId
+                return true
+            end
+        else
+            print("[Fusion]", remoteName, "failed or returned nil")
+        end
+    end
+
+    -- Last resort: mark it claimed anyway so we don't softlock forever
+    warn("[Fusion] Could not clear fusion, marking as handled to prevent softlock")
+    lastClaimedJobId = jobId
+    return false
 end
 
-local function findFusableGroups(state, minCount, variantFilter)
+local function findFusableGroups(playerState, minCount, variantFilter)
     minCount = minCount or 6
     local groups = {}
-    local pets = state and state.Pets
+    local pets = playerState and playerState.Pets
     if not pets then return {} end
 
     for _, pet in pairs(pets) do
@@ -150,123 +121,138 @@ local function teleportToFuseMachine()
     task.wait(TELEPORT_SETTLE_DELAY)
 end
 
-local function waitForFusionReady()
-    local startTime = tick()
-    while tick() - startTime < FUSION_MAX_WAIT do
-        local fs = getFusionState()
-        if fs and fs.Fusion then
-            local jobId = fs.Fusion.JobId
+local function syncExistingFusion()
+    local fs = getFusionState()
+    if not fs or not fs.Fusion then return false end
 
-            if jobId and jobId == lastClaimedJobId then
-                task.wait(FUSION_WAIT_INTERVAL)
-                continue
-            end
+    local fusion = fs.Fusion
+    if not fusion.JobId or fusion.JobId == lastClaimedJobId then return false end
 
-            if fs.Fusion.Ready or (fs.Fusion.Remaining and fs.Fusion.Remaining <= 0) then
-                print("[Fusion] Fusion ready! JobId:", jobId)
-                return fs.Fusion
-            end
-
-            if not fs.Fusion.Active then
-                return nil
-            end
+    if fusion.Active or fusion.Ready or (fusion.Remaining and fusion.Remaining <= 0) then
+        if not pendingFusion or pendingFusion.JobId ~= fusion.JobId then
+            pendingFusion = {
+                JobId = fusion.JobId,
+                Mode = fusion.Mode or "Golden",
+                Outcome = fusion.Outcome,
+            }
+            print("[Fusion] Detected existing fusion → JobId:", pendingFusion.JobId,
+                  "Ready:", fusion.Ready, "Outcome:", fusion.Outcome)
         end
-        task.wait(FUSION_WAIT_INTERVAL)
+        return true
     end
-    warn("[Fusion] Timed out waiting for fusion")
-    return nil
+    return false
 end
 
-local function fuseToGolden()
-    local state = getPlayerState()
-    if not state then return false end
+local function startFuse(variantFilter, mode)
+    if fusionActionBusy then return false end
 
-    local groups = findFusableGroups(state, 6, "Normal")
-    if #groups == 0 then
-        print("[Fusion] No 6+ Normal pets")
+    -- If something is already running / ready, just sync it
+    if syncExistingFusion() then
         return false
     end
 
+    local playerState = getPlayerState()
+    if not playerState then return false end
+
+    local groups = findFusableGroups(playerState, 6, variantFilter)
+    if #groups == 0 then return false end
+
     local group = groups[1]
-    print("[Fusion] Found", group.count, "Normal", group.name)
+    print("[Fusion] Found", group.count, variantFilter, group.name, "→", mode)
+
+    fusionActionBusy = true
 
     local petIds = {}
     for i = 1, 6 do
         table.insert(petIds, group.ids[i])
     end
 
-    print("[Fusion] Teleporting to FuseMachine...")
     teleportToFuseMachine()
+    local fuseResult = fusePets(petIds, mode)
 
-    print("[Fusion] Fusing 6x", group.name, "→ Golden...")
-    local fuseResult = fusePets(petIds, "Golden")
     if fuseResult then
-        print("[Fusion] Fuse Success:", fuseResult.Success, "Reason:", fuseResult.Reason)
+        if fuseResult.Success == false and fuseResult.Reason == "FusionInProgress" then
+            print("[Fusion] Server said FusionInProgress → syncing...")
+            syncExistingFusion()
+        elseif fuseResult.Success ~= false then
+            task.wait(0.35)
+            local fs = getFusionState()
+            if fs and fs.Fusion and fs.Fusion.JobId then
+                pendingFusion = {
+                    JobId = fs.Fusion.JobId,
+                    Mode = mode,
+                    Outcome = fs.Fusion.Outcome,
+                }
+                print("[Fusion] Fuse started → JobId:", pendingFusion.JobId)
+            end
+        else
+            print("[Fusion] Fuse failed →", fuseResult.Success, fuseResult.Reason)
+        end
     end
 
-    local fusionInfo = waitForFusionReady()
-    if not fusionInfo or not fusionInfo.JobId then
-        unpin()
-        return false
-    end
-
-    -- Fully remote claim
-    claimFusion(fusionInfo.JobId)
     unpin()
-    task.wait(AFTER_CLAIM_COOLDOWN)
+    fusionActionBusy = false
     return true
 end
 
-local function fuseToDiamond()
-    local state = getPlayerState()
-    if not state then return false end
-
-    local groups = findFusableGroups(state, 6, "Golden")
-    if #groups == 0 then
-        print("[Fusion] No 6+ Golden pets")
-        return false
-    end
-
-    local group = groups[1]
-    print("[Fusion] Found", group.count, "Golden", group.name)
-
-    local petIds = {}
-    for i = 1, 6 do
-        table.insert(petIds, group.ids[i])
-    end
-
-    print("[Fusion] Teleporting to FuseMachine...")
-    teleportToFuseMachine()
-
-    print("[Fusion] Fusing 6x Golden", group.name, "→ Diamond...")
-    local fuseResult = fusePets(petIds, "Diamond")
-    if fuseResult then
-        print("[Fusion] Fuse Success:", fuseResult.Success, "Reason:", fuseResult.Reason)
-    end
-
-    local fusionInfo = waitForFusionReady()
-    if not fusionInfo or not fusionInfo.JobId then
-        unpin()
-        return false
-    end
-
-    claimFusion(fusionInfo.JobId)
-    unpin()
-    task.wait(AFTER_CLAIM_COOLDOWN)
-    return true
-end
-
+-- Background claim watcher — highest priority when a fusion is ready/failed
 task.spawn(function()
     while true do
-        local ok, err = pcall(function()
-            if fuseToGolden() then task.wait(1) end
-            if fuseToDiamond() then task.wait(1) end
-        end)
-        if not ok then
-            warn("[Fusion] Error:", err)
+        task.wait(1)
+
+        if fusionActionBusy then
+            continue
         end
-        task.wait(FUSION_CHECK_INTERVAL)
+
+        syncExistingFusion()
+
+        if not pendingFusion then
+            continue
+        end
+
+        local fs = getFusionState()
+        if not fs or not fs.Fusion then
+            pendingFusion = nil
+            continue
+        end
+
+        local fusion = fs.Fusion
+        local jobId = fusion.JobId
+
+        if not jobId or jobId == lastClaimedJobId then
+            pendingFusion = nil
+            continue
+        end
+
+        local ready = fusion.Ready
+            or (fusion.Remaining and fusion.Remaining <= 0)
+            or fusion.Outcome == "Succeeded"
+            or fusion.Outcome == "Failed"
+
+        if ready then
+            print("[Fusion] Ready/Failed → forcing claim (Outcome:", fusion.Outcome, ")")
+
+            fusionActionBusy = true
+            teleportToFuseMachine()
+
+            -- This will try AcknowledgeFusion first when Outcome == "Failed"
+            forceClaim(jobId, fusion.Outcome)
+
+            task.wait(AFTER_CLAIM_COOLDOWN)
+            unpin()
+
+            pendingFusion = nil
+            fusionActionBusy = false
+
+            -- After clearing, try next fuse
+            if state.autoCraftGolden then
+                startFuse("Normal", "Golden")
+            end
+            if not pendingFusion and state.autoCraftDiamond then
+                startFuse("Golden", "Diamond")
+            end
+        elseif not fusion.Active then
+            pendingFusion = nil
+        end
     end
 end)
-
-print("[Fusion] Standalone fusion script loaded (v7 - fully remote ClaimFusion).")
