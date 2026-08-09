@@ -866,7 +866,7 @@ OpenBtn.Size = UDim2.fromOffset(55, 55)
 OpenBtn.Position = UDim2.new(0.02, 0, 0.85, 0)
 OpenBtn.BackgroundColor3 = Color3.fromRGB(30, 30, 40)
 OpenBtn.BackgroundTransparency = 0.15
-OpenBtn.Image = "rbxassetid://YOUR_IMAGE_ID_HERE"   -- your ID
+OpenBtn.Image = "rbxassetid://117032319690583"   -- your ID
 OpenBtn.ScaleType = Enum.ScaleType.Fit
 OpenBtn.Parent = OpenGui
 
