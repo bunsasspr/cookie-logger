@@ -1,4 +1,4 @@
--- ================= AutoFarm — Fluent Modded rework =================
+-- ================= AutoFarm — Fluent Modded rework + Fusion =================
 local Fluent = loadstring(game:HttpGet(
     "https://github.com/StyearX/Fluent-Modded/releases/download/Fluent/FluentPro"
 ))()
@@ -28,11 +28,20 @@ local TELEPORT_SETTLE_DELAY = 0.5
 local SCHEDULER_INTERVAL = 1
 local RESTOCK_BUFFER = 2
 local FALLBACK_RESTOCK_WAIT = 120
-local EQUIP_BEST_SETTLE = 0.5        -- pause after firing EquipBest (claims money)
+local EQUIP_BEST_SETTLE = 0.5
 local USE_POTIONS_INTERVAL = 10
 local REBIRTH_CHECK_INTERVAL = 2
 local REBIRTH_COOLDOWN = 5
 local SELL_COOLDOWN = 3
+
+-- Fusion config
+local FUSION_CHECK_INTERVAL = 4
+local FUSION_WAIT_INTERVAL = 1
+local FUSION_MAX_WAIT = 300
+local AFTER_CLAIM_COOLDOWN = 2.5
+local FUSE_MACHINE_CFRAME = CFrame.new(-104.240242, 1.77263951 + 5, 198.388123)
+local MAX_STUCK_RETRIES = 3       -- give up retrying a stuck job after this many failed attempts
+local STUCK_RETRY_BACKOFF = 10    -- seconds to wait between stuck-job retries
 
 local DICE_ORDER = {
     "Basic", "Bronze", "Iron", "Silver", "Gold", "Sapphire", "Emerald", "Ruby",
@@ -69,6 +78,8 @@ local state = {
     usePotions = false, egg = false, eggQuantity = 3,
     rebirth = false, equipBest = false, sell = false, sellThreshold = 30,
     selectedEgg = "Basic",
+    autoCraftGolden = false,
+    autoCraftDiamond = false,
 }
 
 -- ===== Helpers =====
@@ -78,9 +89,6 @@ local function getHRP()
 end
 
 -- ================= Pinning system =================
--- Heartbeat pinning runs every frame (~60×/s). It locks the player's HRP to an
--- exact CFrame and zeroes velocity, so the physics engine can't push/slide you
--- away after teleporting to NPCs, eggs, or the pot.
 local pinned = false
 local pinTarget = nil
 
@@ -135,13 +143,11 @@ local function getMyPlotModel()
     return nil
 end
 
--- Returns the CFrame of the player's plot center (the "pot")
 local function getPlotCFrame()
     local plot = getMyPlotModel()
     if not plot then return nil end
     local part = plot.PrimaryPart or plot:FindFirstChildWhichIsA("BasePart", true)
     if part then return part.CFrame + Vector3.new(0, 3, 0) end
-    -- fallback: use Spawn part
     local spawn = plot:FindFirstChild("Spawn")
     if spawn and spawn:IsA("BasePart") then return spawn.CFrame end
     return nil
@@ -166,7 +172,7 @@ local function getInventoryCount()
     return tonumber(current) or 0
 end
 
--- PotionUpdater — tracks which potions we actually own
+-- PotionUpdater
 local ownedPotionCounts = {}
 if PotionUpdater then
     PotionUpdater.OnClientEvent:Connect(function(event, data)
@@ -189,7 +195,6 @@ local function getOwnedPotions()
         if count > 0 then table.insert(owned, name) end
     end
     if #owned > 0 then return owned end
-    -- fallback: GUI reading
     local ok, holder = pcall(function()
         return player.PlayerGui.Main.Canvas.Potions.Holder.Holder
     end)
@@ -206,7 +211,7 @@ local function getOwnedPotions()
     return owned
 end
 
--- ================= Buy actions (all use pinning) =================
+-- ================= Buy actions =================
 local function buyDice()
     local part = getMapShopPart("Shop")
     if not part then return end
@@ -286,9 +291,6 @@ local function openEgg()
     unpin()
 end
 
--- ================= Auto Equip Best (claims placeholder money too) =================
--- Firing EquipBest while standing on your pot equips your best dice AND claims
--- all the placeholder money — so this replaces the old firetouchinterest collect.
 local function equipBest()
     local cf = getPlotCFrame()
     if not cf then warn("[EquipBest] Could not find your plot"); return end
@@ -299,7 +301,6 @@ local function equipBest()
     unpin()
 end
 
--- Auto Use Potions — only fires for potions you actually own
 task.spawn(function()
     while true do
         if state.usePotions then
@@ -313,14 +314,10 @@ task.spawn(function()
     end
 end)
 
--- ================= Auto Sell (equips best first, then sells) =================
 local function sellInventory()
-    -- Step 1: go to your pot and equip best (claims money + equips)
     if state.equipBest then
         equipBest()
     end
-
-    -- Step 2: go sell
     local part = getMapShopPart("SellShop")
     if not part then return end
     pinTo(part.CFrame)
@@ -331,43 +328,279 @@ local function sellInventory()
     unpin()
 end
 
--- ================= Priority scheduler =================
--- Merchant > FoodCart > Dice > Potion > Sell > Eggs
--- (Rebirth & Auto Use Potions run as independent background loops.)
--- EquipBest is NOT a standalone step — it triggers inside sellInventory
--- right before selling (pin to pot → EquipBest → pin to SellShop → sell).
-local lastMerchant, lastFoodCart = nil, nil
-local nextDiceTime, nextPotionTime = 0, 0
+-- ================= FUSION SYSTEM =================
+local lastClaimedJobId = nil
+local pendingFusion = nil          -- {JobId = ..., Mode = ...}
+local fusionActionBusy = false
+local stuckJobRetries = {}         -- [JobId] = retry count, so we don't hammer forever on a job our claim can't actually clear
 
+local function getPlayerState()
+    local ok, result = pcall(function()
+        return EggInfo:InvokeServer("State")
+    end)
+    return ok and result or nil
+end
+
+local function getFusionState()
+    local ok, result = pcall(function()
+        return EggInfo:InvokeServer("GetFusionState")
+    end)
+    return ok and result or nil
+end
+
+local function fusePets(petIds, mode)
+    local ok, result = pcall(function()
+        return EggInfo:InvokeServer("Fuse", {
+            PetIds = petIds,
+            Mode = mode,
+        })
+    end)
+    if not ok then
+        warn("[Fusion] Fuse call error:", result)
+        return nil
+    end
+    return result
+end
+
+-- outcome is now actually passed in from the caller (was missing before,
+-- which meant this always thought outcome==nil and skipped the Failed path)
+local function claimFusion(jobId, outcome)
+    if not jobId or jobId == lastClaimedJobId then return nil end
+
+    print("[Fusion] Claiming JobId:", jobId, "Outcome:", outcome or "?")
+
+    local result
+
+    if outcome == "Failed" then
+        local ok, res = pcall(function()
+            return EggInfo:InvokeServer("AcknowledgeFusion", {
+                JobId = jobId,
+            })
+        end)
+        if ok then result = res end
+        print("[Fusion] AcknowledgeFusion →", result and result.Success, result and result.Reason)
+    else
+        local ok, res = pcall(function()
+            return EggInfo:InvokeServer("ClaimFusion", {
+                JobId = jobId,
+            })
+        end)
+        if ok then result = res end
+        print("[Fusion] ClaimFusion →", result and result.Success, result and result.Reason)
+    end
+
+    if not result or result.Success == false then
+        print("[Fusion] First claim method failed, trying fallback...")
+        local ok2, res2 = pcall(function()
+            if outcome == "Failed" then
+                return EggInfo:InvokeServer("ClaimFusion", { JobId = jobId })
+            else
+                return EggInfo:InvokeServer("AcknowledgeFusion", { JobId = jobId })
+            end
+        end)
+        if ok2 and res2 then
+            result = res2
+            print("[Fusion] Fallback result →", result.Success, result.Reason)
+        end
+    end
+
+    -- Only mark as handled if we actually got a successful response — a job that
+    -- both methods failed to clear should NOT be silently forgotten, or we'll
+    -- just start firing new Fuse attempts that keep bouncing off FusionInProgress.
+    if result and result.Success ~= false then
+        lastClaimedJobId = jobId
+        stuckJobRetries[jobId] = nil
+    else
+        stuckJobRetries[jobId] = (stuckJobRetries[jobId] or 0) + 1
+        warn(("[Fusion] Could not clear JobId %s (attempt %d/%d) — neither ClaimFusion nor AcknowledgeFusion worked"):format(
+            jobId, stuckJobRetries[jobId], MAX_STUCK_RETRIES))
+        if stuckJobRetries[jobId] >= MAX_STUCK_RETRIES then
+            warn("[Fusion] Giving up on this job for now — the real claim remote is probably different from what's coded. Won't spam retries.")
+            lastClaimedJobId = jobId -- stop retrying this specific job, but don't pretend it succeeded
+        end
+    end
+
+    return result
+end
+
+local function findFusableGroups(playerState, minCount, variantFilter)
+    minCount = minCount or 6
+    local groups = {}
+    local pets = playerState and playerState.Pets
+    if not pets then return {} end
+
+    for _, pet in pairs(pets) do
+        if type(pet) == "table" and pet.Name and pet.Id then
+            if not variantFilter or pet.Variant == variantFilter then
+                local name = pet.Name
+                if not groups[name] then
+                    groups[name] = { name = name, ids = {}, count = 0 }
+                end
+                table.insert(groups[name].ids, pet.Id)
+                groups[name].count = groups[name].count + 1
+            end
+        end
+    end
+
+    local fusable = {}
+    for _, group in pairs(groups) do
+        if group.count >= minCount then
+            table.insert(fusable, group)
+        end
+    end
+    table.sort(fusable, function(a, b) return a.count > b.count end)
+    return fusable
+end
+
+local function teleportToFuseMachine()
+    local part = workspace:FindFirstChild("Map")
+        and workspace.Map:FindFirstChild("Island")
+        and workspace.Map.Island:FindFirstChild("FuseMachine")
+        and workspace.Map.Island.FuseMachine:FindFirstChild("Machine")
+        and workspace.Map.Island.FuseMachine.Machine:FindFirstChild("Machine Plinth")
+
+    if part and part:IsA("BasePart") then
+        pinTo(part.CFrame + Vector3.new(0, 5, 0))
+    else
+        pinTo(FUSE_MACHINE_CFRAME)
+    end
+    task.wait(TELEPORT_SETTLE_DELAY)
+end
+
+local function syncExistingFusion()
+    local fs = getFusionState()
+    if not fs or not fs.Fusion then return false end
+
+    local fusion = fs.Fusion
+    if not fusion.Active or not fusion.JobId then return false end
+    if fusion.JobId == lastClaimedJobId then return false end
+
+    if not pendingFusion or pendingFusion.JobId ~= fusion.JobId then
+        pendingFusion = {
+            JobId = fusion.JobId,
+            Mode = fusion.Mode or "Golden",
+        }
+        print("[Fusion] Detected existing fusion → JobId:", pendingFusion.JobId,
+              "Ready:", fusion.Ready, "Remaining:", fusion.Remaining)
+    end
+    return true
+end
+
+local function startFuse(variantFilter, mode)
+    if fusionActionBusy then return false end
+
+    if syncExistingFusion() then
+        return false
+    end
+
+    local playerState = getPlayerState()
+    if not playerState then return false end
+
+    local groups = findFusableGroups(playerState, 6, variantFilter)
+    if #groups == 0 then return false end
+
+    local group = groups[1]
+    print("[Fusion] Found", group.count, variantFilter, group.name, "→", mode)
+
+    fusionActionBusy = true
+
+    local petIds = {}
+    for i = 1, 6 do
+        table.insert(petIds, group.ids[i])
+    end
+
+    teleportToFuseMachine()
+    local fuseResult = fusePets(petIds, mode)
+
+    if fuseResult then
+        if fuseResult.Success == false and fuseResult.Reason == "FusionInProgress" then
+            print("[Fusion] Server said FusionInProgress → syncing...")
+            syncExistingFusion()
+        elseif fuseResult.Success ~= false then
+            task.wait(0.3)
+            local fs = getFusionState()
+            if fs and fs.Fusion and fs.Fusion.JobId then
+                pendingFusion = {
+                    JobId = fs.Fusion.JobId,
+                    Mode = mode,
+                }
+                print("[Fusion] Fuse started → JobId:", pendingFusion.JobId, "— resuming farm")
+            end
+        else
+            print("[Fusion] Fuse failed → Success:", fuseResult.Success, "Reason:", fuseResult.Reason)
+        end
+    end
+
+    unpin()
+    fusionActionBusy = false
+    return true
+end
+
+-- Background watcher: claims when ready (success OR fail), then tries next fuse
 task.spawn(function()
     while true do
-        local didSomething = false
-        local merchant = state.merchant and getMerchantModel()
-        local foodcart = state.foodcart and getFoodCartModel()
-        local sellReady = state.sell and getInventoryCount() >= state.sellThreshold
+        task.wait(1.2)
 
-        if merchant and merchant ~= lastMerchant then
-            lastMerchant = merchant; buyMerchant(); didSomething = true
-        elseif foodcart and foodcart ~= lastFoodCart then
-            lastFoodCart = foodcart; buyFoodCart(); didSomething = true
-        elseif state.dice and tick() >= nextDiceTime then
-            buyDice()
-            local r = getRestockSeconds("Main")
-            nextDiceTime = tick() + (r and (r + RESTOCK_BUFFER) or FALLBACK_RESTOCK_WAIT)
-            didSomething = true
-        elseif state.potion and tick() >= nextPotionTime then
-            buyPotion()
-            local r = getRestockSeconds("Potion")
-            nextPotionTime = tick() + (r and (r + RESTOCK_BUFFER) or FALLBACK_RESTOCK_WAIT)
-            didSomething = true
-        elseif sellReady then
-            sellInventory(); task.wait(SELL_COOLDOWN); didSomething = true
-        elseif state.egg then
-            openEgg(); didSomething = true
+        if fusionActionBusy then
+            continue
         end
-        if not merchant then lastMerchant = nil end
-        if not foodcart then lastFoodCart = nil end
-        if not didSomething then task.wait(SCHEDULER_INTERVAL) end
+
+        syncExistingFusion()
+
+        if not pendingFusion then
+            continue
+        end
+
+        local fs = getFusionState()
+        if not fs or not fs.Fusion then
+            pendingFusion = nil
+            continue
+        end
+
+        local fusion = fs.Fusion
+        local jobId = fusion.JobId
+
+        if not jobId or jobId == lastClaimedJobId then
+            pendingFusion = nil
+            continue
+        end
+
+        -- If we've already given up on this specific job, don't keep re-triggering
+        -- the whole claim+refuse cycle every 1.2s — back off.
+        if stuckJobRetries[jobId] and stuckJobRetries[jobId] >= MAX_STUCK_RETRIES then
+            task.wait(STUCK_RETRY_BACKOFF)
+        end
+
+        local ready = fusion.Ready
+            or (fusion.Remaining and fusion.Remaining <= 0)
+            or (fusion.Outcome == "Succeeded" or fusion.Outcome == "Failed")
+
+        if ready then
+            print("[Fusion] Timer finished (Outcome:", fusion.Outcome or "?", ") → claiming...")
+
+            fusionActionBusy = true
+            teleportToFuseMachine()
+            claimFusion(jobId, fusion.Outcome) -- FIX: outcome is now actually passed
+            task.wait(AFTER_CLAIM_COOLDOWN)
+            unpin()
+
+            local stillStuck = stuckJobRetries[jobId] and stuckJobRetries[jobId] >= MAX_STUCK_RETRIES
+            pendingFusion = nil
+            fusionActionBusy = false
+
+            -- Only try starting a new fuse if the previous job actually cleared —
+            -- otherwise we'll just hit FusionInProgress again immediately.
+            if not stillStuck then
+                if state.autoCraftGolden then
+                    startFuse("Normal", "Golden")
+                end
+                if not pendingFusion and state.autoCraftDiamond then
+                    startFuse("Golden", "Diamond")
+                end
+            end
+        elseif not fusion.Active then
+            pendingFusion = nil
+        end
     end
 end)
 
@@ -461,13 +694,22 @@ EggTab:AddDropdown("EggType", {
     Title = "Egg Type", Values = EGG_NAMES, Default = "Basic", Multi = false,
     Callback = function(v) state.selectedEgg = v end,
 })
-EggTab:AddSlider("EggQuantity", {
-    Title = "Egg Quantity", Default = 3, Min = 1, Max = 10, Rounding = 1,
-    Callback = function(v) state.eggQuantity = v end,
+EggTab:AddDropdown("EggQuantity", {
+    Title = "Egg Quantity", Values = {"1", "2", "3", "4", "5"}, Default = "3", Multi = false,
+    Callback = function(v) state.eggQuantity = tonumber(v) or 3 end,
 })
 EggTab:AddToggle("AutoEgg", {
     Title = "Auto Egg", Default = false,
     Callback = function(v) state.egg = v end,
+})
+
+EggTab:AddToggle("AutoCraftGolden", {
+    Title = "Auto Craft Golden", Default = false,
+    Callback = function(v) state.autoCraftGolden = v end,
+})
+EggTab:AddToggle("AutoCraftDiamond", {
+    Title = "Auto Craft Diamond", Default = false,
+    Callback = function(v) state.autoCraftDiamond = v end,
 })
 
 -- ============ Settings Tab ============
@@ -486,7 +728,6 @@ InterfaceManager:SetLibrary(Fluent)
 InterfaceManager:SetFolder("BunsHub")
 SaveManager:SetFolder("BunsHub/Config")
 
--- ===== Apply default theme/interface settings =====
 InterfaceManager.Settings = {
     Theme       = "Cyanic",
     Acrylic     = true,
@@ -498,35 +739,27 @@ InterfaceManager.Settings = {
     Font        = "SourceSans",
 }
 
--- Save the interface defaults and apply theme+font
 pcall(function()
     InterfaceManager:SaveSettings()
     Fluent:SetTheme("Cyanic")
     InterfaceManager:ApplyFont("SourceSans")
 end)
 
--- Interface section only (theme/font/acrylic/transparency/animated/keybind).
--- The manual config section is not needed because everything auto-saves.
 InterfaceManager:BuildInterfaceSection(SettingsTab)
 SaveManager:IgnoreThemeSettings()
 SaveManager:LoadAutoloadConfig()
 
--- ===== Auto-save: every time a user element changes, save to "AutoSave" =====
--- NOTE: task.delay returns a thread, so we cancel it with task.cancel(),
--- not :Cancel() (that was causing the "attempt to index thread" error).
 local autoSaveThread
 for idx, opt in pairs(SaveManager.Options) do
     if SaveManager.Parser[opt.Type] and not SaveManager.Ignore[idx] then
         local cb = opt.Callback
         opt.Callback = function(v)
             if cb then cb(v) end
-            -- Debounce auto-save: wait 0.5s after last change then save
             if autoSaveThread then task.cancel(autoSaveThread) end
             autoSaveThread = task.delay(0.5, function()
                 pcall(function() SaveManager:Save("AutoSave") end)
             end)
         end
-        -- If the element has an OnChanged, hook that too
         if opt.OnChanged then
             local old = opt.OnChanged
             opt.OnChanged = function()
@@ -537,11 +770,9 @@ for idx, opt in pairs(SaveManager.Options) do
     end
 end
 
--- Also set Autoload to AutoSave so it loads on next run
 pcall(function()
     local autoPath = "BunsHub/Config/settings/autoload.txt"
     if not isfile(autoPath) then
-        -- Create an initial AutoSave so autoload has something to load
         task.delay(1, function()
             pcall(function()
                 SaveManager:Save("AutoSave")
@@ -551,4 +782,4 @@ pcall(function()
     end
 end)
 
-print("AutoFarm loaded (Fluent Modded).")
+print("AutoFarm loaded (Fluent Modded + Fusion).")
