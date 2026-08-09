@@ -75,8 +75,9 @@ local EGG_NAMES = {"Basic", "Forest", "Jungle", "Beach", "Monster", "Desert", "G
 -- ===== Feature state =====
 local state = {
     dice = false, potion = false, merchant = false, foodcart = false,
-    usePotions = false, egg = false, eggQuantity = 3,
+    usePotions = false, egg = false, eggQuantity = 3, autoEquipBestPet = false,
     rebirth = false, equipBest = false, sell = false, sellThreshold = 30,
+    equipBestInterval = 30,
     selectedEgg = "Basic",
     autoCraftGolden = false,
     autoCraftDiamond = false,
@@ -283,11 +284,33 @@ local function openEgg()
     if not part then return end
     pinTo(part.CFrame)
     task.wait(TELEPORT_SETTLE_DELAY)
-    local elapsed = 0
-    while elapsed < BUY_STAND_DURATION do
-        pcall(function() EggInfo:InvokeServer("Buy", state.selectedEgg, state.eggQuantity) end)
-        task.wait(BUY_FIRE_INTERVAL); elapsed = elapsed + BUY_FIRE_INTERVAL
+
+    -- Fire once and inspect the real response so we never blind-spam the
+    -- Buy remote; pace the next attempt by the server-reported cooldown.
+    local success, result = pcall(function()
+        return EggInfo:InvokeServer("Buy", state.selectedEgg, state.eggQuantity)
+    end)
+
+    if success and result then
+        if result.Success then
+            -- Hatch succeeded: re-fire once purely to read back the cooldown
+            local ok, res = pcall(function()
+                return EggInfo:InvokeServer("Buy", state.selectedEgg, state.eggQuantity)
+            end)
+            if ok and res and res.Reason == "Cooldown" and res.RetryAfter then
+                task.wait(res.RetryAfter + 0.1)
+            else
+                task.wait(0.85)
+            end
+        elseif result.Reason == "Cooldown" and result.RetryAfter then
+            task.wait(result.RetryAfter + 0.1)
+        else
+            task.wait(0.85)
+        end
+    else
+        task.wait(0.85)
     end
+
     unpin()
 end
 
@@ -315,9 +338,7 @@ task.spawn(function()
 end)
 
 local function sellInventory()
-    if state.equipBest then
-        equipBest()
-    end
+    equipBest()
     local part = getMapShopPart("SellShop")
     if not part then return end
     pinTo(part.CFrame)
@@ -622,6 +643,26 @@ task.spawn(function()
     end
 end)
 
+-- Auto Equip Best
+task.spawn(function()
+    while true do
+        if state.equipBest then
+            equipBest()
+        end
+        task.wait(state.equipBestInterval)
+    end
+end)
+
+-- Auto Equip Best Pet
+task.spawn(function()
+    while true do
+        if state.autoEquipBestPet then
+            pcall(function() EggInfo:InvokeServer("EquipSort", "Luck") end)
+        end
+        task.wait(5)
+    end
+end)
+
 local VirtualUser = game:GetService("VirtualUser")
 player.Idled:Connect(function()
     VirtualUser:CaptureController()
@@ -654,6 +695,10 @@ MainTab:AddToggle("AutoRebirth", {
 MainTab:AddToggle("AutoEquipBest", {
     Title = "Auto Equip Best", Default = false,
     Callback = function(v) state.equipBest = v end,
+})
+MainTab:AddSlider("EquipBestInterval", {
+    Title = "Equip Best Interval (s)", Default = 30, Min = 5, Max = 100, Rounding = 1,
+    Callback = function(v) state.equipBestInterval = tonumber(v) or 30 end,
 })
 MainTab:AddToggle("AutoSell", {
     Title = "Auto Sell", Default = false,
@@ -698,6 +743,10 @@ EggTab:AddDropdown("EggQuantity", {
 EggTab:AddToggle("AutoEgg", {
     Title = "Auto Egg", Default = false,
     Callback = function(v) state.egg = v end,
+})
+EggTab:AddToggle("AutoEquipBestPet", {
+    Title = "Auto Equip Best Pet", Default = false,
+    Callback = function(v) state.autoEquipBestPet = v end,
 })
 
 EggTab:AddToggle("AutoCraftGolden", {
