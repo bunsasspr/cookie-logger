@@ -330,8 +330,6 @@ end
 
 -- ================= FUSION SYSTEM =================
 local lastClaimedJobId = nil
-local pendingFusion = nil          -- {JobId = ..., Mode = ...}
-local fusionActionBusy = false
 local stuckJobRetries = {}         -- [JobId] = retry count, so we don't hammer forever on a job our claim can't actually clear
 
 local function getPlayerState()
@@ -430,7 +428,8 @@ local function findFusableGroups(playerState, minCount, variantFilter)
     if not pets then return {} end
 
     for _, pet in pairs(pets) do
-        if type(pet) == "table" and pet.Name and pet.Id then
+        if type(pet) == "table" and pet.Name and pet.Id
+            and not pet.Equipped and not pet.Favorited then
             if not variantFilter or pet.Variant == variantFilter then
                 local name = pet.Name
                 if not groups[name] then
@@ -467,139 +466,137 @@ local function teleportToFuseMachine()
     task.wait(TELEPORT_SETTLE_DELAY)
 end
 
-local function syncExistingFusion()
-    local fs = getFusionState()
-    if not fs or not fs.Fusion then return false end
-
-    local fusion = fs.Fusion
-    if not fusion.Active or not fusion.JobId then return false end
-    if fusion.JobId == lastClaimedJobId then return false end
-
-    if not pendingFusion or pendingFusion.JobId ~= fusion.JobId then
-        pendingFusion = {
-            JobId = fusion.JobId,
-            Mode = fusion.Mode or "Golden",
-        }
-        print("[Fusion] Detected existing fusion → JobId:", pendingFusion.JobId,
-              "Ready:", fusion.Ready, "Remaining:", fusion.Remaining)
-    end
-    return true
-end
-
+-- Starts a fuse: Golden needs 6 matching Normal pets, Diamond needs just 1 Golden pet.
+-- Quick action (teleport, fire, done) — same shape as buyMerchant/buyFoodCart, meant
+-- to be called from the unified scheduler below, not as a standalone loop.
 local function startFuse(variantFilter, mode)
-    if fusionActionBusy then return false end
-
-    if syncExistingFusion() then
-        return false
-    end
-
+    local minCount = (mode == "Diamond") and 1 or 6
     local playerState = getPlayerState()
     if not playerState then return false end
 
-    local groups = findFusableGroups(playerState, 6, variantFilter)
+    local groups = findFusableGroups(playerState, minCount, variantFilter)
     if #groups == 0 then return false end
 
     local group = groups[1]
-    print("[Fusion] Found", group.count, variantFilter, group.name, "→", mode)
-
-    fusionActionBusy = true
+    print(("[Fusion] Found %d %s %s -> %s"):format(group.count, variantFilter, group.name, mode))
 
     local petIds = {}
-    for i = 1, 6 do
+    for i = 1, minCount do
         table.insert(petIds, group.ids[i])
     end
 
     teleportToFuseMachine()
     local fuseResult = fusePets(petIds, mode)
-
-    if fuseResult then
-        if fuseResult.Success == false and fuseResult.Reason == "FusionInProgress" then
-            print("[Fusion] Server said FusionInProgress → syncing...")
-            syncExistingFusion()
-        elseif fuseResult.Success ~= false then
-            task.wait(0.3)
-            local fs = getFusionState()
-            if fs and fs.Fusion and fs.Fusion.JobId then
-                pendingFusion = {
-                    JobId = fs.Fusion.JobId,
-                    Mode = mode,
-                }
-                print("[Fusion] Fuse started → JobId:", pendingFusion.JobId, "— resuming farm")
-            end
-        else
-            print("[Fusion] Fuse failed → Success:", fuseResult.Success, "Reason:", fuseResult.Reason)
-        end
-    end
-
     unpin()
-    fusionActionBusy = false
-    return true
+
+    if fuseResult and fuseResult.Success ~= false then
+        print("[Fusion] Fuse started, will check back later")
+        return true
+    else
+        print("[Fusion] Fuse failed -> Success:", fuseResult and fuseResult.Success, "Reason:", fuseResult and fuseResult.Reason)
+        return false
+    end
 end
 
--- Background watcher: claims when ready (success OR fail), then tries next fuse
+-- Claims a ready job, and if eligible, immediately starts the next fuse before
+-- handing control back to the scheduler (per your requested flow).
+local function claimAndMaybeRefuse(jobId, outcome)
+    teleportToFuseMachine()
+    local result = claimFusion(jobId, outcome)
+    task.wait(AFTER_CLAIM_COOLDOWN)
+    unpin()
+
+    local cleared = result and result.Success ~= false
+    if cleared then
+        if state.autoCraftGolden then
+            startFuse("Normal", "Golden")
+        end
+        if state.autoCraftDiamond then
+            startFuse("Golden", "Diamond")
+        end
+    end
+end
+
+-- ================= Unified priority scheduler =================
+-- Merchant > FoodCart > Fusion (claim if ready, else start if eligible) >
+-- Dice > Potion > Sell > Eggs. This is the ONLY loop that ever moves the
+-- character, so there's no more cross-thread pin conflict with fusion.
+-- Fusion check/action is quick (teleport, fire, done) so it fits the same
+-- "one action per pass" shape as everything else — start a fuse, then this
+-- loop naturally resumes dice/potion/etc while it cooks, and only comes
+-- back to it once FUSION_CHECK_INTERVAL has passed and it's ready to claim.
+local lastMerchant, lastFoodCart = nil, nil
+local nextDiceTime, nextPotionTime = 0, 0
+local nextFusionCheckTime = 0
+
 task.spawn(function()
     while true do
-        task.wait(1.2)
+        local ok, err = pcall(function()
+            local didSomething = false
+            local merchant = state.merchant and getMerchantModel()
+            local foodcart = state.foodcart and getFoodCartModel()
+            local sellReady = state.sell and getInventoryCount() >= state.sellThreshold
+            local fusionEnabled = state.autoCraftGolden or state.autoCraftDiamond
+            local fusionDue = fusionEnabled and tick() >= nextFusionCheckTime
 
-        if fusionActionBusy then
-            continue
-        end
+            if merchant and merchant ~= lastMerchant then
+                lastMerchant = merchant; buyMerchant(); didSomething = true
+            elseif foodcart and foodcart ~= lastFoodCart then
+                lastFoodCart = foodcart; buyFoodCart(); didSomething = true
+            elseif fusionDue then
+                local fs = getFusionState()
+                local fusion = fs and fs.Fusion
 
-        syncExistingFusion()
-
-        if not pendingFusion then
-            continue
-        end
-
-        local fs = getFusionState()
-        if not fs or not fs.Fusion then
-            pendingFusion = nil
-            continue
-        end
-
-        local fusion = fs.Fusion
-        local jobId = fusion.JobId
-
-        if not jobId or jobId == lastClaimedJobId then
-            pendingFusion = nil
-            continue
-        end
-
-        -- If we've already given up on this specific job, don't keep re-triggering
-        -- the whole claim+refuse cycle every 1.2s — back off.
-        if stuckJobRetries[jobId] and stuckJobRetries[jobId] >= MAX_STUCK_RETRIES then
-            task.wait(STUCK_RETRY_BACKOFF)
-        end
-
-        local ready = fusion.Ready
-            or (fusion.Remaining and fusion.Remaining <= 0)
-            or (fusion.Outcome == "Succeeded" or fusion.Outcome == "Failed")
-
-        if ready then
-            print("[Fusion] Timer finished (Outcome:", fusion.Outcome or "?", ") → claiming...")
-
-            fusionActionBusy = true
-            teleportToFuseMachine()
-            claimFusion(jobId, fusion.Outcome) -- FIX: outcome is now actually passed
-            task.wait(AFTER_CLAIM_COOLDOWN)
-            unpin()
-
-            local stillStuck = stuckJobRetries[jobId] and stuckJobRetries[jobId] >= MAX_STUCK_RETRIES
-            pendingFusion = nil
-            fusionActionBusy = false
-
-            -- Only try starting a new fuse if the previous job actually cleared —
-            -- otherwise we'll just hit FusionInProgress again immediately.
-            if not stillStuck then
-                if state.autoCraftGolden then
-                    startFuse("Normal", "Golden")
+                if fusion and fusion.Active and fusion.JobId and fusion.JobId ~= lastClaimedJobId then
+                    local ready = fusion.Ready or (fusion.Remaining and fusion.Remaining <= 0)
+                    if ready then
+                        claimAndMaybeRefuse(fusion.JobId, fusion.Outcome)
+                        didSomething = true
+                        nextFusionCheckTime = tick() + FUSION_CHECK_INTERVAL
+                    else
+                        -- still cooking — check back around when it should finish
+                        nextFusionCheckTime = tick() + math.min(fusion.Remaining or FUSION_CHECK_INTERVAL, FUSION_CHECK_INTERVAL)
+                    end
+                else
+                    local started = false
+                    if state.autoCraftGolden then
+                        started = startFuse("Normal", "Golden")
+                    end
+                    if not started and state.autoCraftDiamond then
+                        started = startFuse("Golden", "Diamond")
+                    end
+                    if started then
+                        didSomething = true
+                    end
+                    nextFusionCheckTime = tick() + FUSION_CHECK_INTERVAL
                 end
-                if not pendingFusion and state.autoCraftDiamond then
-                    startFuse("Golden", "Diamond")
-                end
+            elseif state.dice and tick() >= nextDiceTime then
+                buyDice()
+                local r = getRestockSeconds("Main")
+                nextDiceTime = tick() + (r and (r + RESTOCK_BUFFER) or FALLBACK_RESTOCK_WAIT)
+                didSomething = true
+            elseif state.potion and tick() >= nextPotionTime then
+                buyPotion()
+                local r = getRestockSeconds("Potion")
+                nextPotionTime = tick() + (r and (r + RESTOCK_BUFFER) or FALLBACK_RESTOCK_WAIT)
+                didSomething = true
+            elseif sellReady then
+                sellInventory(); task.wait(SELL_COOLDOWN); didSomething = true
+            elseif state.egg then
+                openEgg(); didSomething = true
             end
-        elseif not fusion.Active then
-            pendingFusion = nil
+
+            if not merchant then lastMerchant = nil end
+            if not foodcart then lastFoodCart = nil end
+
+            if not didSomething then
+                task.wait(SCHEDULER_INTERVAL)
+            end
+        end)
+
+        if not ok then
+            warn("[Scheduler] Error in scheduler pass (won't stop the loop):", err)
+            task.wait(SCHEDULER_INTERVAL)
         end
     end
 end)
