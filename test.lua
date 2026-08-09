@@ -29,6 +29,7 @@ local SCHEDULER_INTERVAL = 1
 local RESTOCK_BUFFER = 2
 local FALLBACK_RESTOCK_WAIT = 120
 local EQUIP_BEST_SETTLE = 0.5
+local EQUIP_BEST_HOLD = 1 -- small delay after equip best fires before the player can be tped back to the previous job (e.g. eggs)
 local USE_POTIONS_INTERVAL = 10
 local REBIRTH_CHECK_INTERVAL = 2
 local REBIRTH_COOLDOWN = 5
@@ -92,8 +93,20 @@ end
 -- ================= Pinning system =================
 local pinned = false
 local pinTarget = nil
+-- Mover mutex: only ONE mover (a scheduler action or Auto Equip Best) may
+-- hold the pin at a time. Without it, Auto Egg teleports back to the egg
+-- right after equip best teleports to the plot, so EquipBest ends up firing
+-- while the player is at the egg instead of at the base.
+local pinBusy = false
 
 local function pinTo(cframe)
+    -- Wait for the current mover to fully finish (pin -> unpin) before
+    -- taking over, so equip best completes at the plot first and only then
+    -- gets teleported back to whatever job was in progress (e.g. eggs).
+    while pinBusy do
+        task.wait(0.05)
+    end
+    pinBusy = true
     pinTarget = cframe
     pinned = true
 end
@@ -101,6 +114,7 @@ end
 local function unpin()
     pinned = false
     pinTarget = nil
+    pinBusy = false
 end
 
 RunService.Heartbeat:Connect(function()
@@ -321,6 +335,9 @@ local function equipBest()
     task.wait(TELEPORT_SETTLE_DELAY)
     pcall(function() EquipBest:FireServer() end)
     task.wait(EQUIP_BEST_SETTLE)
+    -- Small delay: keep the player at the plot before the next teleport
+    -- (e.g. back to the egg) is allowed, so the equip best takes effect here.
+    task.wait(EQUIP_BEST_HOLD)
     unpin()
 end
 
@@ -617,6 +634,7 @@ task.spawn(function()
 
         if not ok then
             warn("[Scheduler] Error in scheduler pass (won't stop the loop):", err)
+            unpin() -- release the pin/mover lock in case the action errored mid-teleport
             task.wait(SCHEDULER_INTERVAL)
         end
     end
@@ -647,7 +665,11 @@ end)
 task.spawn(function()
     while true do
         if state.equipBest then
-            equipBest()
+            local ok, err = pcall(equipBest)
+            if not ok then
+                unpin() -- release the mover lock if equip best errored mid-teleport
+                warn("[EquipBest] Error in loop:", err)
+            end
         end
         task.wait(state.equipBestInterval)
     end
