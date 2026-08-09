@@ -40,6 +40,8 @@ local FUSION_WAIT_INTERVAL = 1
 local FUSION_MAX_WAIT = 300
 local AFTER_CLAIM_COOLDOWN = 2.5
 local FUSE_MACHINE_CFRAME = CFrame.new(-104.240242, 1.77263951 + 5, 198.388123)
+local MAX_STUCK_RETRIES = 3       -- give up retrying a stuck job after this many failed attempts
+local STUCK_RETRY_BACKOFF = 10    -- seconds to wait between stuck-job retries
 
 local DICE_ORDER = {
     "Basic", "Bronze", "Iron", "Silver", "Gold", "Sapphire", "Emerald", "Ruby",
@@ -326,10 +328,11 @@ local function sellInventory()
     unpin()
 end
 
--- ================= FUSION SYSTEM (fixed) =================
+-- ================= FUSION SYSTEM =================
 local lastClaimedJobId = nil
 local pendingFusion = nil          -- {JobId = ..., Mode = ...}
 local fusionActionBusy = false
+local stuckJobRetries = {}         -- [JobId] = retry count, so we don't hammer forever on a job our claim can't actually clear
 
 local function getPlayerState()
     local ok, result = pcall(function()
@@ -359,6 +362,8 @@ local function fusePets(petIds, mode)
     return result
 end
 
+-- outcome is now actually passed in from the caller (was missing before,
+-- which meant this always thought outcome==nil and skipped the Failed path)
 local function claimFusion(jobId, outcome)
     if not jobId or jobId == lastClaimedJobId then return nil end
 
@@ -366,9 +371,7 @@ local function claimFusion(jobId, outcome)
 
     local result
 
-    -- Try the correct remote based on outcome
     if outcome == "Failed" then
-        -- Failed fusions use AcknowledgeFusion
         local ok, res = pcall(function()
             return EggInfo:InvokeServer("AcknowledgeFusion", {
                 JobId = jobId,
@@ -377,7 +380,6 @@ local function claimFusion(jobId, outcome)
         if ok then result = res end
         print("[Fusion] AcknowledgeFusion →", result and result.Success, result and result.Reason)
     else
-        -- Successful fusions use ClaimFusion
         local ok, res = pcall(function()
             return EggInfo:InvokeServer("ClaimFusion", {
                 JobId = jobId,
@@ -387,7 +389,6 @@ local function claimFusion(jobId, outcome)
         print("[Fusion] ClaimFusion →", result and result.Success, result and result.Reason)
     end
 
-    -- Fallback: if the first one failed, try the other
     if not result or result.Success == false then
         print("[Fusion] First claim method failed, trying fallback...")
         local ok2, res2 = pcall(function()
@@ -403,8 +404,22 @@ local function claimFusion(jobId, outcome)
         end
     end
 
-    -- Always mark as handled so we don't loop forever
-    lastClaimedJobId = jobId
+    -- Only mark as handled if we actually got a successful response — a job that
+    -- both methods failed to clear should NOT be silently forgotten, or we'll
+    -- just start firing new Fuse attempts that keep bouncing off FusionInProgress.
+    if result and result.Success ~= false then
+        lastClaimedJobId = jobId
+        stuckJobRetries[jobId] = nil
+    else
+        stuckJobRetries[jobId] = (stuckJobRetries[jobId] or 0) + 1
+        warn(("[Fusion] Could not clear JobId %s (attempt %d/%d) — neither ClaimFusion nor AcknowledgeFusion worked"):format(
+            jobId, stuckJobRetries[jobId], MAX_STUCK_RETRIES))
+        if stuckJobRetries[jobId] >= MAX_STUCK_RETRIES then
+            warn("[Fusion] Giving up on this job for now — the real claim remote is probably different from what's coded. Won't spam retries.")
+            lastClaimedJobId = jobId -- stop retrying this specific job, but don't pretend it succeeded
+        end
+    end
+
     return result
 end
 
@@ -452,7 +467,6 @@ local function teleportToFuseMachine()
     task.wait(TELEPORT_SETTLE_DELAY)
 end
 
--- Returns true if there is already an active fusion we should wait for / claim
 local function syncExistingFusion()
     local fs = getFusionState()
     if not fs or not fs.Fusion then return false end
@@ -461,7 +475,6 @@ local function syncExistingFusion()
     if not fusion.Active or not fusion.JobId then return false end
     if fusion.JobId == lastClaimedJobId then return false end
 
-    -- There is already a fusion running or ready → treat it as pending
     if not pendingFusion or pendingFusion.JobId ~= fusion.JobId then
         pendingFusion = {
             JobId = fusion.JobId,
@@ -473,11 +486,9 @@ local function syncExistingFusion()
     return true
 end
 
--- Starts a new fuse (only if nothing is already running)
 local function startFuse(variantFilter, mode)
     if fusionActionBusy then return false end
 
-    -- If a fusion is already in progress, just sync it and return
     if syncExistingFusion() then
         return false
     end
@@ -503,11 +514,9 @@ local function startFuse(variantFilter, mode)
 
     if fuseResult then
         if fuseResult.Success == false and fuseResult.Reason == "FusionInProgress" then
-            -- Server already has a fusion → sync it
             print("[Fusion] Server said FusionInProgress → syncing...")
             syncExistingFusion()
         elseif fuseResult.Success ~= false then
-            -- New fusion started successfully
             task.wait(0.3)
             local fs = getFusionState()
             if fs and fs.Fusion and fs.Fusion.JobId then
@@ -536,7 +545,6 @@ task.spawn(function()
             continue
         end
 
-        -- Always keep pendingFusion in sync with server
         syncExistingFusion()
 
         if not pendingFusion then
@@ -557,6 +565,12 @@ task.spawn(function()
             continue
         end
 
+        -- If we've already given up on this specific job, don't keep re-triggering
+        -- the whole claim+refuse cycle every 1.2s — back off.
+        if stuckJobRetries[jobId] and stuckJobRetries[jobId] >= MAX_STUCK_RETRIES then
+            task.wait(STUCK_RETRY_BACKOFF)
+        end
+
         local ready = fusion.Ready
             or (fusion.Remaining and fusion.Remaining <= 0)
             or (fusion.Outcome == "Succeeded" or fusion.Outcome == "Failed")
@@ -566,19 +580,23 @@ task.spawn(function()
 
             fusionActionBusy = true
             teleportToFuseMachine()
-            claimFusion(jobId)
+            claimFusion(jobId, fusion.Outcome) -- FIX: outcome is now actually passed
             task.wait(AFTER_CLAIM_COOLDOWN)
             unpin()
 
+            local stillStuck = stuckJobRetries[jobId] and stuckJobRetries[jobId] >= MAX_STUCK_RETRIES
             pendingFusion = nil
             fusionActionBusy = false
 
-            -- After claim, immediately try to start another fuse if possible
-            if state.autoCraftGolden then
-                startFuse("Normal", "Golden")
-            end
-            if not pendingFusion and state.autoCraftDiamond then
-                startFuse("Golden", "Diamond")
+            -- Only try starting a new fuse if the previous job actually cleared —
+            -- otherwise we'll just hit FusionInProgress again immediately.
+            if not stillStuck then
+                if state.autoCraftGolden then
+                    startFuse("Normal", "Golden")
+                end
+                if not pendingFusion and state.autoCraftDiamond then
+                    startFuse("Golden", "Diamond")
+                end
             end
         elseif not fusion.Active then
             pendingFusion = nil
@@ -685,7 +703,6 @@ EggTab:AddToggle("AutoEgg", {
     Callback = function(v) state.egg = v end,
 })
 
--- NEW FUSION TOGGLES
 EggTab:AddToggle("AutoCraftGolden", {
     Title = "Auto Craft Golden", Default = false,
     Callback = function(v) state.autoCraftGolden = v end,
